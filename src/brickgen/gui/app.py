@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.7.0
+Version: v0.8.0
 '''
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -36,7 +37,9 @@ from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import SLOPE_SIDES, BlockSettings, validate_settings
 from brickgen.gui.grid_editor import CellGridEditor
 from brickgen.gui.library import TemplateLibraryPanel
+from brickgen.gui.preferences import PreferencesDialog
 from brickgen.gui.preview import DISPLAY_MODES, MODE_SOLID, PreviewWidget
+from brickgen.services.app_settings import AppSettings, load_app_settings, save_app_settings
 from brickgen.services.export_service import SUPPORTED_FORMATS, export_model
 from brickgen.services.settings_io import load_settings, save_settings
 
@@ -82,14 +85,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._settings = BlockSettings()
         self._model = None
+        self._app_settings = load_app_settings()
         self.setWindowTitle("BrickGen - construction block generator")
         self.resize(1400, 760)
         self.setMinimumSize(1100, 600)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_sidebar())
-        self._preview = PreviewWidget()
-        splitter.addWidget(self._preview)
+        splitter.addWidget(self._build_preview_pane())
         self._library = TemplateLibraryPanel(self._collect_settings_or_default)
         self._library.apply_requested.connect(self._on_template_selected)
         splitter.addWidget(self._library)
@@ -176,6 +179,42 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._cell_grid, alignment=Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(include_all)
         return group
+
+    def _build_preview_pane(self) -> QWidget:
+        '''Build the preview area with the preferences button bottom-left.
+
+        Returns:
+            Container widget holding the preview and the button row.
+        '''
+        pane = QWidget()
+        layout = QVBoxLayout(pane)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._preview = PreviewWidget()
+        layout.addWidget(self._preview, stretch=1)
+        bottom = QHBoxLayout()
+        prefs = QPushButton("Settings")
+        prefs.setFixedWidth(110)
+        prefs.clicked.connect(self._on_preferences)
+        bottom.addWidget(prefs)
+        bottom.addStretch(1)
+        layout.addLayout(bottom)
+        return pane
+
+    def _on_preferences(self) -> None:
+        '''Open the preferences modal and apply/save the results.'''
+        dialog = PreferencesDialog(self._app_settings, self)
+        if not dialog.exec():
+            return
+        updated = dialog.get_settings()
+        if updated is None:
+            return
+        self._app_settings = updated
+        try:
+            save_app_settings(updated)
+        except OSError as exc:
+            QMessageBox.critical(self, "Preferences", f"Cannot save: {exc}")
+        self._on_generate()  # re-render the preview with the new precision
+        self._set_status("Preferences saved.")
 
     def _build_slope_group(self) -> QGroupBox:
         '''Create the slope group (only applies to stud-less blocks).'''
@@ -358,7 +397,7 @@ class MainWindow(QMainWindow):
             f"{self._settings.outer_length_x:.2f} x {self._settings.outer_length_y:.2f} mm"
             f" | height {self._settings.total_height:.2f} mm{slope_note}{figure_note}{chamfer_note}"
         )
-        self._preview.show_model(self._model)
+        self._preview.show_model(self._model, self._app_settings.preview_tolerance)
         self._preview.set_display_mode(self._mode.currentText())
         self._preview.set_grid_enabled(self._grid.isChecked())
 
@@ -373,11 +412,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Nothing to export", "Generate a block first.")
             return
         formats = list(SUPPORTED_FORMATS)
-        default_filter = f"{formats[0]} (*.{formats[0].lower()})"
+        default_format = self._app_settings.default_format
+        default_filter = f"{default_format} (*.{default_format.lower()})"
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export model",
-            f"block_{self._settings.describe()}.step",
+            f"block_{self._settings.describe()}.{default_format.lower()}",
             ";;".join(f"{fmt} (*.{fmt.lower()})" for fmt in formats)
             + ";;All files (*.*)",
             default_filter,
@@ -386,7 +426,10 @@ class MainWindow(QMainWindow):
             return
         path, file_format = resolve_export_target(path, selected_filter)
         try:
-            written = export_model(self._model, Path(path), file_format)
+            written = export_model(
+                self._model, Path(path), file_format,
+                tolerance=self._app_settings.export_tolerance,
+            )
         except BrickGenError as exc:
             self._set_status("Export failed.", error=True)
             QMessageBox.critical(self, "Export failed", str(exc))

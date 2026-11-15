@@ -13,4 +13,4 @@ from brickgen.core.builder import build_block
 
 __all__ = ["BlockSettings", "build_block", "__version__"]
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
