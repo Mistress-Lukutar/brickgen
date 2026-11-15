@@ -1,6 +1,6 @@
 [project]
 name = "brickgen"
-version = "0.2.0"
+version = "0.3.0"
 description = "Parametric generator of LEGO-like stud blocks (CadQuery-based) with GUI, 3D preview and multi-format export."
 authors = [{ name = "Mistress-Lukutar" }]
 requires-python = ">=3.11"

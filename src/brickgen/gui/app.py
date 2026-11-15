@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: settings panel, VTK preview, export.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.2.0
+Version: v0.3.0
 '''
 
 from __future__ import annotations
@@ -110,6 +110,15 @@ class MainWindow(QMainWindow):
 
         self._pins = QCheckBox("Studs on top")
         form.addRow(self._pins)
+
+        self._tubes = QCheckBox("Inner tubes (2x2+ centers)")
+        form.addRow(self._tubes)
+        tube_spin = QDoubleSpinBox()
+        tube_spin.setRange(0.1, 20.0)
+        tube_spin.setSingleStep(0.1)
+        tube_spin.setDecimals(2)
+        self._floats["tube_inner_diameter"] = tube_spin
+        form.addRow("Tube bore diameter, mm", tube_spin)
         return group
 
     def _build_display_group(self) -> QGroupBox:
@@ -158,6 +167,7 @@ class MainWindow(QMainWindow):
             "cells_x": self._cells_x.value(),
             "cells_y": self._cells_y.value(),
             "pins_enabled": self._pins.isChecked(),
+            "tubes_enabled": self._tubes.isChecked(),
         }
         values.update({field: spin.value() for field, spin in self._floats.items()})
         return validate_settings(values)
@@ -167,6 +177,7 @@ class MainWindow(QMainWindow):
         self._cells_x.setValue(self._settings.cells_x)
         self._cells_y.setValue(self._settings.cells_y)
         self._pins.setChecked(self._settings.pins_enabled)
+        self._tubes.setChecked(self._settings.tubes_enabled)
         for field, spin in self._floats.items():
             spin.setValue(getattr(self._settings, field))
 

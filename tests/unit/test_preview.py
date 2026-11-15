@@ -3,7 +3,7 @@ File:   test_preview.py
 Brief:  Unit tests for the pyvista mesh conversion used by the preview.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.2.0
+Version: v0.3.0
 '''
 
 from __future__ import annotations
@@ -29,11 +29,11 @@ def test_mesh_is_triangles(mesh_2x4) -> None:
 
 
 def test_mesh_bounding_box(mesh_2x4) -> None:
-    '''Mesh bounds match the block footprint 8x16x10 mm.'''
+    '''Mesh bounds match the block footprint 8x16x5 mm.'''
     bounds = mesh_2x4.bounds
     assert bounds.x_max - bounds.x_min == pytest.approx(8.0, abs=1e-3)
     assert bounds.y_max - bounds.y_min == pytest.approx(16.0, abs=1e-3)
-    assert bounds.z_max - bounds.z_min == pytest.approx(10.0, abs=1e-3)
+    assert bounds.z_max - bounds.z_min == pytest.approx(5.0, abs=1e-3)
 
 
 def test_mesh_has_no_duplicate_points(mesh_2x4) -> None:

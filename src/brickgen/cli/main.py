@@ -3,7 +3,7 @@ File:   main.py
 Brief:  Typer CLI entry point for headless block generation and export.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.1.0
+Version: v0.3.0
 '''
 
 from __future__ import annotations
@@ -40,6 +40,10 @@ def generate(
     pin_diameter: float = typer.Option(2.5, "--pin-diameter", help="Stud diameter, mm."),
     pin_height: float = typer.Option(2.0, "--pin-height", help="Stud height, mm."),
     no_pins: bool = typer.Option(False, "--no-pins", help="Omit top studs."),
+    no_tubes: bool = typer.Option(False, "--no-tubes", help="Omit inner tubes."),
+    tube_inner_diameter: float = typer.Option(
+        1.0, "--tube-bore", help="Inner tube bore diameter, mm."
+    ),
     settings_file: Path | None = typer.Option(
         None, "--settings", "-s", help="Load parameters from a JSON preset first."
     ),
@@ -66,6 +70,8 @@ def generate(
             "pin_diameter": pin_diameter,
             "pin_height": pin_height,
             "pins_enabled": not no_pins,
+            "tubes_enabled": not no_tubes,
+            "tube_inner_diameter": tube_inner_diameter,
         }
         settings = settings.model_copy(update=overrides)
         settings = validate_settings(settings.model_dump())
