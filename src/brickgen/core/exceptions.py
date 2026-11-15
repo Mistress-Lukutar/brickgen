@@ -1,0 +1,25 @@
+'''
+File:   exceptions.py
+Brief:  Custom exception hierarchy for BrickGen.
+Author: Mistress-Lukutar
+Date:   2026-11-15
+Version: v0.1.0
+'''
+
+from __future__ import annotations
+
+
+class BrickGenError(Exception):
+    '''Base exception for all BrickGen errors.'''
+
+
+class SettingsValidationError(BrickGenError):
+    '''Raised when block settings fail validation.'''
+
+
+class SettingsIOError(BrickGenError):
+    '''Raised when settings import/export fails (unreadable/invalid JSON file).'''
+
+
+class ExportError(BrickGenError):
+    '''Raised when a 3D model export fails or the format is unsupported.'''
