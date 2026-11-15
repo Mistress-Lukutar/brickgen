@@ -3,7 +3,7 @@ File:   builder.py
 Brief:  CadQuery geometry builder for parametric LEGO-like stud blocks.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.1
+Version: v0.5.0
 '''
 
 from __future__ import annotations
@@ -35,7 +35,134 @@ def build_block(settings: BlockSettings) -> cq.Workplane:
     '''
     if settings.slope_active:
         return _build_sloped_block(settings)
+    if not settings.is_rectangular:
+        return _build_figure_block(settings)
     return _build_flat_block(settings)
+
+
+def _included_cells(settings: BlockSettings) -> list[tuple[int, int]]:
+    '''List the included (ix, iy) cells of the figure, sorted.
+
+    Args:
+        settings: Validated parametric block description.
+
+    Returns:
+        Sorted list of included cell indices.
+    '''
+    excluded = {(ix, iy) for ix, iy in settings.excluded_cells}
+    return [
+        (ix, iy)
+        for iy in range(settings.cells_y)
+        for ix in range(settings.cells_x)
+        if (ix, iy) not in excluded
+    ]
+
+
+def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
+    '''Build a block with excluded cells (T-, L-shaped figures, etc.).
+
+    The figure variant follows the reference parts: the cavity is one piece
+    shaped like the included region (perimeter walls step around excluded
+    cells, no internal partition walls), and every concave corner of the
+    region carries an inward quarter-round rib instead of a tube. Tubes do
+    not apply in this variant; studs remain on top of every included cell.
+
+    Args:
+        settings: Validated parametric block description.
+
+    Returns:
+        A CadQuery workplane holding a single fused solid.
+    '''
+    t = settings.wall_thickness
+    unit = settings.unit_size
+    height = settings.block_height
+    half_x = settings.outer_length_x / 2.0
+    half_y = settings.outer_length_y / 2.0
+
+    outer: cq.Workplane | None = None
+    cavity: cq.Workplane | None = None
+    included = set(_included_cells(settings))
+    for ix, iy in _included_cells(settings):
+        x0 = ix * unit - half_x
+        y0 = iy * unit - half_y
+        cell = cq.Workplane("XY", origin=(x0 + unit / 2.0, y0 + unit / 2.0, 0)).box(
+            unit, unit, height, centered=(True, True, False)
+        )
+        # Cavity box: inset t only on sides facing the region boundary;
+        # sides shared with an included neighbor stay open so the cavities
+        # of adjacent cells fuse into a single contour-shaped cavity.
+        inset_x0 = t if (ix - 1, iy) not in included else 0.0
+        inset_x1 = t if (ix + 1, iy) not in included else 0.0
+        inset_y0 = t if (ix, iy - 1) not in included else 0.0
+        inset_y1 = t if (ix, iy + 1) not in included else 0.0
+        cav_w = unit - inset_x0 - inset_x1
+        cav_h = unit - inset_y0 - inset_y1
+        cell_cavity = cq.Workplane(
+            "XY",
+            origin=(x0 + inset_x0 + cav_w / 2.0, y0 + inset_y0 + cav_h / 2.0, 0),
+        ).box(cav_w, cav_h, height - t + CUT_OVERSHOOT,
+              centered=(True, True, False)).translate((0, 0, -CUT_OVERSHOOT))
+        outer = cell if outer is None else outer.union(cell)
+        cavity = cell_cavity if cavity is None else cavity.union(cell_cavity)
+
+    solid = outer.cut(cavity)
+
+    for rib in _figure_corner_ribs(settings):
+        solid = solid.union(rib)
+
+    if settings.pins_enabled:
+        solid = _fuse_pins(solid, settings)
+    return solid
+
+
+def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
+    '''Quarter-round inward ribs at every concave corner of the figure.
+
+    A concave corner is a lattice vertex where exactly 3 of the 4 adjacent
+    cells are included (the missing cell creates the inner angle). The rib
+    fills that corner with a quarter-round fillet (instead of a tube),
+    spans the full cavity height and overshoots into the top face.
+
+    Args:
+        settings: Validated parametric block description.
+
+    Returns:
+        Rib solids to fuse into the shell.
+    '''
+    t = settings.wall_thickness
+    unit = settings.unit_size
+    half_x = settings.outer_length_x / 2.0
+    half_y = settings.outer_length_y / 2.0
+    radius = min(2.0 * t, unit - 2.0 * t)
+    included = set(_included_cells(settings))
+
+    ribs: list[cq.Workplane] = []
+    for i in range(1, settings.cells_x):
+        for j in range(1, settings.cells_y):
+            quadrants = {
+                (-1, -1): (i - 1, j - 1),
+                (1, -1): (i, j - 1),
+                (-1, 1): (i - 1, j),
+                (1, 1): (i, j),
+            }
+            missing = [off for off, cell in quadrants.items()
+                       if cell not in included]
+            if len(missing) != 1:
+                continue  # concave corner needs exactly 3 included cells
+            mx, my = missing[0]
+            vx = i * unit - half_x
+            vy = j * unit - half_y
+            into_x, into_y = -mx, -my  # into the diagonal included cell
+            rib_box = cq.Workplane(
+                "XY",
+                origin=(vx + into_x * radius / 2.0, vy + into_y * radius / 2.0, 0),
+            ).box(radius, radius, settings.block_height,
+                  centered=(True, True, False))
+            arc = cq.Workplane(
+                "XY", origin=(vx + into_x * radius, vy + into_y * radius, 0)
+            ).circle(radius).extrude(settings.block_height)
+            ribs.append(rib_box.cut(arc))
+    return ribs
 
 
 def _build_flat_block(settings: BlockSettings) -> cq.Workplane:
@@ -225,8 +352,11 @@ def _fuse_pins(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
         The shell with all studs fused into a single solid.
     '''
     radius = settings.pin_diameter / 2.0
+    excluded = {(ix, iy) for ix, iy in settings.excluded_cells}
     for ix in range(settings.cells_x):
         for iy in range(settings.cells_y):
+            if (ix, iy) in excluded:
+                continue  # excluded cells have no material to carry a stud
             cx = (ix + 0.5) * settings.unit_size - settings.outer_length_x / 2.0
             cy = (iy + 0.5) * settings.unit_size - settings.outer_length_y / 2.0
             stud = (

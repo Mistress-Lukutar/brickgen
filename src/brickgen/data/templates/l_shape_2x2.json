@@ -1,0 +1,15 @@
+{
+  "schema": {
+    "name": "brickgen-settings",
+    "version": 1
+  },
+  "template_name": "L-shape 2x2",
+  "cells_x": 2,
+  "cells_y": 2,
+  "excluded_cells": [
+    [
+      1,
+      1
+    ]
+  ]
+}

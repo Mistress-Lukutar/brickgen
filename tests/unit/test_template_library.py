@@ -3,7 +3,7 @@ File:   test_template_library.py
 Brief:  Unit tests for the template library service.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.0
+Version: v0.5.0
 '''
 
 from __future__ import annotations
@@ -30,12 +30,15 @@ def isolated_user_dir(monkeypatch, tmp_path: Path) -> Path:
     return target
 
 
-def test_builtin_templates_are_valid() -> None:
-    '''All shipped templates parse and validate.'''
+def test_builtin_templates_are_valid(monkeypatch, tmp_path: Path) -> None:
+    '''All shipped templates parse and validate (user dir isolated).'''
+    monkeypatch.setattr(tl, "user_templates_dir", lambda: tmp_path / "u")
     templates = list_templates()
-    assert len(templates) >= 9
+    assert len(templates) >= 11
     assert all(isinstance(t.settings, BlockSettings) for t in templates)
     assert all(t.builtin for t in templates)
+    names = {t.name for t in templates}
+    assert {"Brick 2x4", "T-shape 3x2", "L-shape 2x2"} <= names
 
 
 def test_save_and_reload_roundtrip(isolated_user_dir: Path) -> None:

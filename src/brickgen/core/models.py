@@ -3,7 +3,7 @@ File:   models.py
 Brief:  Pydantic settings model describing the parametric block geometry.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.1
+Version: v0.5.0
 '''
 
 from __future__ import annotations
@@ -69,6 +69,10 @@ class BlockSettings(BaseModel):
             (N x ``block_height``), forming a sloped top face. Applies only
             to stud-less blocks (``pins_enabled=False``); 0 disables it.
         slope_side: Which top edge is raised: ``+X``/``-X``/``+Y``/``-Y``.
+        excluded_cells: 0-based ``[ix, iy]`` cells removed from the figure
+            (top view, ix along X, iy along Y). Non-empty masks switch the
+            builder to the figure variant: contour walls follow the shape,
+            concave corners get inward quarter-round ribs instead of tubes.
     '''
 
     cells_x: int = Field(default=1, ge=1, le=MAX_CELLS)
@@ -83,6 +87,7 @@ class BlockSettings(BaseModel):
     tube_inner_diameter: float = Field(default=1.2, gt=0)
     slope_rise_units: int = Field(default=0, ge=0, le=MAX_SLOPE_RISE)
     slope_side: SlopeSide = "+X"
+    excluded_cells: list[list[int]] = Field(default_factory=list)
 
     model_config = {"extra": "forbid"}
 
@@ -105,6 +110,21 @@ class BlockSettings(BaseModel):
             )
         return value
 
+    @field_validator("excluded_cells")
+    @classmethod
+    def _validate_excluded_cells(cls, value: list) -> list[list[int]]:
+        '''Normalize the exclusion mask to a sorted list of [ix, iy] pairs.'''
+        result: list[list[int]] = []
+        for item in value:
+            try:
+                ix, iy = int(item[0]), int(item[1])
+            except (TypeError, ValueError, IndexError) as exc:
+                raise SettingsValidationError(
+                    f"excluded cell {item!r} must be an [ix, iy] pair"
+                ) from exc
+            result.append([ix, iy])
+        return sorted(result)
+
     @property
     def tube_outer_diameter(self) -> float:
         '''Outer tube diameter: bore plus two wall-thickness shells, mm.'''
@@ -114,6 +134,16 @@ class BlockSettings(BaseModel):
     def has_tubes(self) -> bool:
         '''True when tubes apply: enabled and both cell counts are 2+.'''
         return self.tubes_enabled and self.cells_x >= 2 and self.cells_y >= 2
+
+    @property
+    def is_rectangular(self) -> bool:
+        '''True when no cells are excluded from the figure.'''
+        return not self.excluded_cells
+
+    @property
+    def included_count(self) -> int:
+        '''Number of cells present in the figure.'''
+        return self.cells_x * self.cells_y - len(self.excluded_cells)
 
     @property
     def slope_active(self) -> bool:
@@ -148,6 +178,20 @@ class BlockSettings(BaseModel):
                 raise SettingsValidationError(
                     "tube_outer_diameter must fit inside the cavity"
                 )
+        seen: set[tuple[int, int]] = set()
+        for ix, iy in self.excluded_cells:
+            if not (0 <= ix < self.cells_x and 0 <= iy < self.cells_y):
+                raise SettingsValidationError(
+                    f"excluded cell [{ix}, {iy}] is outside the {self.cells_x}x"
+                    f"{self.cells_y} grid"
+                )
+            if (ix, iy) in seen:
+                raise SettingsValidationError(
+                    f"excluded cell [{ix}, {iy}] is listed twice"
+                )
+            seen.add((ix, iy))
+        if len(self.excluded_cells) >= self.cells_x * self.cells_y:
+            raise SettingsValidationError("at least one cell must remain in the figure")
         return self
 
     @property

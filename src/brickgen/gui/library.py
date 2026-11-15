@@ -3,7 +3,7 @@ File:   library.py
 Brief:  Template library panel: thumbnail previews, select, save, refresh.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.0
+Version: v0.5.0
 '''
 
 from __future__ import annotations

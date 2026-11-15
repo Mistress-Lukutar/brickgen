@@ -3,7 +3,7 @@ File:   main.py
 Brief:  Typer CLI entry point for headless block generation and export.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.1
+Version: v0.5.0
 '''
 
 from __future__ import annotations
@@ -28,6 +28,36 @@ app = typer.Typer(
 logger = logging.getLogger(__name__)
 
 
+def _parse_exclude(spec: str) -> list[list[int]]:
+    '''Parse an ``--exclude`` spec like ``"0,1;2,1"`` into cell pairs.
+
+    Args:
+        spec: Comma/semicolon-separated ``ix,iy`` pairs; blanks are skipped.
+
+    Returns:
+        List of [ix, iy] integer pairs (empty when spec is blank).
+
+    Raises:
+        typer.BadParameter: If a pair is malformed.
+    '''
+    cells: list[list[int]] = []
+    for pair in spec.replace(":", ",").split(";"):
+        parts = [p.strip() for p in pair.split(",") if p.strip()]
+        if not parts:
+            continue
+        if len(parts) != 2:
+            raise typer.BadParameter(
+                f"Invalid --exclude item '{pair.strip()}', expected 'ix,iy'"
+            )
+        try:
+            cells.append([int(parts[0]), int(parts[1])])
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"Invalid --exclude item '{pair.strip()}', expected integers"
+            ) from exc
+    return cells
+
+
 @app.command()
 def generate(
     cells_x: int = typer.Option(1, "--cells-x", "-x", min=1, max=64,
@@ -50,6 +80,9 @@ def generate(
     ),
     slope_side: str = typer.Option(
         "+X", "--slope-side", help=f"Raised slope edge: {'/'.join(SLOPE_SIDES)}."
+    ),
+    exclude: str = typer.Option(
+        "", "--exclude", help="Cells to exclude, e.g. '0,1;2,1' (ix,iy from 0)."
     ),
     settings_file: Path | None = typer.Option(
         None, "--settings", "-s", help="Load parameters from a JSON preset first."
@@ -81,6 +114,7 @@ def generate(
             "tube_inner_diameter": tube_inner_diameter,
             "slope_rise_units": slope_rise,
             "slope_side": slope_side,
+            "excluded_cells": _parse_exclude(exclude),
         }
         settings = settings.model_copy(update=overrides)
         settings = validate_settings(settings.model_dump())

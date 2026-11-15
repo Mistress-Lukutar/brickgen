@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.0
+Version: v0.5.0
 '''
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from brickgen.core.builder import build_block
 from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import SLOPE_SIDES, BlockSettings, validate_settings
+from brickgen.gui.grid_editor import CellGridEditor
 from brickgen.gui.library import TemplateLibraryPanel
 from brickgen.gui.preview import DISPLAY_MODES, MODE_SOLID, PreviewWidget
 from brickgen.services.export_service import SUPPORTED_FORMATS, export_model
@@ -88,6 +89,7 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.addWidget(self._build_size_group())
+        layout.addWidget(self._build_layout_group())
         layout.addWidget(self._build_slope_group())
         layout.addWidget(self._build_display_group())
         layout.addWidget(self._build_actions_group())
@@ -138,6 +140,18 @@ class MainWindow(QMainWindow):
         form.addRow("Tube bore diameter, mm", tube_spin)
         return group
 
+    def _build_layout_group(self) -> QGroupBox:
+        '''Create the top-view cell grid editor group.'''
+        group = QGroupBox("Layout (top view, click cells to exclude)")
+        layout = QVBoxLayout(group)
+        self._cell_grid = CellGridEditor()
+        self._cell_grid.changed.connect(self._schedule_rebuild)
+        include_all = QPushButton("Include all cells")
+        include_all.clicked.connect(self._on_include_all)
+        layout.addWidget(self._cell_grid, alignment=Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(include_all)
+        return group
+
     def _build_slope_group(self) -> QGroupBox:
         '''Create the slope group (only applies to stud-less blocks).'''
         self._slope_group = QGroupBox("Slope (stud-less blocks)")
@@ -151,7 +165,8 @@ class MainWindow(QMainWindow):
         form.addRow("Edge rise", self._slope_rise)
         note = QLabel(
             "One top edge rises N x block_height, the top face slopes down\n"
-            "to the opposite edge. Studs and tubes do not apply."
+            "to the opposite edge (full rectangle). Studs and tubes do not\n"
+            "apply; cell exclusions are ignored in this mode."
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -189,8 +204,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------- auto generation
     def _connect_auto_generate(self) -> None:
         '''Wire every parameter widget to the debounced regeneration.'''
-        self._cells_x.valueChanged.connect(self._schedule_rebuild)
-        self._cells_y.valueChanged.connect(self._schedule_rebuild)
+        self._cells_x.valueChanged.connect(self._on_cells_changed)
+        self._cells_y.valueChanged.connect(self._on_cells_changed)
         for spin in self._floats.values():
             spin.valueChanged.connect(self._schedule_rebuild)
         self._tubes.toggled.connect(self._schedule_rebuild)
@@ -200,6 +215,16 @@ class MainWindow(QMainWindow):
     def _schedule_rebuild(self) -> None:
         '''(Re)start the debounced regeneration timer.'''
         self._regen_timer.start()
+
+    def _on_cells_changed(self) -> None:
+        '''Resize the grid editor when the cell counts change; regenerate.'''
+        self._cell_grid.set_dimensions(self._cells_x.value(), self._cells_y.value())
+        self._schedule_rebuild()
+
+    def _on_include_all(self) -> None:
+        '''Reset the exclusion mask from the "Include all" button.'''
+        self._cell_grid.include_all()
+        self._schedule_rebuild()
 
     def _on_pins_toggled(self, checked: bool) -> None:
         '''Enable the slope group only for stud-less blocks; regenerate.'''
@@ -216,13 +241,14 @@ class MainWindow(QMainWindow):
         Raises:
             SettingsValidationError: If values fail geometry validation.
         '''
-        values: dict[str, int | float | bool | str] = {
+        values: dict[str, int | float | bool | str | list] = {
             "cells_x": self._cells_x.value(),
             "cells_y": self._cells_y.value(),
             "pins_enabled": self._pins.isChecked(),
             "tubes_enabled": self._tubes.isChecked(),
             "slope_side": self._slope_side.currentText(),
             "slope_rise_units": self._slope_rise.value(),
+            "excluded_cells": self._cell_grid.excluded_cells(),
         }
         values.update({field: spin.value() for field, spin in self._floats.items()})
         return validate_settings(values)
@@ -248,6 +274,8 @@ class MainWindow(QMainWindow):
         self._slope_side.setCurrentText(self._settings.slope_side)
         self._slope_rise.setValue(self._settings.slope_rise_units)
         self._slope_group.setEnabled(not self._settings.pins_enabled)
+        self._cell_grid.set_dimensions(self._settings.cells_x, self._settings.cells_y)
+        self._cell_grid.set_excluded(self._settings.excluded_cells)
         for field, spin in self._floats.items():
             spin.setValue(getattr(self._settings, field))
 
@@ -287,11 +315,16 @@ class MainWindow(QMainWindow):
             if self._settings.slope_active
             else ""
         )
+        figure_note = (
+            f" | figure {self._settings.included_count} cells"
+            if not self._settings.is_rectangular
+            else ""
+        )
         self._status_style(False)
         self._status.setText(
             f"Form {self._settings.describe()} | footprint "
             f"{self._settings.outer_length_x:.2f} x {self._settings.outer_length_y:.2f} mm"
-            f" | height {self._settings.total_height:.2f} mm{slope_note}"
+            f" | height {self._settings.total_height:.2f} mm{slope_note}{figure_note}"
         )
         self._preview.show_model(self._model)
         self._preview.set_display_mode(self._mode.currentText())
