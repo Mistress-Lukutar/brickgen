@@ -3,7 +3,7 @@ File:   test_preview.py
 Brief:  Unit tests for the pyvista mesh conversion used by the preview.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.8.1
+Version: v0.9.0
 '''
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def test_edge_chord_deviation_bounded() -> None:
     circle = next(e for e in solid.Edges()
                   if e.geomType() == "CIRCLE" and e.Length() > 8.0)
     tolerance = 0.02
-    points = _sample_edge(circle, tolerance)
+    points = _sample_edge(circle, tolerance, 0.1)
     assert len(points) >= 2
     # Independent check: fine ground-truth sampling of the curve; every
     # fine point must lie within tolerance of the sampled polyline.
@@ -109,3 +109,11 @@ def test_edge_chord_deviation_bounded() -> None:
         proj = a + t[:, None] * ab
         dmin = np.minimum(dmin, np.linalg.norm(fine - proj, axis=1))
     assert float(dmin.max()) <= tolerance
+
+
+def test_edge_density_depends_on_angular_tolerance() -> None:
+    '''Tighter angular tolerance yields denser curved-edge polylines.'''
+    solid = build_block(BlockSettings(cells_x=1, cells_y=1)).val()
+    loose = brep_edges_polydata(solid, tolerance=1.0, angular_tolerance=0.3)
+    tight = brep_edges_polydata(solid, tolerance=1.0, angular_tolerance=0.02)
+    assert tight.n_points > loose.n_points

@@ -3,7 +3,7 @@ File:   export_service.py
 Brief:  Export of generated solids to STEP/STL/AMF/3MF/SVG/VRML/BREP files.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.1.0
+Version: v0.9.0
 '''
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ def export_model(
     output_path: Path,
     file_format: str,
     tolerance: float = DEFAULT_TESSELLATION_TOLERANCE,
+    angular_tolerance: float = 0.1,
 ) -> Path:
     '''Export a CadQuery model to the requested 3D file format.
 
@@ -67,6 +68,7 @@ def export_model(
             str(output_path),
             exportType=export_type,
             tolerance=tolerance,
+            angularTolerance=angular_tolerance,
         )
     except ExportError:
         raise

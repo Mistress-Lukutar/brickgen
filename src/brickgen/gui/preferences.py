@@ -3,7 +3,7 @@ File:   preferences.py
 Brief:  Modal preferences dialog: precisions and default export format.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.8.0
+Version: v0.9.0
 '''
 
 from __future__ import annotations
@@ -54,6 +54,20 @@ class PreferencesDialog(QDialog):
         self._export_tol.setValue(settings.export_tolerance)
         form.addRow("Export mesh tolerance, mm", self._export_tol)
 
+        self._preview_ang = QDoubleSpinBox()
+        self._preview_ang.setRange(0.01, 1.0)
+        self._preview_ang.setSingleStep(0.01)
+        self._preview_ang.setDecimals(3)
+        self._preview_ang.setValue(settings.preview_angular_tolerance)
+        form.addRow("Preview angular tolerance, rad", self._preview_ang)
+
+        self._export_ang = QDoubleSpinBox()
+        self._export_ang.setRange(0.01, 1.0)
+        self._export_ang.setSingleStep(0.01)
+        self._export_ang.setDecimals(3)
+        self._export_ang.setValue(settings.export_angular_tolerance)
+        form.addRow("Export angular tolerance, rad", self._export_ang)
+
         self._format = QComboBox()
         self._format.addItems(list(SUPPORTED_FORMATS))
         self._format.setCurrentText(settings.default_format)
@@ -76,7 +90,9 @@ class PreferencesDialog(QDialog):
         '''
         values = {
             "preview_tolerance": self._preview_tol.value(),
+            "preview_angular_tolerance": self._preview_ang.value(),
             "export_tolerance": self._export_tol.value(),
+            "export_angular_tolerance": self._export_ang.value(),
             "default_format": self._format.currentText(),
         }
         try:

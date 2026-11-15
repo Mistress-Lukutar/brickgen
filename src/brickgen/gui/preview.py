@@ -3,7 +3,7 @@ File:   preview.py
 Brief:  PyVista/VTK-based 3D preview widget with display modes.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.8.1
+Version: v0.9.0
 '''
 
 from __future__ import annotations
@@ -40,16 +40,19 @@ ANGULAR_TOLERANCE = 0.1  # rad, matches Shape.tessellate default
 MAX_EDGE_SEGMENTS = 256
 
 
-def _sample_edge(edge: cq.Edge, tolerance: float) -> list[cq.Vector]:
+def _sample_edge(
+    edge: cq.Edge, tolerance: float, angular_tolerance: float
+) -> list[cq.Vector]:
     '''Sample an edge as a polyline matching the mesh constraints.
 
     The segment count doubles until every chord deviates from the true
     curve by no more than ``tolerance`` AND the turn angle between adjacent
-    chords stays within ``ANGULAR_TOLERANCE`` (or the segment cap is hit).
+    chords stays within ``angular_tolerance`` (or the segment cap is hit).
 
     Args:
         edge: CadQuery edge to sample.
         tolerance: Maximum chord deviation in mm.
+        angular_tolerance: Maximum turn angle between segments in rad.
 
     Returns:
         Sampled points of the polyline (including both endpoints).
@@ -70,13 +73,15 @@ def _sample_edge(edge: cq.Edge, tolerance: float) -> list[cq.Vector]:
             v2 = cq.Vector(c.x - b.x, c.y - b.y, c.z - b.z)
             if v1.Length > 0 and v2.Length > 0:
                 max_turn = max(max_turn, v1.getAngle(v2))
-        if (max_dev <= tolerance and max_turn <= ANGULAR_TOLERANCE) \
+        if (max_dev <= tolerance and max_turn <= angular_tolerance) \
                 or segments >= MAX_EDGE_SEGMENTS:
             return points
         segments *= 2
 
 
-def brep_edges_polydata(solid: cq.Shape, tolerance: float = 0.15) -> pv.PolyData:
+def brep_edges_polydata(
+    solid: cq.Shape, tolerance: float = 0.15, angular_tolerance: float = ANGULAR_TOLERANCE
+) -> pv.PolyData:
     '''Discretize the topological edges of a shape into line polylines.
 
     Sampling respects the same linear (chord deviation <= ``tolerance``)
@@ -95,7 +100,7 @@ def brep_edges_polydata(solid: cq.Shape, tolerance: float = 0.15) -> pv.PolyData
     points: list[tuple[float, float, float]] = []
     lines: list[int] = []
     for edge in solid.Edges():
-        sampled = _sample_edge(edge, tolerance)
+        sampled = _sample_edge(edge, tolerance, angular_tolerance)
         indices = []
         for p in sampled:
             indices.append(len(points))
@@ -108,17 +113,22 @@ def brep_edges_polydata(solid: cq.Shape, tolerance: float = 0.15) -> pv.PolyData
     )
 
 
-def solid_to_mesh(solid: cq.Shape, tolerance: float = PREVIEW_TESSELLATION_TOLERANCE) -> pv.PolyData:
+def solid_to_mesh(
+    solid: cq.Shape,
+    tolerance: float = PREVIEW_TESSELLATION_TOLERANCE,
+    angular_tolerance: float = ANGULAR_TOLERANCE,
+) -> pv.PolyData:
     '''Convert a CadQuery shape into a cleaned PyVista triangle mesh.
 
     Args:
         solid: CadQuery shape to tessellate.
-        tolerance: Tessellation tolerance in mm.
+        tolerance: Linear tessellation tolerance in mm.
+        angular_tolerance: Angular tessellation tolerance in rad.
 
     Returns:
         Triangle PolyData with merged duplicate vertices.
     '''
-    vertices, triangles = solid.tessellate(tolerance)
+    vertices, triangles = solid.tessellate(tolerance, angular_tolerance)
     points = np.asarray([(v.x, v.y, v.z) for v in vertices])
     faces = np.hstack(
         [np.full((len(triangles), 1), 3), np.asarray(triangles, dtype=np.int64)]
@@ -157,18 +167,20 @@ class PreviewWidget(QtInteractor):
         self,
         model: cq.Workplane,
         tolerance: float = PREVIEW_TESSELLATION_TOLERANCE,
+        angular_tolerance: float = ANGULAR_TOLERANCE,
     ) -> None:
         '''Tessellate the model solid and rebuild both display actors.
 
         Args:
             model: Workplane whose first solid is displayed.
-            tolerance: Tessellation tolerance in mm.
+            tolerance: Linear tessellation tolerance in mm.
+            angular_tolerance: Angular tessellation tolerance in rad.
         '''
         solid = model.val()
         if solid is None:
             return
-        self._mesh = solid_to_mesh(solid, tolerance)
-        self._edges = brep_edges_polydata(solid, tolerance)
+        self._mesh = solid_to_mesh(solid, tolerance, angular_tolerance)
+        self._edges = brep_edges_polydata(solid, tolerance, angular_tolerance)
         self._rebuild_actors()
         self._update_grid()
         self.reset_camera()

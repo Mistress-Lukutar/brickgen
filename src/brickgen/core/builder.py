@@ -3,7 +3,7 @@ File:   builder.py
 Brief:  CadQuery geometry builder for parametric stud blocks.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.6.0
+Version: v0.9.0
 '''
 
 from __future__ import annotations
@@ -89,6 +89,11 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
 
     material = set(_included_cells(settings))
     chamfered = {(ix, iy) for ix, iy, _ in settings.sloped_cells}
+    # For cavity-side decisions a chamfered neighbor counts as boundary:
+    # the wedge cell has no cavity of its own, so a wall strip is required
+    # between the normal cell's cavity and the void under the wedge,
+    # otherwise the bottom opening extends under the wedge (too wide).
+    cavity_neighbors = material - chamfered
 
     outer: cq.Workplane | None = None
     cavity: cq.Workplane | None = None
@@ -101,13 +106,14 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
         outer = cell if outer is None else outer.union(cell)
         if (ix, iy) in chamfered:
             continue  # solid wedge: no cavity opening in chamfered cells
-        # Cavity box: inset t only on sides facing the region boundary;
-        # sides shared with a material neighbor stay open so the cavities
-        # of adjacent cells fuse into a single contour-shaped cavity.
-        inset_x0 = t if (ix - 1, iy) not in material else 0.0
-        inset_x1 = t if (ix + 1, iy) not in material else 0.0
-        inset_y0 = t if (ix, iy - 1) not in material else 0.0
-        inset_y1 = t if (ix, iy + 1) not in material else 0.0
+        # Cavity box: inset t only on sides facing the region boundary or a
+        # chamfered cell; sides shared with a normal material neighbor stay
+        # open so the cavities of adjacent cells fuse into a single
+        # contour-shaped cavity.
+        inset_x0 = t if (ix - 1, iy) not in cavity_neighbors else 0.0
+        inset_x1 = t if (ix + 1, iy) not in cavity_neighbors else 0.0
+        inset_y0 = t if (ix, iy - 1) not in cavity_neighbors else 0.0
+        inset_y1 = t if (ix, iy + 1) not in cavity_neighbors else 0.0
         cav_w = unit - inset_x0 - inset_x1
         cav_h = unit - inset_y0 - inset_y1
         cell_cavity = cq.Workplane(
@@ -198,6 +204,7 @@ def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
     half_y = settings.outer_length_y / 2.0
     radius = min(2.0 * t, unit - 2.0 * t)
     included = set(_included_cells(settings))
+    chamfered = {(ix, iy) for ix, iy, _ in settings.sloped_cells}
 
     ribs: list[cq.Workplane] = []
     for i in range(1, settings.cells_x):
@@ -213,9 +220,20 @@ def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
             if len(missing) != 1:
                 continue  # concave corner needs exactly 3 included cells
             mx, my = missing[0]
+            diagonal = quadrants[(-mx, -my)]
+            if diagonal in chamfered:
+                continue  # no cavity in a chamfered diagonal cell
             vx = i * unit - half_x
             vy = j * unit - half_y
             into_x, into_y = -mx, -my  # into the diagonal included cell
+            # Anchor the rib at the cavity corner of the diagonal cell: the
+            # corner is inset by t along each side whose edge neighbor is a
+            # chamfered cell (those cavities are inset, see the cavity
+            # construction above).
+            off_x = t if quadrants[(mx, -my)] in chamfered else 0.0
+            off_y = t if quadrants[(-mx, my)] in chamfered else 0.0
+            vx += into_x * off_x
+            vy += into_y * off_y
             rib_box = cq.Workplane(
                 "XY",
                 origin=(vx + into_x * radius / 2.0, vy + into_y * radius / 2.0, 0),

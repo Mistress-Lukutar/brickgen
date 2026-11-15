@@ -3,7 +3,7 @@ File:   test_app_settings.py
 Brief:  Unit tests for persistent application preferences.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.8.0
+Version: v0.9.0
 '''
 
 from __future__ import annotations
@@ -69,3 +69,16 @@ def test_settings_path_uses_documents() -> None:
     path = app_settings_path()
     assert path.name == "settings.json"
     assert path.parent.name == "BrickGen"
+
+
+def test_angular_tolerance_defaults_and_bounds() -> None:
+    '''Angular tolerance persists and must be within (0, 1] rad.'''
+    settings = AppSettings(preview_angular_tolerance=0.05,
+                           export_angular_tolerance=0.2)
+    path = save_app_settings(settings)
+    assert load_app_settings().preview_angular_tolerance == 0.05
+    assert load_app_settings().export_angular_tolerance == 0.2
+    with pytest.raises(ValueError):
+        AppSettings(preview_angular_tolerance=0.0)
+    with pytest.raises(ValueError):
+        AppSettings(export_angular_tolerance=2.0)

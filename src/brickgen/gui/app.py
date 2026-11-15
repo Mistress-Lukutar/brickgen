@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.8.0
+Version: v0.9.0
 '''
 
 from __future__ import annotations
@@ -397,7 +397,11 @@ class MainWindow(QMainWindow):
             f"{self._settings.outer_length_x:.2f} x {self._settings.outer_length_y:.2f} mm"
             f" | height {self._settings.total_height:.2f} mm{slope_note}{figure_note}{chamfer_note}"
         )
-        self._preview.show_model(self._model, self._app_settings.preview_tolerance)
+        self._preview.show_model(
+            self._model,
+            self._app_settings.preview_tolerance,
+            self._app_settings.preview_angular_tolerance,
+        )
         self._preview.set_display_mode(self._mode.currentText())
         self._preview.set_grid_enabled(self._grid.isChecked())
 
@@ -429,6 +433,7 @@ class MainWindow(QMainWindow):
             written = export_model(
                 self._model, Path(path), file_format,
                 tolerance=self._app_settings.export_tolerance,
+                angular_tolerance=self._app_settings.export_angular_tolerance,
             )
         except BrickGenError as exc:
             self._set_status("Export failed.", error=True)

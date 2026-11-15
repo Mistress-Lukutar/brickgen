@@ -3,7 +3,7 @@ File:   test_bottom_chamfer.py
 Brief:  Unit tests for bottom-chamfered cells (sloped underside wedges).
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.6.0
+Version: v0.9.0
 '''
 
 from __future__ import annotations
@@ -125,3 +125,33 @@ def test_rectangular_without_chamfers_uses_tubes() -> None:
     assert len(build_block(settings).solids().vals()) == 1
     # tube bore void at the central midpoint
     assert not _material_at(solid, (0.0, 0.0, 1.0))
+
+
+def test_internal_wall_between_cavity_and_wedge_void() -> None:
+    '''Regression (user report): the bottom opening must not extend into
+    neighboring cells. The normal cell's cavity is inset by wall thickness
+    on sides facing a chamfered cell, creating an internal wall between
+    the cavity and the void under the wedge.'''
+    settings = BlockSettings(cells_x=2, cells_y=2, excluded_cells=[[1, 1]],
+                             sloped_cells=[[1, 0, "+X"], [0, 1, "+Y"]])
+    solid = build_block(settings).val()
+    # wall strip between the corner cavity and the +X wedge void
+    # (cell (0,0) spans x -4..0; cavity now ends at x = -wall = -0.8)
+    assert _material_at(solid, (-0.4, -2.0, 0.3))
+    # cavity side of the wall stays void
+    assert not _material_at(solid, (-1.5, -2.0, 0.3))
+    # and the same wall against the +Y wedge void
+    assert _material_at(solid, (-2.0, -0.4, 0.3))
+    assert not _material_at(solid, (-2.0, -1.5, 0.3))
+
+
+def test_rib_anchored_at_inset_cavity_corner() -> None:
+    '''The corner rib follows the inset cavity corner (offset by wall t).'''
+    settings = BlockSettings(cells_x=2, cells_y=2, excluded_cells=[[1, 1]],
+                             sloped_cells=[[1, 0, "+X"], [0, 1, "+Y"]])
+    solid = build_block(settings).val()
+    t = settings.wall_thickness
+    # material just outside the rib arc at the inset corner (V - t)
+    assert _material_at(solid, (-t - 0.02, -t - 0.02, 1.0))
+    # void inside the rib arc
+    assert not _material_at(solid, (-t - 1.0, -t - 1.0, 1.0))

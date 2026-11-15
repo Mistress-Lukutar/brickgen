@@ -3,7 +3,7 @@ File:   app_settings.py
 Brief:  Persistent application preferences (precisions, default format).
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.8.0
+Version: v0.9.0
 '''
 
 from __future__ import annotations
@@ -32,7 +32,9 @@ class AppSettings(BaseModel):
     '''
 
     preview_tolerance: float = Field(default=0.15, gt=0, le=1.0)
+    preview_angular_tolerance: float = Field(default=0.1, gt=0, le=1.0)
     export_tolerance: float = Field(default=0.1, gt=0, le=1.0)
+    export_angular_tolerance: float = Field(default=0.1, gt=0, le=1.0)
     default_format: str = "STEP"
 
     model_config = {"extra": "forbid"}
