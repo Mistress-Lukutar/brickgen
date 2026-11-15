@@ -3,7 +3,7 @@ File:   builder.py
 Brief:  CadQuery geometry builder for parametric LEGO-like stud blocks.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.0
+Version: v0.4.1
 '''
 
 from __future__ import annotations
@@ -107,14 +107,21 @@ def _build_sloped_block(settings: BlockSettings) -> cq.Workplane:
         along_x,
     )
 
-    # Cavity: same profile inset by t on both sides and capped at t below
-    # the sloped top, pushed below the rim so the bottom stays open.
+    # Cavity: XY-inset by t on all sides; ceiling strictly parallel to the
+    # sloped outer top (sampled from the outer top line at the inset ends),
+    # so the top face keeps a uniform vertical thickness t for any rise.
+    # Pushed below the rim so the bottom stays open.
+    def _top_at(pos: float) -> float:
+        '''Outer top-plane height along the slope axis at ``pos``.'''
+        fraction = pos / profile_len
+        return top_b + (top_a - top_b) * fraction
+
     cavity = _extrude_profile(
         [
             (t, -CUT_OVERSHOOT),
             (profile_len - t, -CUT_OVERSHOOT),
-            (profile_len - t, top_a - t),
-            (t, top_b - t),
+            (profile_len - t, _top_at(profile_len - t) - t),
+            (t, _top_at(t) - t),
         ],
         extrude_len - 2.0 * t,
         along_x,
@@ -130,6 +137,10 @@ def _extrude_profile(
 ) -> cq.Workplane:
     '''Extrude an XZ (or YZ) polygon symmetrically across the other axis.
 
+    The polygon is re-centered on the profile axis using the midpoint of its
+    own extent (min..max), so profiles that do not start at zero (e.g. the
+    wall-inset cavity) stay centered in the block.
+
     Args:
         points: Polygon vertices in (axis, height) local coordinates, where
             ``axis`` is X when ``along_x`` else Y.
@@ -137,8 +148,8 @@ def _extrude_profile(
         along_x: True to sketch in the XZ plane (extrude along Y).
 
     Returns:
-        The extruded solid, centered in the perpendicular axis, with the
-        profile axis re-centered at the origin.
+        The extruded solid, centered in both the profile axis and the
+        perpendicular axis.
     '''
     plane = "XZ" if along_x else "YZ"
     solid = (
@@ -147,8 +158,10 @@ def _extrude_profile(
         .close()
         .extrude(extrude_len / 2.0, both=True)
     )
-    return solid.translate((-points[-1][0] / 2.0, 0, 0)) if along_x else \
-        solid.translate((0, -points[-1][0] / 2.0, 0))
+    axis_values = [p[0] for p in points]
+    center = (min(axis_values) + max(axis_values)) / 2.0
+    offset = (-center, 0.0, 0.0) if along_x else (0.0, -center, 0.0)
+    return solid.translate(offset)
 
 
 def _tube_centers(settings: BlockSettings) -> list[tuple[float, float]]:

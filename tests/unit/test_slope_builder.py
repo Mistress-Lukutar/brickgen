@@ -3,12 +3,13 @@ File:   test_slope_builder.py
 Brief:  Unit tests for the sloped-top stud-less block variant.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.0
+Version: v0.4.1
 '''
 
 from __future__ import annotations
 
 import pytest
+from cadquery import Workplane
 
 from brickgen.core.builder import build_block
 from brickgen.core.models import BlockSettings
@@ -94,3 +95,72 @@ def test_slope_ignored_when_pins_enabled() -> None:
     v_plain = build_block(plain).val().Volume()
     v_sloped = build_block(sloped).val().Volume()
     assert v_plain == pytest.approx(v_sloped, rel=1e-6)
+
+
+def test_slope_cavity_is_centered(slope_2x4: BlockSettings) -> None:
+    '''Bottom rim walls must be uniform: cavity centered in the footprint.
+
+    Regression: the cavity used to be shifted by wall_thickness/2 along the
+    slope axis, producing rim walls of t/2 and 3t/2.
+    '''
+    t = slope_2x4.wall_thickness
+    solid = build_block(slope_2x4).val()
+    slab = (
+        Workplane("XY")
+        .box(slope_2x4.outer_length_x, slope_2x4.outer_length_y, 0.1,
+             centered=(True, True, False))
+        .intersect(build_block(slope_2x4))
+    )
+    ring = slab.val().Volume()
+    rim_area = (
+        slope_2x4.outer_length_x * slope_2x4.outer_length_y
+        - (slope_2x4.outer_length_x - 2 * t) * (slope_2x4.outer_length_y - 2 * t)
+    )
+    assert ring == pytest.approx(rim_area * 0.1, rel=1e-3)
+
+
+def test_steep_slope_has_no_hole() -> None:
+    '''Steep slopes keep a uniform top face thickness (no slit hole).
+
+    Regression: a non-parallel cavity ceiling used to poke through the
+    sloped top face when rise exceeded the slope-axis length.
+    '''
+    settings = BlockSettings(
+        cells_x=2, cells_y=2, pins_enabled=False, tubes_enabled=False,
+        slope_rise_units=3, slope_side="+X",
+    )
+    solid = build_block(settings).val()
+    bb = solid.BoundingBox()
+    assert bb.zmax == pytest.approx(12.0, abs=1e-4)
+    # A through-hole in the top face would remove material below analytic.
+    assert solid.Volume() == pytest.approx(_sloped_volume(settings), rel=1e-3)
+
+
+def test_top_face_thickness_is_uniform() -> None:
+    '''Vertical distance between outer top plane and cavity ceiling stays t.
+
+    Sampled at several positions along the slope axis via thin slab cuts.
+    '''
+    settings = BlockSettings(
+        cells_x=2, cells_y=2, pins_enabled=False, tubes_enabled=False,
+        slope_rise_units=2, slope_side="+X",
+    )
+    t = settings.wall_thickness
+    lx = settings.outer_length_x
+    solid = build_block(settings)
+    for pos in (0.25, 0.5, 0.75):
+        # Global x of the sample point along the slope axis.
+        x = -lx / 2.0 + pos * lx
+        # Thin probe column at the block center: inside the cavity the
+        # material spans ceiling..outer-top, so bbox zmin is the ceiling.
+        probe = (
+            Workplane("XY", origin=(x, 0, 0))
+            .rect(0.02, 0.02)
+            .extrude(settings.block_height + settings.slope_rise + 1.0)
+        )
+        column = probe.intersect(solid)
+        bb = column.val().BoundingBox()
+        outer_top = settings.block_height + settings.slope_rise * pos
+        # bbox spans the 0.02 mm probe width; allow that in tolerances.
+        assert bb.zmin == pytest.approx(outer_top - t, abs=0.02)
+        assert bb.zmax == pytest.approx(outer_top, abs=0.02)

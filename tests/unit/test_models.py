@@ -3,7 +3,7 @@ File:   test_models.py
 Brief:  Unit tests for BlockSettings validation and derived properties.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.3.0
+Version: v0.4.1
 '''
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ def test_defaults_match_specification(default_settings: BlockSettings) -> None:
     assert default_settings.unit_size == 4.0
     assert default_settings.wall_thickness == 0.8
     assert default_settings.block_height == 3.0
-    assert default_settings.pin_diameter == 2.5
+    assert default_settings.pin_diameter == 2.6
     assert default_settings.pin_height == 2.0
-    assert default_settings.tube_inner_diameter == 1.0
+    assert default_settings.tube_inner_diameter == 1.2
     assert default_settings.cells_x == 1
     assert default_settings.cells_y == 1
 

@@ -3,7 +3,7 @@ File:   models.py
 Brief:  Pydantic settings model describing the parametric block geometry.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.0
+Version: v0.4.1
 '''
 
 from __future__ import annotations
@@ -76,11 +76,11 @@ class BlockSettings(BaseModel):
     unit_size: float = Field(default=4.0, gt=0)
     wall_thickness: float = Field(default=0.8, gt=0)
     block_height: float = Field(default=3.0, gt=0)
-    pin_diameter: float = Field(default=2.5, gt=0)
+    pin_diameter: float = Field(default=2.6, gt=0)
     pin_height: float = Field(default=2.0, gt=0)
     pins_enabled: bool = True
     tubes_enabled: bool = True
-    tube_inner_diameter: float = Field(default=1.0, gt=0)
+    tube_inner_diameter: float = Field(default=1.2, gt=0)
     slope_rise_units: int = Field(default=0, ge=0, le=MAX_SLOPE_RISE)
     slope_side: SlopeSide = "+X"
 

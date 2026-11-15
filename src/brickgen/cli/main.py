@@ -3,7 +3,7 @@ File:   main.py
 Brief:  Typer CLI entry point for headless block generation and export.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.4.0
+Version: v0.4.1
 '''
 
 from __future__ import annotations
@@ -37,12 +37,12 @@ def generate(
     unit_size: float = typer.Option(4.0, "--unit-size", help="1x1 cell footprint, mm."),
     wall: float = typer.Option(0.8, "--wall", help="Wall thickness, mm."),
     height: float = typer.Option(3.0, "--height", help="Block height, mm."),
-    pin_diameter: float = typer.Option(2.5, "--pin-diameter", help="Stud diameter, mm."),
+    pin_diameter: float = typer.Option(2.6, "--pin-diameter", help="Stud diameter, mm."),
     pin_height: float = typer.Option(2.0, "--pin-height", help="Stud height, mm."),
     no_pins: bool = typer.Option(False, "--no-pins", help="Omit top studs."),
     no_tubes: bool = typer.Option(False, "--no-tubes", help="Omit inner tubes."),
     tube_inner_diameter: float = typer.Option(
-        1.0, "--tube-bore", help="Inner tube bore diameter, mm."
+        1.2, "--tube-bore", help="Inner tube bore diameter, mm."
     ),
     slope_rise: int = typer.Option(
         0, "--slope-rise", min=0, max=16,
