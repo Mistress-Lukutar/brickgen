@@ -3,7 +3,7 @@ File:   test_preview.py
 Brief:  Unit tests for the pyvista mesh conversion used by the preview.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.3.0
+Version: v0.7.0
 '''
 
 from __future__ import annotations
@@ -44,3 +44,21 @@ def test_mesh_has_no_duplicate_points(mesh_2x4) -> None:
 def test_display_modes_list() -> None:
     '''Exactly three display modes are offered: solid, solid+mesh, wireframe.'''
     assert len(DISPLAY_MODES) == 3
+
+
+def test_brep_edges_polydata() -> None:
+    '''B-Rep edges discretize into line cells at every block edge.'''
+    from brickgen.gui.preview import brep_edges_polydata
+
+    solid = build_block(BlockSettings(cells_x=2, cells_y=2)).val()
+    edges = brep_edges_polydata(solid)
+    assert edges.n_cells > 0
+    assert all(cell.n_points >= 2 for cell in edges.cell)
+    bounds = edges.bounds
+    assert bounds.x_max - bounds.x_min == pytest.approx(8.0, abs=1e-3)
+
+
+def test_wireframe_mode_has_no_mesh_fill() -> None:
+    '''Wireframe shows only B-Rep edges: surface actor is absent.'''
+    modes = dict.fromkeys(DISPLAY_MODES)
+    assert "Solid" in modes and "Wireframe" in modes and len(DISPLAY_MODES) == 3

@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.6.1
+Version: v0.7.0
 '''
 
 from __future__ import annotations
