@@ -1,9 +1,9 @@
 '''
 File:   preview.py
-Brief:  Matplotlib-based 3D preview panel embedded into the tkinter GUI.
+Brief:  PyVista/VTK-based 3D preview widget with display modes.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.1.0
+Version: v0.2.0
 '''
 
 from __future__ import annotations
@@ -12,39 +12,70 @@ import logging
 
 import cadquery as cq
 import numpy as np
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import pyvista as pv
+from pyvistaqt import QtInteractor
 
 logger = logging.getLogger(__name__)
 
 # Tessellation tolerance for the interactive preview, mm.
-PREVIEW_TESSELLATION_TOLERANCE = 0.2
+PREVIEW_TESSELLATION_TOLERANCE = 0.15
 
-_PREVIEW_COLOR = "#3f7fbf"
-_PREVIEW_EDGE_COLOR = "#1d3d5c"
+BLOCK_COLOR = "#3f7fbf"
+EDGE_COLOR = "#173a57"
+
+# Display modes offered by the GUI.
+MODE_SOLID = "Solid"
+MODE_SOLID_MESH = "Solid + mesh"
+MODE_WIREFRAME = "Wireframe"
+DISPLAY_MODES: list[str] = [MODE_SOLID, MODE_SOLID_MESH, MODE_WIREFRAME]
 
 
-class PreviewPanel:
-    '''Tk-embedded 3D mesh preview rendered with matplotlib.'''
+def solid_to_mesh(solid: cq.Shape, tolerance: float = PREVIEW_TESSELLATION_TOLERANCE) -> pv.PolyData:
+    '''Convert a CadQuery shape into a cleaned PyVista triangle mesh.
 
-    def __init__(self, parent: object) -> None:
-        '''Create the preview panel inside ``parent`` (a tk widget).
+    Args:
+        solid: CadQuery shape to tessellate.
+        tolerance: Tessellation tolerance in mm.
+
+    Returns:
+        Triangle PolyData with merged duplicate vertices.
+    '''
+    vertices, triangles = solid.tessellate(tolerance)
+    points = np.asarray([(v.x, v.y, v.z) for v in vertices])
+    faces = np.hstack(
+        [np.full((len(triangles), 1), 3), np.asarray(triangles, dtype=np.int64)]
+    ).ravel()
+    return pv.PolyData(points, faces).clean(tolerance=1e-6)
+
+
+class PreviewWidget(QtInteractor):
+    '''Interactive 3D preview: shaded solid / wireframe, optional mm grid.
+
+    Wraps a pyvista QtInteractor; the mesh is tessellated once per model and
+    display-mode/grid changes only touch actor properties, not geometry.
+    '''
+
+    def __init__(self, parent: object | None = None) -> None:
+        '''Create the renderer with a white background.
 
         Args:
-            parent: Parent tkinter widget or grid slot container.
+            parent: Optional parent Qt widget.
         '''
-        self._figure = Figure(figsize=(5, 4), dpi=100)
-        self._axes = self._figure.add_subplot(111, projection="3d")
-        self._canvas = FigureCanvasTkAgg(self._figure, master=parent)
-        self._toolbar = NavigationToolbar2Tk(self._canvas, parent, pack_toolbar=False)
-        self._toolbar.config(height=28)
-        self._toolbar.pack(side="bottom", fill="x")
-        self._canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
-        self._show_empty()
+        super().__init__(parent=parent)
+        self.set_background("white")
+        self._mesh: pv.PolyData | None = None
+        self._mesh_actor = None
+        self._grid_actor = None
+        self._mode = MODE_SOLID
+        self._grid_enabled = False
+        self.enable_anti_aliasing("msaa")
 
-    def show_model(self, model: cq.Workplane, tolerance: float = PREVIEW_TESSELLATION_TOLERANCE) -> None:
-        '''Render a CadQuery solid as a shaded mesh.
+    def show_model(
+        self,
+        model: cq.Workplane,
+        tolerance: float = PREVIEW_TESSELLATION_TOLERANCE,
+    ) -> None:
+        '''Tessellate the model solid and (re)create the mesh actor.
 
         Args:
             model: Workplane whose first solid is displayed.
@@ -52,46 +83,69 @@ class PreviewPanel:
         '''
         solid = model.val()
         if solid is None:
-            self._show_empty()
             return
-        vertices, triangles = solid.tessellate(tolerance)
-        verts = np.asarray([(v.x, v.y, v.z) for v in vertices])
-        faces = verts[np.asarray(triangles)]
-        self._axes.clear()
-        collection = Poly3DCollection(
-            faces,
-            facecolors=_PREVIEW_COLOR,
-            edgecolors=_PREVIEW_EDGE_COLOR,
-            linewidths=0.15,
-            shade=True,
+        self._mesh = solid_to_mesh(solid, tolerance)
+        if self._mesh_actor is not None:
+            self.remove_actor(self._mesh_actor)
+        self._mesh_actor = self._add_mesh_actor()
+        self._update_grid()
+        self.reset_camera()
+        logger.debug(
+            "Preview mesh: %d points / %d cells", self._mesh.n_points, self._mesh.n_cells
         )
-        self._axes.add_collection3d(collection)
-        self._fit_axes(verts)
-        self._axes.set_xlabel("X, mm")
-        self._axes.set_ylabel("Y, mm")
-        self._axes.set_zlabel("Z, mm")
-        self._axes.view_init(elev=28, azim=-55)
-        self._canvas.draw_idle()
-        logger.debug("Preview updated: %d verts / %d faces", len(verts), len(faces))
 
-    def _fit_axes(self, verts: np.ndarray) -> None:
-        '''Fit axes limits to the mesh bounding box with equal aspect ratio.'''
-        mins = verts.min(axis=0)
-        maxs = verts.max(axis=0)
-        center = (mins + maxs) / 2.0
-        half = float(((maxs - mins) / 2.0).max()) * 1.1 or 1.0
-        self._axes.set_xlim(center[0] - half, center[0] + half)
-        self._axes.set_ylim(center[1] - half, center[1] + half)
-        self._axes.set_zlim(center[2] - half, center[2] + half)
-        self._axes.set_box_aspect((1, 1, 1))
+    def set_display_mode(self, mode: str) -> None:
+        '''Switch the rendering style without retessellating.
 
-    def _show_empty(self) -> None:
-        '''Display a blank scene before the first model is generated.'''
-        self._axes.clear()
-        self._axes.set_xlim(-4, 4)
-        self._axes.set_ylim(-4, 4)
-        self._axes.set_zlim(0, 8)
-        self._axes.set_xlabel("X, mm")
-        self._axes.set_ylabel("Y, mm")
-        self._axes.set_zlabel("Z, mm")
-        self._canvas.draw_idle()
+        Args:
+            mode: One of ``DISPLAY_MODES``.
+        '''
+        if mode not in DISPLAY_MODES or mode == self._mode:
+            return
+        self._mode = mode
+        if self._mesh_actor is not None:
+            self.remove_actor(self._mesh_actor)
+            self._mesh_actor = self._add_mesh_actor()
+            self.render()
+
+    def set_grid_enabled(self, enabled: bool) -> None:
+        '''Show or hide the metric grid around the model.
+
+        Args:
+            enabled: True to display the grid.
+        '''
+        self._grid_enabled = enabled
+        self._update_grid()
+
+    # ------------------------------------------------------------------ internals
+    def _add_mesh_actor(self):
+        '''Add the current mesh with the styling of the active mode.
+
+        Returns:
+            The created actor, or None when no mesh is loaded.
+        '''
+        if self._mesh is None:
+            return None
+        if self._mode == MODE_WIREFRAME:
+            return self.add_mesh(
+                self._mesh, color=BLOCK_COLOR, style="wireframe", line_width=1.5
+            )
+        return self.add_mesh(
+            self._mesh,
+            color=BLOCK_COLOR,
+            show_edges=(self._mode == MODE_SOLID_MESH),
+            edge_color=EDGE_COLOR,
+            line_width=0.5,
+            smooth_shading=False,
+            specular=0.3,
+            lighting="three lights",
+        )
+
+    def _update_grid(self) -> None:
+        '''Recreate or remove the metric grid actor.'''
+        if self._grid_actor is not None:
+            self.remove_actor(self._grid_actor)
+            self._grid_actor = None
+        if self._grid_enabled and self._mesh is not None:
+            self._grid_actor = self.show_grid(font_size=8)
+        self.render()

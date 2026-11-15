@@ -1,299 +1,283 @@
 '''
 File:   app.py
-Brief:  Main BrickGen tkinter window: settings panel, 3D preview, export.
+Brief:  BrickGen PySide6 main window: settings panel, VTK preview, export.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.1.0
+Version: v0.2.0
 '''
 
 from __future__ import annotations
 
 import logging
-import tkinter as tk
+import sys
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 
-import cadquery as cq
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
 
 from brickgen.core.builder import build_block
 from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import BlockSettings, validate_settings
-from brickgen.gui.preview import PreviewPanel
+from brickgen.gui.preview import DISPLAY_MODES, MODE_SOLID, PreviewWidget
 from brickgen.services.export_service import SUPPORTED_FORMATS, export_model
 from brickgen.services.settings_io import load_settings, save_settings
 
 logger = logging.getLogger(__name__)
 
-_SETTINGS_FILETYPES = [
-    ("BrickGen settings", "*.json"),
-    ("All files", "*.*"),
-]
-
-# (label, settings field, unit hint)
-_FLOAT_FIELDS: list[tuple[str, str, str]] = [
-    ("Unit size", "unit_size", "mm"),
-    ("Wall thickness", "wall_thickness", "mm"),
-    ("Block height", "block_height", "mm"),
-    ("Pin diameter", "pin_diameter", "mm"),
-    ("Pin height", "pin_height", "mm"),
-]
-_INT_FIELDS: list[tuple[str, str, str]] = [
-    ("Cells X (length)", "cells_x", "cells"),
-    ("Cells Y (width)", "cells_y", "cells"),
-]
+_SETTINGS_FILETYPES = "BrickGen settings (*.json);;All files (*.*)"
 
 
-class BrickGenApp:
-    '''Main application window assembling settings, preview and export.'''
+class MainWindow(QMainWindow):
+    '''Main application window: parameters on the left, VTK preview on the right.'''
 
-    def __init__(self, root: tk.Tk) -> None:
-        '''Build the window layout and render the default 1x1 block.
-
-        Args:
-            root: Tk root window to populate.
-        '''
-        self._root = root
+    def __init__(self) -> None:
+        '''Build the layout and render the default 1x1 block.'''
+        super().__init__()
         self._settings = BlockSettings()
-        self._model: cq.Workplane | None = None
+        self._model = None
+        self.setWindowTitle("BrickGen - LEGO-like block generator")
+        self.resize(1200, 720)
+        self.setMinimumSize(900, 560)
 
-        root.title("BrickGen - LEGO-like block generator")
-        root.geometry("1100x680")
-        root.minsize(900, 560)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self._build_sidebar())
+        self._preview = PreviewWidget()
+        splitter.addWidget(self._preview)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        self.setCentralWidget(splitter)
 
-        self._build_layout()
+        self._sync_form_from_settings()
         self._on_generate()
-        logger.info("BrickGen window ready")
 
     # ------------------------------------------------------------------ layout
-    def _build_layout(self) -> None:
-        '''Create the two-pane layout: settings sidebar + preview area.'''
-        paned = ttk.PanedWindow(self._root, orient="horizontal")
-        paned.pack(fill="both", expand=True)
+    def _build_sidebar(self) -> QWidget:
+        '''Create the parameters panel with actions and status label.'''
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.addWidget(self._build_size_group())
+        layout.addWidget(self._build_display_group())
+        layout.addWidget(self._build_actions_group())
+        layout.addStretch(1)
+        self._status = QLabel("Ready.")
+        self._status.setWordWrap(True)
+        layout.addWidget(self._status)
+        return panel
 
-        sidebar = ttk.Frame(paned, padding=10)
-        paned.add(sidebar, weight=0)
-        preview_frame = ttk.Frame(paned)
-        paned.add(preview_frame, weight=1)
+    def _build_size_group(self) -> QGroupBox:
+        '''Create the block-geometry form group.'''
+        group = QGroupBox("Block parameters")
+        form = QFormLayout(group)
 
-        self._preview = PreviewPanel(preview_frame)
-        self._build_sidebar(sidebar)
+        self._cells_x = QSpinBox()
+        self._cells_x.setRange(1, 64)
+        self._cells_y = QSpinBox()
+        self._cells_y.setRange(1, 64)
+        form.addRow("Cells X (length)", self._cells_x)
+        form.addRow("Cells Y (width)", self._cells_y)
 
-    def _build_sidebar(self, parent: ttk.Frame) -> None:
-        '''Create the settings form, action buttons and status bar.'''
-        parent.columnconfigure(0, weight=1)
+        self._floats: dict[str, QDoubleSpinBox] = {}
+        for label, field, maximum in [
+            ("Unit size, mm", "unit_size", 100.0),
+            ("Wall thickness, mm", "wall_thickness", 20.0),
+            ("Block height, mm", "block_height", 200.0),
+            ("Pin diameter, mm", "pin_diameter", 50.0),
+            ("Pin height, mm", "pin_height", 100.0),
+        ]:
+            spin = QDoubleSpinBox()
+            spin.setRange(0.05, maximum)
+            spin.setSingleStep(0.1)
+            spin.setDecimals(2)
+            self._floats[field] = spin
+            form.addRow(label, spin)
 
-        header = ttk.Label(
-            parent, text="Block parameters", font=("", 11, "bold")
-        )
-        header.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._pins = QCheckBox("Studs on top")
+        form.addRow(self._pins)
+        return group
 
-        self._vars: dict[str, tk.Variable] = {}
-        row = 1
-        for label, field, unit in _INT_FIELDS:
-            self._add_spinbox(parent, row, label, field, unit, 1, 64, 1)
-            row += 1
-        for label, field, unit in _FLOAT_FIELDS:
-            self._add_spinbox(parent, row, label, field, unit, 0.05, 500.0, 0.1)
-            row += 1
+    def _build_display_group(self) -> QGroupBox:
+        '''Create the preview display-mode group.'''
+        group = QGroupBox("Preview")
+        layout = QFormLayout(group)
+        self._mode = QComboBox()
+        self._mode.addItems(DISPLAY_MODES)
+        self._mode.setCurrentText(MODE_SOLID)
+        self._mode.currentTextChanged.connect(self._on_mode_changed)
+        self._grid = QCheckBox("Show grid")
+        self._grid.toggled.connect(self._on_grid_toggled)
+        layout.addRow("Display mode", self._mode)
+        layout.addRow(self._grid)
+        return group
 
-        pins_var = tk.BooleanVar(value=self._settings.pins_enabled)
-        pins_check = ttk.Checkbutton(
-            parent, text="Studs on top", variable=pins_var,
-            command=self._on_pins_toggled,
-        )
-        pins_check.grid(row=row, column=0, sticky="w", pady=6)
-        self._vars["pins_enabled"] = pins_var
-        row += 1
-
-        self._form_label = ttk.Label(parent, text="", foreground="#555")
-        self._form_label.grid(row=row, column=0, sticky="w")
-        row += 1
-
-        buttons = ttk.Frame(parent)
-        buttons.grid(row=row, column=0, sticky="ew", pady=(8, 0))
-        buttons.columnconfigure((0, 1), weight=1)
-        ttk.Button(buttons, text="Generate", command=self._on_generate).grid(
-            row=0, column=0, columnspan=2, sticky="ew", pady=2
-        )
-        ttk.Button(buttons, text="Export model...", command=self._on_export).grid(
-            row=1, column=0, columnspan=2, sticky="ew", pady=2
-        )
-        ttk.Button(buttons, text="Save settings...", command=self._on_save_settings).grid(
-            row=2, column=0, sticky="ew", pady=2, padx=(0, 2)
-        )
-        ttk.Button(buttons, text="Load settings...", command=self._on_load_settings).grid(
-            row=2, column=1, sticky="ew", pady=2, padx=(2, 0)
-        )
-        row += 1
-
-        self._status = tk.StringVar(value="Ready.")
-        ttk.Label(parent, textvariable=self._status, foreground="#0a6").grid(
-            row=row, column=0, sticky="ew", pady=(8, 0)
-        )
-
-    def _add_spinbox(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        field: str,
-        unit: str,
-        min_value: float,
-        max_value: float,
-        step: float,
-    ) -> None:
-        '''Add one labelled spinbox row bound to a settings field.
-
-        Args:
-            parent: Frame to place the row in.
-            row: Grid row index.
-            label: Human-readable field label.
-            field: BlockSettings field name.
-            unit: Unit hint shown after the field.
-            min_value: Minimal spinbox value.
-            max_value: Maximal spinbox value.
-            step: Spinbox increment.
-        '''
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
-        var = tk.StringVar(value=str(getattr(self._settings, field)))
-        frame = ttk.Frame(parent)
-        frame.grid(row=row, column=0, sticky="e")
-        spin = ttk.Spinbox(
-            frame, textvariable=var, from_=min_value, to=max_value,
-            increment=step, width=7,
-        )
-        spin.pack(side="left")
-        ttk.Label(frame, text=unit, foreground="#888").pack(side="left", padx=(4, 0))
-        self._vars[field] = var
+    def _build_actions_group(self) -> QWidget:
+        '''Create the action buttons group.'''
+        group = QGroupBox("Actions")
+        layout = QVBoxLayout(group)
+        generate = QPushButton("Generate")
+        generate.clicked.connect(self._on_generate)
+        export = QPushButton("Export model...")
+        export.clicked.connect(self._on_export)
+        save = QPushButton("Save settings...")
+        save.clicked.connect(self._on_save_settings)
+        load = QPushButton("Load settings...")
+        load.clicked.connect(self._on_load_settings)
+        layout.addWidget(generate)
+        layout.addWidget(export)
+        layout.addWidget(save)
+        layout.addWidget(load)
+        return group
 
     # ----------------------------------------------------------------- actions
     def _collect_settings(self) -> BlockSettings:
-        '''Build BlockSettings from the form fields.
+        '''Build BlockSettings from the form widgets.
 
         Returns:
             Validated settings.
 
         Raises:
-            ValueError: If a numeric field contains a non-numeric value.
             SettingsValidationError: If values fail geometry validation.
         '''
-        values: dict[str, int | float | bool] = {}
-        for _, field, _ in _INT_FIELDS:
-            values[field] = int(float(self._vars[field].get()))
-        for _, field, _ in _FLOAT_FIELDS:
-            values[field] = float(self._vars[field].get())
-        values["pins_enabled"] = bool(self._vars["pins_enabled"].get())
+        values: dict[str, int | float | bool] = {
+            "cells_x": self._cells_x.value(),
+            "cells_y": self._cells_y.value(),
+            "pins_enabled": self._pins.isChecked(),
+        }
+        values.update({field: spin.value() for field, spin in self._floats.items()})
         return validate_settings(values)
 
-    def _on_pins_toggled(self) -> None:
-        '''React to the studs checkbox without rebuilding the model.'''
-        self._settings.pins_enabled = bool(self._vars["pins_enabled"].get())
-        self._on_generate()
+    def _sync_form_from_settings(self) -> None:
+        '''Push settings values into the form widgets.'''
+        self._cells_x.setValue(self._settings.cells_x)
+        self._cells_y.setValue(self._settings.cells_y)
+        self._pins.setChecked(self._settings.pins_enabled)
+        for field, spin in self._floats.items():
+            spin.setValue(getattr(self._settings, field))
+
+    def _on_mode_changed(self, mode: str) -> None:
+        '''Apply the selected display mode to the preview.'''
+        self._preview.set_display_mode(mode)
+
+    def _on_grid_toggled(self, enabled: bool) -> None:
+        '''Show or hide the preview grid.'''
+        self._preview.set_grid_enabled(enabled)
 
     def _on_generate(self) -> None:
         '''Rebuild the model from form values and refresh the preview.'''
         try:
             self._settings = self._collect_settings()
-        except (ValueError, BrickGenError) as exc:
-            self._status.set("Invalid settings.")
-            messagebox.showwarning("Invalid settings", str(exc), parent=self._root)
+        except BrickGenError as exc:
+            self._set_status("Invalid settings.", error=True)
+            QMessageBox.warning(self, "Invalid settings", str(exc))
             return
         try:
             self._model = build_block(self._settings)
         except BrickGenError as exc:
-            self._status.set("Generation failed.")
-            messagebox.showerror("Generation failed", str(exc), parent=self._root)
+            self._set_status("Generation failed.", error=True)
+            QMessageBox.critical(self, "Generation failed", str(exc))
             return
-        self._form_label.config(
-            text=f"Form: {self._settings.describe()}   "
-                 f"Footprint: {self._settings.outer_length_x:.2f} x "
-                 f"{self._settings.outer_length_y:.2f} mm   "
-                 f"Height: {self._settings.total_height:.2f} mm"
+        self._status_style(False)
+        self._status.setText(
+            f"Form {self._settings.describe()} | footprint "
+            f"{self._settings.outer_length_x:.2f} x {self._settings.outer_length_y:.2f} mm"
+            f" | height {self._settings.total_height:.2f} mm"
         )
         self._preview.show_model(self._model)
-        self._status.set(
-            f"Generated {self._settings.describe()} block "
-            f"({self._settings.outer_length_x:.1f} x "
-            f"{self._settings.outer_length_y:.1f} x "
-            f"{self._settings.total_height:.1f} mm)."
-        )
+        self._preview.set_display_mode(self._mode.currentText())
+        self._preview.set_grid_enabled(self._grid.isChecked())
 
     def _on_export(self) -> None:
         '''Ask for a destination file and export the current model.'''
         if self._model is None:
-            messagebox.showinfo(
-                "Nothing to export", "Generate a block first.", parent=self._root
-            )
+            QMessageBox.information(self, "Nothing to export", "Generate a block first.")
             return
         formats = sorted(SUPPORTED_FORMATS)
-        default_name = f"block_{self._settings.describe()}.step"
-        path = filedialog.asksaveasfilename(
-            parent=self._root,
-            title="Export model",
-            defaultextension=".step",
-            initialfile=default_name,
-            filetypes=[(fmt, f"*.{fmt.lower()}") for fmt in formats]
-            + [("All files", "*.*")],
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export model",
+            f"block_{self._settings.describe()}.step",
+            ";;".join(f"{fmt} (*.{fmt.lower()})" for fmt in formats)
+            + ";;All files (*.*)",
         )
         if not path:
             return
-        suffix = Path(path).suffix.lstrip(".").upper()
+        suffix = path.rsplit(".", 1)[-1].upper() if "." in path else "STEP"
         file_format = suffix if suffix in SUPPORTED_FORMATS else "STEP"
         try:
             written = export_model(self._model, Path(path), file_format)
         except BrickGenError as exc:
-            self._status.set("Export failed.")
-            messagebox.showerror("Export failed", str(exc), parent=self._root)
+            self._set_status("Export failed.", error=True)
+            QMessageBox.critical(self, "Export failed", str(exc))
             return
-        self._status.set(f"Exported: {written.name}")
+        self._set_status(f"Exported: {written.name}")
 
     def _on_save_settings(self) -> None:
         '''Persist current form values into a JSON preset.'''
-        path = filedialog.asksaveasfilename(
-            parent=self._root,
-            title="Save settings",
-            defaultextension=".json",
-            initialfile="brickgen_settings.json",
-            filetypes=_SETTINGS_FILETYPES,
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save settings", "brickgen_settings.json", _SETTINGS_FILETYPES
         )
         if not path:
             return
         try:
             self._settings = self._collect_settings()
             written = save_settings(self._settings, Path(path))
-        except (ValueError, BrickGenError) as exc:
-            messagebox.showerror("Save failed", str(exc), parent=self._root)
+        except BrickGenError as exc:
+            QMessageBox.critical(self, "Save failed", str(exc))
             return
-        self._status.set(f"Settings saved: {written.name}")
+        self._set_status(f"Settings saved: {written.name}")
 
     def _on_load_settings(self) -> None:
         '''Load a JSON preset into the form and regenerate the model.'''
-        path = filedialog.askopenfilename(
-            parent=self._root, title="Load settings", filetypes=_SETTINGS_FILETYPES
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load settings", "", _SETTINGS_FILETYPES
         )
         if not path:
             return
         try:
             self._settings = load_settings(Path(path))
         except BrickGenError as exc:
-            messagebox.showerror("Load failed", str(exc), parent=self._root)
+            QMessageBox.critical(self, "Load failed", str(exc))
             return
         self._sync_form_from_settings()
         self._on_generate()
 
-    def _sync_form_from_settings(self) -> None:
-        '''Push current settings values back into the form widgets.'''
-        for _, field, _ in _INT_FIELDS + _FLOAT_FIELDS:
-            self._vars[field].set(str(getattr(self._settings, field)))
-        self._vars["pins_enabled"].set(self._settings.pins_enabled)
+    # ------------------------------------------------------------------ helpers
+    def _status_style(self, error: bool) -> None:
+        '''Color the status label green (ok) or red (error).'''
+        self._status.setStyleSheet(
+            "color: #0a6;" if not error else "color: #b00;"
+        )
+
+    def _set_status(self, text: str, error: bool = False) -> None:
+        '''Set status text with the matching color.'''
+        self._status_style(error)
+        self._status.setText(text)
 
 
 def main() -> None:
-    '''Application entry point: configure logging and run the GUI loop.'''
+    '''Application entry point: configure logging and run the Qt GUI loop.'''
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    root = tk.Tk()
-    BrickGenApp(root)
-    root.mainloop()
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

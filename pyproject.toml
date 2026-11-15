@@ -1,6 +1,6 @@
 [project]
 name = "brickgen"
-version = "0.1.0"
+version = "0.2.0"
 description = "Parametric generator of LEGO-like stud blocks (CadQuery-based) with GUI, 3D preview and multi-format export."
 authors = [{ name = "Mistress-Lukutar" }]
 requires-python = ">=3.11"
@@ -8,7 +8,9 @@ dependencies = [
     "cadquery>=2.5",
     "pydantic>=2.0",
     "numpy>=1.26",
-    "matplotlib>=3.8",
+    "pyvista>=0.44",
+    "pyvistaqt>=0.11",
+    "PySide6>=6.6",
     "typer>=0.12",
 ]
 
