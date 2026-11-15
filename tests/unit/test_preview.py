@@ -3,7 +3,7 @@ File:   test_preview.py
 Brief:  Unit tests for the pyvista mesh conversion used by the preview.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.8.0
+Version: v0.8.1
 '''
 
 from __future__ import annotations
@@ -65,10 +65,15 @@ def test_wireframe_mode_has_no_mesh_fill() -> None:
 
 
 def test_edge_sampling_matches_tolerance() -> None:
-    '''Finer tolerance yields denser edge polylines (adaptive sampling).'''
+    '''Finer tolerance yields denser edge polylines (adaptive sampling).
+
+    Note: the angular constraint (0.1 rad, matching Shape.tessellate) sets
+    a density floor on curved edges, so only a very fine tolerance makes
+    the chord bound dominate over the angular floor.
+    '''
     solid = build_block(BlockSettings(cells_x=2, cells_y=2)).val()
     coarse = brep_edges_polydata(solid, tolerance=0.2)
-    fine = brep_edges_polydata(solid, tolerance=0.01)
+    fine = brep_edges_polydata(solid, tolerance=0.001)
     assert fine.n_points > coarse.n_points
 
 

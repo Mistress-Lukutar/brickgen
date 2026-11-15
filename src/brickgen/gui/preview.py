@@ -3,7 +3,7 @@ File:   preview.py
 Brief:  PyVista/VTK-based 3D preview widget with display modes.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.8.0
+Version: v0.8.1
 '''
 
 from __future__ import annotations
@@ -30,17 +30,22 @@ MODE_EDGES = "Solid + edges"
 MODE_WIREFRAME = "Wireframe"
 DISPLAY_MODES: list[str] = [MODE_SOLID, MODE_EDGES, MODE_WIREFRAME]
 
-# B-Rep edges are discretized adaptively: chord deviation from the true
-# curve stays within the same tolerance as the surface tessellation, so
-# edges and mesh circles always match visually.
+# B-Rep edges are discretized adaptively with the SAME two constraints as
+# the OCC tessellation (Shape.tessellate): linear chord deviation <= tolerance
+# and turn angle between segments <= angular tolerance (0.1 rad default).
+# Without the angular bound, coarse tolerances produce polygonal edges over
+# a visually smooth meshed surface (the angular constraint keeps the mesh
+# dense on cylinders while the chord-only edges collapse to triangles).
+ANGULAR_TOLERANCE = 0.1  # rad, matches Shape.tessellate default
 MAX_EDGE_SEGMENTS = 256
 
 
 def _sample_edge(edge: cq.Edge, tolerance: float) -> list[cq.Vector]:
-    '''Sample an edge as a polyline with chord deviation within tolerance.
+    '''Sample an edge as a polyline matching the mesh constraints.
 
-    The segment count doubles until every chord midpoint deviates from the
-    true curve by no more than ``tolerance`` (or the segment cap is hit).
+    The segment count doubles until every chord deviates from the true
+    curve by no more than ``tolerance`` AND the turn angle between adjacent
+    chords stays within ``ANGULAR_TOLERANCE`` (or the segment cap is hit).
 
     Args:
         edge: CadQuery edge to sample.
@@ -59,7 +64,14 @@ def _sample_edge(edge: cq.Edge, tolerance: float) -> list[cq.Vector]:
             chord = cq.Vector((pa.x + pb.x) / 2.0, (pa.y + pb.y) / 2.0,
                               (pa.z + pb.z) / 2.0)
             max_dev = max(max_dev, (mid - chord).Length)
-        if max_dev <= tolerance or segments >= MAX_EDGE_SEGMENTS:
+        max_turn = 0.0
+        for a, b, c in zip(points, points[1:], points[2:]):
+            v1 = cq.Vector(b.x - a.x, b.y - a.y, b.z - a.z)
+            v2 = cq.Vector(c.x - b.x, c.y - b.y, c.z - b.z)
+            if v1.Length > 0 and v2.Length > 0:
+                max_turn = max(max_turn, v1.getAngle(v2))
+        if (max_dev <= tolerance and max_turn <= ANGULAR_TOLERANCE) \
+                or segments >= MAX_EDGE_SEGMENTS:
             return points
         segments *= 2
 
@@ -67,10 +79,11 @@ def _sample_edge(edge: cq.Edge, tolerance: float) -> list[cq.Vector]:
 def brep_edges_polydata(solid: cq.Shape, tolerance: float = 0.15) -> pv.PolyData:
     '''Discretize the topological edges of a shape into line polylines.
 
-    Chord deviation is bounded by ``tolerance`` — the same tolerance used
-    for the surface tessellation — so curved edges visually match the mesh
-    circles. This yields CAD-style feature edges independent of the mesh;
-    discretizing curves is far cheaper than meshing.
+    Sampling respects the same linear (chord deviation <= ``tolerance``)
+    and angular (<= 0.1 rad) constraints as the OCC surface tessellation,
+    so curved edges visually match the mesh at any precision. This yields
+    CAD-style feature edges independent of the mesh; discretizing curves
+    is far cheaper than meshing.
 
     Args:
         solid: CadQuery shape whose edges are sampled.
