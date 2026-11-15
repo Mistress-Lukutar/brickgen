@@ -1,0 +1,51 @@
+[project]
+name = "brickgen"
+version = "0.1.0"
+description = "Parametric generator of LEGO-like stud blocks (CadQuery-based) with GUI, 3D preview and multi-format export."
+authors = [{ name = "Mistress-Lukutar" }]
+requires-python = ">=3.11"
+dependencies = [
+    "cadquery>=2.5",
+    "pydantic>=2.0",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+brickgen = "brickgen.cli.main:app"
+brickgen-gui = "brickgen.gui.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+brickgen = ["py.typed"]
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "D"]
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
