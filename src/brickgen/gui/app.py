@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.5.0
+Version: v0.6.0
 '''
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ class MainWindow(QMainWindow):
 
     def _build_layout_group(self) -> QGroupBox:
         '''Create the top-view cell grid editor group.'''
-        group = QGroupBox("Layout (top view, click cells to exclude)")
+        group = QGroupBox("Layout (top view: click = exclude / chamfer)")
         layout = QVBoxLayout(group)
         self._cell_grid = CellGridEditor()
         self._cell_grid.changed.connect(self._schedule_rebuild)
@@ -249,6 +249,7 @@ class MainWindow(QMainWindow):
             "slope_side": self._slope_side.currentText(),
             "slope_rise_units": self._slope_rise.value(),
             "excluded_cells": self._cell_grid.excluded_cells(),
+            "sloped_cells": self._cell_grid.sloped_cells(),
         }
         values.update({field: spin.value() for field, spin in self._floats.items()})
         return validate_settings(values)
@@ -276,6 +277,7 @@ class MainWindow(QMainWindow):
         self._slope_group.setEnabled(not self._settings.pins_enabled)
         self._cell_grid.set_dimensions(self._settings.cells_x, self._settings.cells_y)
         self._cell_grid.set_excluded(self._settings.excluded_cells)
+        self._cell_grid.set_sloped(self._settings.sloped_cells)
         for field, spin in self._floats.items():
             spin.setValue(getattr(self._settings, field))
 
@@ -320,11 +322,16 @@ class MainWindow(QMainWindow):
             if not self._settings.is_rectangular
             else ""
         )
+        chamfer_note = (
+            f" | {len(self._settings.sloped_cells)} chamfered"
+            if self._settings.sloped_cells
+            else ""
+        )
         self._status_style(False)
         self._status.setText(
             f"Form {self._settings.describe()} | footprint "
             f"{self._settings.outer_length_x:.2f} x {self._settings.outer_length_y:.2f} mm"
-            f" | height {self._settings.total_height:.2f} mm{slope_note}{figure_note}"
+            f" | height {self._settings.total_height:.2f} mm{slope_note}{figure_note}{chamfer_note}"
         )
         self._preview.show_model(self._model)
         self._preview.set_display_mode(self._mode.currentText())

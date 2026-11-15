@@ -3,7 +3,7 @@ File:   models.py
 Brief:  Pydantic settings model describing the parametric block geometry.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.5.0
+Version: v0.6.0
 '''
 
 from __future__ import annotations
@@ -73,6 +73,12 @@ class BlockSettings(BaseModel):
             (top view, ix along X, iy along Y). Non-empty masks switch the
             builder to the figure variant: contour walls follow the shape,
             concave corners get inward quarter-round ribs instead of tubes.
+        sloped_cells: ``[ix, iy, side]`` triplets for cells whose bottom is
+            chamfered (solid wedge, no cavity opening). ``side`` is the
+            outward face the wedge thins toward; it must look outward, i.e.
+            the neighbor across it is excluded or outside the grid. A cell
+            may be chamfered on several sides. Chamfers switch the builder
+            to the figure variant (tubes do not apply).
     '''
 
     cells_x: int = Field(default=1, ge=1, le=MAX_CELLS)
@@ -88,6 +94,7 @@ class BlockSettings(BaseModel):
     slope_rise_units: int = Field(default=0, ge=0, le=MAX_SLOPE_RISE)
     slope_side: SlopeSide = "+X"
     excluded_cells: list[list[int]] = Field(default_factory=list)
+    sloped_cells: list[list] = Field(default_factory=list)
 
     model_config = {"extra": "forbid"}
 
@@ -125,6 +132,33 @@ class BlockSettings(BaseModel):
             result.append([ix, iy])
         return sorted(result)
 
+    @field_validator("sloped_cells")
+    @classmethod
+    def _validate_sloped_cells(cls, value: list) -> list[list]:
+        '''Normalize the bottom-chamfer list to sorted [ix, iy, side] triplets.'''
+        result: list[list] = []
+        seen: set[tuple[int, int, str]] = set()
+        for item in value:
+            try:
+                triplet = (int(item[0]), int(item[1]), str(item[2]))
+            except (TypeError, ValueError, IndexError) as exc:
+                raise SettingsValidationError(
+                    f"sloped cell {item!r} must be an [ix, iy, side] triplet"
+                ) from exc
+            if triplet[2] not in SLOPE_SIDES:
+                raise SettingsValidationError(
+                    f"sloped cell side '{triplet[2]}' must be one of "
+                    f"{', '.join(SLOPE_SIDES)}"
+                )
+            if triplet in seen:
+                raise SettingsValidationError(
+                    f"sloped cell {triplet[:2]} with side '{triplet[2]}' "
+                    "is listed twice"
+                )
+            seen.add(triplet)
+            result.append([triplet[0], triplet[1], triplet[2]])
+        return sorted(result)
+
     @property
     def tube_outer_diameter(self) -> float:
         '''Outer tube diameter: bore plus two wall-thickness shells, mm.'''
@@ -137,8 +171,13 @@ class BlockSettings(BaseModel):
 
     @property
     def is_rectangular(self) -> bool:
-        '''True when no cells are excluded from the figure.'''
-        return not self.excluded_cells
+        '''True when the figure is the full rectangle (no exclusions/chamfers).'''
+        return not self.excluded_cells and not self.sloped_cells
+
+    @property
+    def has_bottom_chamfers(self) -> bool:
+        '''True when at least one cell has a chamfered bottom.'''
+        return bool(self.sloped_cells)
 
     @property
     def included_count(self) -> int:
@@ -190,6 +229,26 @@ class BlockSettings(BaseModel):
                     f"excluded cell [{ix}, {iy}] is listed twice"
                 )
             seen.add((ix, iy))
+        excluded_set = seen
+        side_offsets = {"+X": (1, 0), "-X": (-1, 0), "+Y": (0, 1), "-Y": (0, -1)}
+        for ix, iy, side in self.sloped_cells:
+            if not (0 <= ix < self.cells_x and 0 <= iy < self.cells_y):
+                raise SettingsValidationError(
+                    f"sloped cell [{ix}, {iy}] is outside the {self.cells_x}x"
+                    f"{self.cells_y} grid"
+                )
+            if (ix, iy) in excluded_set:
+                raise SettingsValidationError(
+                    f"cell [{ix}, {iy}] cannot be both excluded and sloped"
+                )
+            dx, dy = side_offsets[side]
+            nx, ny = ix + dx, iy + dy
+            neighbor_out = not (0 <= nx < self.cells_x and 0 <= ny < self.cells_y)
+            if not neighbor_out and (nx, ny) not in excluded_set:
+                raise SettingsValidationError(
+                    f"sloped cell [{ix}, {iy}] side '{side}' must look outward "
+                    "(neighbor across it must be excluded or outside the grid)"
+                )
         if len(self.excluded_cells) >= self.cells_x * self.cells_y:
             raise SettingsValidationError("at least one cell must remain in the figure")
         return self

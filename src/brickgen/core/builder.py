@@ -3,7 +3,7 @@ File:   builder.py
 Brief:  CadQuery geometry builder for parametric LEGO-like stud blocks.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.5.0
+Version: v0.6.0
 '''
 
 from __future__ import annotations
@@ -41,13 +41,16 @@ def build_block(settings: BlockSettings) -> cq.Workplane:
 
 
 def _included_cells(settings: BlockSettings) -> list[tuple[int, int]]:
-    '''List the included (ix, iy) cells of the figure, sorted.
+    '''List the material (ix, iy) cells of the figure, sorted.
+
+    Material cells include both normal and bottom-chamfered cells; only
+    excluded cells are missing.
 
     Args:
         settings: Validated parametric block description.
 
     Returns:
-        Sorted list of included cell indices.
+        Sorted list of material cell indices.
     '''
     excluded = {(ix, iy) for ix, iy in settings.excluded_cells}
     return [
@@ -59,13 +62,18 @@ def _included_cells(settings: BlockSettings) -> list[tuple[int, int]]:
 
 
 def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
-    '''Build a block with excluded cells (T-, L-shaped figures, etc.).
+    '''Build a block with excluded and/or bottom-chamfered cells.
 
     The figure variant follows the reference parts: the cavity is one piece
     shaped like the included region (perimeter walls step around excluded
     cells, no internal partition walls), and every concave corner of the
     region carries an inward quarter-round rib instead of a tube. Tubes do
-    not apply in this variant; studs remain on top of every included cell.
+    not apply in this variant; studs remain on top of every material cell.
+
+    Chamfered cells are solid wedges: their cavity box is omitted and a
+    triangular prism is cut away below the sloped underside plane, which
+    rises from the full height at the inner face to the top edge at the
+    outward face.
 
     Args:
         settings: Validated parametric block description.
@@ -79,22 +87,27 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
     half_x = settings.outer_length_x / 2.0
     half_y = settings.outer_length_y / 2.0
 
+    material = set(_included_cells(settings))
+    chamfered = {(ix, iy) for ix, iy, _ in settings.sloped_cells}
+
     outer: cq.Workplane | None = None
     cavity: cq.Workplane | None = None
-    included = set(_included_cells(settings))
-    for ix, iy in _included_cells(settings):
+    for ix, iy in sorted(material):
         x0 = ix * unit - half_x
         y0 = iy * unit - half_y
         cell = cq.Workplane("XY", origin=(x0 + unit / 2.0, y0 + unit / 2.0, 0)).box(
             unit, unit, height, centered=(True, True, False)
         )
+        outer = cell if outer is None else outer.union(cell)
+        if (ix, iy) in chamfered:
+            continue  # solid wedge: no cavity opening in chamfered cells
         # Cavity box: inset t only on sides facing the region boundary;
-        # sides shared with an included neighbor stay open so the cavities
+        # sides shared with a material neighbor stay open so the cavities
         # of adjacent cells fuse into a single contour-shaped cavity.
-        inset_x0 = t if (ix - 1, iy) not in included else 0.0
-        inset_x1 = t if (ix + 1, iy) not in included else 0.0
-        inset_y0 = t if (ix, iy - 1) not in included else 0.0
-        inset_y1 = t if (ix, iy + 1) not in included else 0.0
+        inset_x0 = t if (ix - 1, iy) not in material else 0.0
+        inset_x1 = t if (ix + 1, iy) not in material else 0.0
+        inset_y0 = t if (ix, iy - 1) not in material else 0.0
+        inset_y1 = t if (ix, iy + 1) not in material else 0.0
         cav_w = unit - inset_x0 - inset_x1
         cav_h = unit - inset_y0 - inset_y1
         cell_cavity = cq.Workplane(
@@ -102,17 +115,67 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
             origin=(x0 + inset_x0 + cav_w / 2.0, y0 + inset_y0 + cav_h / 2.0, 0),
         ).box(cav_w, cav_h, height - t + CUT_OVERSHOOT,
               centered=(True, True, False)).translate((0, 0, -CUT_OVERSHOOT))
-        outer = cell if outer is None else outer.union(cell)
         cavity = cell_cavity if cavity is None else cavity.union(cell_cavity)
 
-    solid = outer.cut(cavity)
+    solid = outer
+    if cavity is not None:
+        solid = solid.cut(cavity)
 
     for rib in _figure_corner_ribs(settings):
         solid = solid.union(rib)
 
     if settings.pins_enabled:
         solid = _fuse_pins(solid, settings)
+
+    for ix, iy, side in settings.sloped_cells:
+        solid = solid.cut(_bottom_chamfer_cutter(settings, ix, iy, side))
     return solid
+
+
+def _bottom_chamfer_cutter(
+    settings: BlockSettings, ix: int, iy: int, side: str
+) -> cq.Workplane:
+    '''Triangular prism cutting the chamfered underside of one cell.
+
+    The prism profile is a right triangle along the slope axis: full cell
+    footprint at z=0 with the apex at the top edge of the outward face, so
+    the remaining material below the top face rises from zero thickness at
+    the outward face to the full height at the inner face.
+
+    Args:
+        settings: Validated parametric block description.
+        ix: Cell index along X.
+        iy: Cell index along Y.
+        side: Outward face the wedge thins toward (``+X``/``-X``/``+Y``/``-Y``).
+
+    Returns:
+        The cutter solid, spanning the cell footprint exactly.
+    '''
+    unit = settings.unit_size
+    height = settings.block_height
+    half_x = settings.outer_length_x / 2.0
+    half_y = settings.outer_length_y / 2.0
+    x0 = ix * unit - half_x
+    x1 = x0 + unit
+    y0 = iy * unit - half_y
+    y1 = y0 + unit
+
+    if side == "+X":
+        points, plane, perp_center = [(x0, 0), (x1, 0), (x1, height)], "XZ", (0, (y0 + y1) / 2.0)
+    elif side == "-X":
+        points, plane, perp_center = [(x0, 0), (x1, 0), (x0, height)], "XZ", (0, (y0 + y1) / 2.0)
+    elif side == "+Y":
+        points, plane, perp_center = [(y0, 0), (y1, 0), (y1, height)], "YZ", ((x0 + x1) / 2.0, 0)
+    else:  # "-Y"
+        points, plane, perp_center = [(y0, 0), (y1, 0), (y0, height)], "YZ", ((x0 + x1) / 2.0, 0)
+
+    prism = (
+        cq.Workplane(plane)
+        .polyline(points)
+        .close()
+        .extrude(unit / 2.0, both=True)
+    )
+    return prism.translate((perp_center[0], perp_center[1], 0))
 
 
 def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:

@@ -3,7 +3,7 @@ File:   main.py
 Brief:  Typer CLI entry point for headless block generation and export.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.5.0
+Version: v0.6.0
 '''
 
 from __future__ import annotations
@@ -84,6 +84,10 @@ def generate(
     exclude: str = typer.Option(
         "", "--exclude", help="Cells to exclude, e.g. '0,1;2,1' (ix,iy from 0)."
     ),
+    slope_cells: str = typer.Option(
+        "", "--slope-cells",
+        help="Bottom-chamfered cells 'ix,iy,side;...', side +X/-X/+Y/-Y.",
+    ),
     settings_file: Path | None = typer.Option(
         None, "--settings", "-s", help="Load parameters from a JSON preset first."
     ),
@@ -115,6 +119,7 @@ def generate(
             "slope_rise_units": slope_rise,
             "slope_side": slope_side,
             "excluded_cells": _parse_exclude(exclude),
+            "sloped_cells": _parse_slope_cells(slope_cells),
         }
         settings = settings.model_copy(update=overrides)
         settings = validate_settings(settings.model_dump())
@@ -127,6 +132,31 @@ def generate(
         f"Generated {settings.describe()} block -> {written}",
         fg=typer.colors.GREEN,
     )
+
+
+def _parse_slope_cells(spec: str) -> list[list]:
+    '''Parse a ``--slope-cells`` spec like ``"1,0,+X;0,1,+Y"`` into triplets.
+
+    Args:
+        spec: Semicolon-separated ``ix,iy,side`` triplets.
+
+    Returns:
+        List of [ix, iy, side] triplets (empty when spec is blank).
+
+    Raises:
+        typer.BadParameter: If a triplet is malformed.
+    '''
+    cells: list[list] = []
+    for part in spec.split(";"):
+        parts = [p.strip() for p in part.split(",") if p.strip()]
+        if not parts:
+            continue
+        if len(parts) != 3:
+            raise typer.BadParameter(
+                f"Invalid --slope-cells item '{part.strip()}', expected 'ix,iy,side'"
+            )
+        cells.append([int(parts[0]), int(parts[1]), parts[2].upper()])
+    return cells
 
 
 @app.command()

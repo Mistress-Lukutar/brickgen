@@ -1,0 +1,27 @@
+{
+  "schema": {
+    "name": "brickgen-settings",
+    "version": 1
+  },
+  "template_name": "Sloped L 2x2",
+  "cells_x": 2,
+  "cells_y": 2,
+  "excluded_cells": [
+    [
+      1,
+      1
+    ]
+  ],
+  "sloped_cells": [
+    [
+      "1",
+      "0",
+      "+X"
+    ],
+    [
+      "0",
+      "1",
+      "+Y"
+    ]
+  ]
+}
