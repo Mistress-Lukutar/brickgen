@@ -1,0 +1,13 @@
+{
+  "schema": {
+    "name": "brickgen-settings",
+    "version": 1
+  },
+  "template_name": "Slope 2x4, rise 1 (+X)",
+  "cells_x": 2,
+  "cells_y": 4,
+  "pins_enabled": false,
+  "tubes_enabled": false,
+  "slope_rise_units": 1,
+  "slope_side": "+X"
+}

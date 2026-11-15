@@ -3,16 +3,23 @@ File:   models.py
 Brief:  Pydantic settings model describing the parametric block geometry.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.3.0
+Version: v0.4.0
 '''
 
 from __future__ import annotations
+
+from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from brickgen.core.exceptions import SettingsValidationError
 
 MAX_CELLS = 64  # sanity limit per axis for GUI/CLI input
+MAX_SLOPE_RISE = 16  # sanity limit for the slope rise in unit heights
+
+# Side of the raised edge that forms the slope.
+SlopeSide = Literal["+X", "-X", "+Y", "-Y"]
+SLOPE_SIDES: tuple[str, ...] = ("+X", "-X", "+Y", "-Y")
 
 
 def validate_settings(values: dict[str, object]) -> BlockSettings:
@@ -43,6 +50,10 @@ class BlockSettings(BaseModel):
     reinforcement tubes are placed at the intersections of the mid-lines
     between stud rows/columns (one tube per sliding 2x2 cell group center).
 
+    Stud-less blocks may instead have a sloped top: one top edge rises by
+    ``slope_rise_units * block_height`` and the top face slopes down to the
+    opposite edge, forming a wedge.
+
     Attributes:
         cells_x: Number of cells along X (block length in cells).
         cells_y: Number of cells along Y (block width in cells).
@@ -54,6 +65,10 @@ class BlockSettings(BaseModel):
         pins_enabled: Whether to place studs on the top face.
         tubes_enabled: Whether to place inner reinforcement tubes (2x2+ blocks).
         tube_inner_diameter: Inner bore diameter of the tubes, mm.
+        slope_rise_units: Rise of one top edge in unit block heights
+            (N x ``block_height``), forming a sloped top face. Applies only
+            to stud-less blocks (``pins_enabled=False``); 0 disables it.
+        slope_side: Which top edge is raised: ``+X``/``-X``/``+Y``/``-Y``.
     '''
 
     cells_x: int = Field(default=1, ge=1, le=MAX_CELLS)
@@ -66,6 +81,8 @@ class BlockSettings(BaseModel):
     pins_enabled: bool = True
     tubes_enabled: bool = True
     tube_inner_diameter: float = Field(default=1.0, gt=0)
+    slope_rise_units: int = Field(default=0, ge=0, le=MAX_SLOPE_RISE)
+    slope_side: SlopeSide = "+X"
 
     model_config = {"extra": "forbid"}
 
@@ -78,6 +95,16 @@ class BlockSettings(BaseModel):
             raise SettingsValidationError("dimension must be a finite positive number")
         return value
 
+    @field_validator("slope_side")
+    @classmethod
+    def _validate_slope_side(cls, value: str) -> str:
+        '''Restrict the slope side to the supported set.'''
+        if value not in SLOPE_SIDES:
+            raise SettingsValidationError(
+                f"slope_side must be one of {', '.join(SLOPE_SIDES)}"
+            )
+        return value
+
     @property
     def tube_outer_diameter(self) -> float:
         '''Outer tube diameter: bore plus two wall-thickness shells, mm.'''
@@ -87,6 +114,16 @@ class BlockSettings(BaseModel):
     def has_tubes(self) -> bool:
         '''True when tubes apply: enabled and both cell counts are 2+.'''
         return self.tubes_enabled and self.cells_x >= 2 and self.cells_y >= 2
+
+    @property
+    def slope_active(self) -> bool:
+        '''True when the sloped-top variant applies (no studs, rise > 0).'''
+        return not self.pins_enabled and self.slope_rise_units > 0
+
+    @property
+    def slope_rise(self) -> float:
+        '''Absolute rise of the raised edge above the top face, mm.'''
+        return self.slope_rise_units * self.block_height
 
     @model_validator(mode="after")
     def _validate_geometry(self) -> BlockSettings:
@@ -103,7 +140,7 @@ class BlockSettings(BaseModel):
             raise SettingsValidationError(
                 "pin_diameter must be smaller than unit_size"
             )
-        if self.has_tubes:
+        if self.has_tubes and not self.slope_active:
             cavity_min = min(
                 self.outer_length_x, self.outer_length_y
             ) - 2.0 * self.wall_thickness
@@ -125,12 +162,14 @@ class BlockSettings(BaseModel):
 
     @property
     def total_height(self) -> float:
-        '''Total height including studs, mm.'''
-        return self.block_height + (self.pin_height if self.pins_enabled else 0.0)
+        '''Total height including studs or the raised slope edge, mm.'''
+        if self.pins_enabled:
+            return self.block_height + self.pin_height
+        return self.block_height + self.slope_rise
 
     def describe(self) -> str:
         '''Human-readable form label, e.g. ``2x6``.'''
         return f"{self.cells_x}x{self.cells_y}"
 
 
-__all__ = ["BlockSettings", "validate_settings"]
+__all__ = ["BlockSettings", "validate_settings", "SlopeSide", "SLOPE_SIDES"]

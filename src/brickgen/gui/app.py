@@ -1,9 +1,9 @@
 '''
 File:   app.py
-Brief:  BrickGen PySide6 main window: settings panel, VTK preview, export.
+Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.3.0
+Version: v0.4.0
 '''
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import logging
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGroupBox,
-    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -34,7 +33,8 @@ from PySide6.QtWidgets import (
 
 from brickgen.core.builder import build_block
 from brickgen.core.exceptions import BrickGenError
-from brickgen.core.models import BlockSettings, validate_settings
+from brickgen.core.models import SLOPE_SIDES, BlockSettings, validate_settings
+from brickgen.gui.library import TemplateLibraryPanel
 from brickgen.gui.preview import DISPLAY_MODES, MODE_SOLID, PreviewWidget
 from brickgen.services.export_service import SUPPORTED_FORMATS, export_model
 from brickgen.services.settings_io import load_settings, save_settings
@@ -43,9 +43,13 @@ logger = logging.getLogger(__name__)
 
 _SETTINGS_FILETYPES = "BrickGen settings (*.json);;All files (*.*)"
 
+# Debounce for automatic regeneration after any parameter change, ms.
+AUTO_GENERATE_DELAY_MS = 250
+
 
 class MainWindow(QMainWindow):
-    '''Main application window: parameters on the left, VTK preview on the right.'''
+    '''Parameters on the left, VTK preview in the middle, template library on
+    the right. The model regenerates automatically after any change.'''
 
     def __init__(self) -> None:
         '''Build the layout and render the default 1x1 block.'''
@@ -53,18 +57,29 @@ class MainWindow(QMainWindow):
         self._settings = BlockSettings()
         self._model = None
         self.setWindowTitle("BrickGen - LEGO-like block generator")
-        self.resize(1200, 720)
-        self.setMinimumSize(900, 560)
+        self.resize(1400, 760)
+        self.setMinimumSize(1100, 600)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_sidebar())
         self._preview = PreviewWidget()
         splitter.addWidget(self._preview)
+        self._library = TemplateLibraryPanel(self._collect_settings_or_default)
+        self._library.apply_requested.connect(self._on_template_selected)
+        splitter.addWidget(self._library)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
         self.setCentralWidget(splitter)
 
+        # Auto-generation: debounced rebuild after any parameter change.
+        self._regen_timer = QTimer(self)
+        self._regen_timer.setSingleShot(True)
+        self._regen_timer.setInterval(AUTO_GENERATE_DELAY_MS)
+        self._regen_timer.timeout.connect(self._on_generate)
+
         self._sync_form_from_settings()
+        self._connect_auto_generate()
         self._on_generate()
 
     # ------------------------------------------------------------------ layout
@@ -73,6 +88,7 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.addWidget(self._build_size_group())
+        layout.addWidget(self._build_slope_group())
         layout.addWidget(self._build_display_group())
         layout.addWidget(self._build_actions_group())
         layout.addStretch(1)
@@ -109,6 +125,7 @@ class MainWindow(QMainWindow):
             form.addRow(label, spin)
 
         self._pins = QCheckBox("Studs on top")
+        self._pins.toggled.connect(self._on_pins_toggled)
         form.addRow(self._pins)
 
         self._tubes = QCheckBox("Inner tubes (2x2+ centers)")
@@ -120,6 +137,25 @@ class MainWindow(QMainWindow):
         self._floats["tube_inner_diameter"] = tube_spin
         form.addRow("Tube bore diameter, mm", tube_spin)
         return group
+
+    def _build_slope_group(self) -> QGroupBox:
+        '''Create the slope group (only applies to stud-less blocks).'''
+        self._slope_group = QGroupBox("Slope (stud-less blocks)")
+        form = QFormLayout(self._slope_group)
+        self._slope_side = QComboBox()
+        self._slope_side.addItems(list(SLOPE_SIDES))
+        form.addRow("Raised edge", self._slope_side)
+        self._slope_rise = QSpinBox()
+        self._slope_rise.setRange(0, 16)
+        self._slope_rise.setSuffix(" x unit height")
+        form.addRow("Edge rise", self._slope_rise)
+        note = QLabel(
+            "One top edge rises N x block_height, the top face slopes down\n"
+            "to the opposite edge. Studs and tubes do not apply."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+        return self._slope_group
 
     def _build_display_group(self) -> QGroupBox:
         '''Create the preview display-mode group.'''
@@ -139,19 +175,36 @@ class MainWindow(QMainWindow):
         '''Create the action buttons group.'''
         group = QGroupBox("Actions")
         layout = QVBoxLayout(group)
-        generate = QPushButton("Generate")
-        generate.clicked.connect(self._on_generate)
         export = QPushButton("Export model...")
         export.clicked.connect(self._on_export)
         save = QPushButton("Save settings...")
         save.clicked.connect(self._on_save_settings)
         load = QPushButton("Load settings...")
         load.clicked.connect(self._on_load_settings)
-        layout.addWidget(generate)
         layout.addWidget(export)
         layout.addWidget(save)
         layout.addWidget(load)
         return group
+
+    # ------------------------------------------------------- auto generation
+    def _connect_auto_generate(self) -> None:
+        '''Wire every parameter widget to the debounced regeneration.'''
+        self._cells_x.valueChanged.connect(self._schedule_rebuild)
+        self._cells_y.valueChanged.connect(self._schedule_rebuild)
+        for spin in self._floats.values():
+            spin.valueChanged.connect(self._schedule_rebuild)
+        self._tubes.toggled.connect(self._schedule_rebuild)
+        self._slope_side.currentTextChanged.connect(self._schedule_rebuild)
+        self._slope_rise.valueChanged.connect(self._schedule_rebuild)
+
+    def _schedule_rebuild(self) -> None:
+        '''(Re)start the debounced regeneration timer.'''
+        self._regen_timer.start()
+
+    def _on_pins_toggled(self, checked: bool) -> None:
+        '''Enable the slope group only for stud-less blocks; regenerate.'''
+        self._slope_group.setEnabled(not checked)
+        self._schedule_rebuild()
 
     # ----------------------------------------------------------------- actions
     def _collect_settings(self) -> BlockSettings:
@@ -163,14 +216,28 @@ class MainWindow(QMainWindow):
         Raises:
             SettingsValidationError: If values fail geometry validation.
         '''
-        values: dict[str, int | float | bool] = {
+        values: dict[str, int | float | bool | str] = {
             "cells_x": self._cells_x.value(),
             "cells_y": self._cells_y.value(),
             "pins_enabled": self._pins.isChecked(),
             "tubes_enabled": self._tubes.isChecked(),
+            "slope_side": self._slope_side.currentText(),
+            "slope_rise_units": self._slope_rise.value(),
         }
         values.update({field: spin.value() for field, spin in self._floats.items()})
         return validate_settings(values)
+
+    def _collect_settings_or_default(self) -> BlockSettings:
+        '''Best-effort settings snapshot for the template library panel.
+
+        Returns:
+            Current form settings, or the last valid settings when the form
+            is currently in an invalid state.
+        '''
+        try:
+            return self._collect_settings()
+        except BrickGenError:
+            return self._settings
 
     def _sync_form_from_settings(self) -> None:
         '''Push settings values into the form widgets.'''
@@ -178,6 +245,9 @@ class MainWindow(QMainWindow):
         self._cells_y.setValue(self._settings.cells_y)
         self._pins.setChecked(self._settings.pins_enabled)
         self._tubes.setChecked(self._settings.tubes_enabled)
+        self._slope_side.setCurrentText(self._settings.slope_side)
+        self._slope_rise.setValue(self._settings.slope_rise_units)
+        self._slope_group.setEnabled(not self._settings.pins_enabled)
         for field, spin in self._floats.items():
             spin.setValue(getattr(self._settings, field))
 
@@ -189,25 +259,39 @@ class MainWindow(QMainWindow):
         '''Show or hide the preview grid.'''
         self._preview.set_grid_enabled(enabled)
 
+    def _on_template_selected(self, settings: BlockSettings) -> None:
+        '''Apply a template picked in the library panel.'''
+        self._settings = settings
+        self._sync_form_from_settings()
+        self._on_generate()
+        self._set_status(f"Template applied: {settings.describe()}")
+
     def _on_generate(self) -> None:
-        '''Rebuild the model from form values and refresh the preview.'''
+        '''Rebuild the model from form values and refresh the preview.
+
+        Invalid intermediate form states are reported in the status label
+        only (no dialogs), so typing stays uninterrupted.
+        '''
         try:
             self._settings = self._collect_settings()
         except BrickGenError as exc:
-            self._set_status("Invalid settings.", error=True)
-            QMessageBox.warning(self, "Invalid settings", str(exc))
+            self._set_status(f"Invalid settings: {exc}", error=True)
             return
         try:
             self._model = build_block(self._settings)
         except BrickGenError as exc:
-            self._set_status("Generation failed.", error=True)
-            QMessageBox.critical(self, "Generation failed", str(exc))
+            self._set_status(f"Generation failed: {exc}", error=True)
             return
+        slope_note = (
+            f" | slope {self._settings.slope_side} +{self._settings.slope_rise_units}u"
+            if self._settings.slope_active
+            else ""
+        )
         self._status_style(False)
         self._status.setText(
             f"Form {self._settings.describe()} | footprint "
             f"{self._settings.outer_length_x:.2f} x {self._settings.outer_length_y:.2f} mm"
-            f" | height {self._settings.total_height:.2f} mm"
+            f" | height {self._settings.total_height:.2f} mm{slope_note}"
         )
         self._preview.show_model(self._model)
         self._preview.set_display_mode(self._mode.currentText())

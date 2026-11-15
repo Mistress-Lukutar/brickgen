@@ -3,7 +3,7 @@ File:   exceptions.py
 Brief:  Custom exception hierarchy for BrickGen.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.1.0
+Version: v0.4.0
 '''
 
 from __future__ import annotations
@@ -19,6 +19,10 @@ class SettingsValidationError(BrickGenError):
 
 class SettingsIOError(BrickGenError):
     '''Raised when settings import/export fails (unreadable/invalid JSON file).'''
+
+
+class TemplateError(BrickGenError):
+    '''Raised when a template file is unreadable or invalid.'''
 
 
 class ExportError(BrickGenError):

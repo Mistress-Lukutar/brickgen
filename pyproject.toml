@@ -1,6 +1,6 @@
 [project]
 name = "brickgen"
-version = "0.3.0"
+version = "0.4.0"
 description = "Parametric generator of LEGO-like stud blocks (CadQuery-based) with GUI, 3D preview and multi-format export."
 authors = [{ name = "Mistress-Lukutar" }]
 requires-python = ">=3.11"
@@ -33,7 +33,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-brickgen = ["py.typed"]
+brickgen = ["py.typed", "data/templates/*.json"]
 
 [tool.ruff]
 line-length = 88

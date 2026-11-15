@@ -3,7 +3,7 @@ File:   main.py
 Brief:  Typer CLI entry point for headless block generation and export.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.3.0
+Version: v0.4.0
 '''
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import typer
 
 from brickgen.core.builder import build_block
 from brickgen.core.exceptions import BrickGenError
-from brickgen.core.models import BlockSettings, validate_settings
+from brickgen.core.models import SLOPE_SIDES, BlockSettings, validate_settings
 from brickgen.services.export_service import SUPPORTED_FORMATS, export_model
 from brickgen.services.settings_io import load_settings
 
@@ -35,14 +35,21 @@ def generate(
     cells_y: int = typer.Option(1, "--cells-y", "-y", min=1, max=64,
                                 help="Cells along Y (width)."),
     unit_size: float = typer.Option(4.0, "--unit-size", help="1x1 cell footprint, mm."),
-    wall: float = typer.Option(0.7, "--wall", help="Wall thickness, mm."),
-    height: float = typer.Option(8.0, "--height", help="Block height, mm."),
+    wall: float = typer.Option(0.8, "--wall", help="Wall thickness, mm."),
+    height: float = typer.Option(3.0, "--height", help="Block height, mm."),
     pin_diameter: float = typer.Option(2.5, "--pin-diameter", help="Stud diameter, mm."),
     pin_height: float = typer.Option(2.0, "--pin-height", help="Stud height, mm."),
     no_pins: bool = typer.Option(False, "--no-pins", help="Omit top studs."),
     no_tubes: bool = typer.Option(False, "--no-tubes", help="Omit inner tubes."),
     tube_inner_diameter: float = typer.Option(
         1.0, "--tube-bore", help="Inner tube bore diameter, mm."
+    ),
+    slope_rise: int = typer.Option(
+        0, "--slope-rise", min=0, max=16,
+        help="Slope rise in unit heights (stud-less blocks only, 0 = off).",
+    ),
+    slope_side: str = typer.Option(
+        "+X", "--slope-side", help=f"Raised slope edge: {'/'.join(SLOPE_SIDES)}."
     ),
     settings_file: Path | None = typer.Option(
         None, "--settings", "-s", help="Load parameters from a JSON preset first."
@@ -72,6 +79,8 @@ def generate(
             "pins_enabled": not no_pins,
             "tubes_enabled": not no_tubes,
             "tube_inner_diameter": tube_inner_diameter,
+            "slope_rise_units": slope_rise,
+            "slope_side": slope_side,
         }
         settings = settings.model_copy(update=overrides)
         settings = validate_settings(settings.model_dump())
