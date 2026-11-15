@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-15
-Version: v0.6.0
+Version: v0.6.1
 '''
 
 from __future__ import annotations
@@ -48,6 +48,31 @@ _SETTINGS_FILETYPES = "BrickGen settings (*.json);;All files (*.*)"
 AUTO_GENERATE_DELAY_MS = 250
 
 
+def resolve_export_target(path: str, selected_filter: str) -> tuple[str, str]:
+    '''Derive the export format and a matching file path.
+
+    The selected filter defines the format; when the typed file name has a
+    different suffix it is replaced so the saved file always matches the
+    chosen format (``block.step`` + 3MF filter -> ``block.3mf``). With the
+    "All files" filter the typed suffix is used, falling back to STEP.
+
+    Args:
+        path: File name as typed by the user.
+        selected_filter: Filter string returned by the file dialog.
+
+    Returns:
+        Tuple of (corrected path, export format name).
+    '''
+    formats = list(SUPPORTED_FORMATS)  # STEP first, dict insertion order
+    file_format = next(
+        (fmt for fmt in formats if selected_filter.startswith(fmt)), None
+    )
+    if file_format is None:
+        suffix = Path(path).suffix.lstrip(".").upper()
+        file_format = suffix if suffix in SUPPORTED_FORMATS else "STEP"
+    return str(Path(path).with_suffix("." + file_format.lower())), file_format
+
+
 class MainWindow(QMainWindow):
     '''Parameters on the left, VTK preview in the middle, template library on
     the right. The model regenerates automatically after any change.'''
@@ -57,7 +82,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._settings = BlockSettings()
         self._model = None
-        self.setWindowTitle("BrickGen - LEGO-like block generator")
+        self.setWindowTitle("BrickGen - construction block generator")
         self.resize(1400, 760)
         self.setMinimumSize(1100, 600)
 
@@ -338,22 +363,28 @@ class MainWindow(QMainWindow):
         self._preview.set_grid_enabled(self._grid.isChecked())
 
     def _on_export(self) -> None:
-        '''Ask for a destination file and export the current model.'''
+        '''Ask for a destination file and export the current model.
+
+        STEP is the default: it is first in the filter list and the initial
+        file name. The selected filter defines the format and the file
+        extension (see ``resolve_export_target``).
+        '''
         if self._model is None:
             QMessageBox.information(self, "Nothing to export", "Generate a block first.")
             return
-        formats = sorted(SUPPORTED_FORMATS)
-        path, _ = QFileDialog.getSaveFileName(
+        formats = list(SUPPORTED_FORMATS)
+        default_filter = f"{formats[0]} (*.{formats[0].lower()})"
+        path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export model",
             f"block_{self._settings.describe()}.step",
             ";;".join(f"{fmt} (*.{fmt.lower()})" for fmt in formats)
             + ";;All files (*.*)",
+            default_filter,
         )
         if not path:
             return
-        suffix = path.rsplit(".", 1)[-1].upper() if "." in path else "STEP"
-        file_format = suffix if suffix in SUPPORTED_FORMATS else "STEP"
+        path, file_format = resolve_export_target(path, selected_filter)
         try:
             written = export_model(self._model, Path(path), file_format)
         except BrickGenError as exc:

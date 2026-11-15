@@ -1,6 +1,6 @@
 '''
 File:   builder.py
-Brief:  CadQuery geometry builder for parametric LEGO-like stud blocks.
+Brief:  CadQuery geometry builder for parametric stud blocks.
 Author: Mistress-Lukutar
 Date:   2026-11-15
 Version: v0.6.0

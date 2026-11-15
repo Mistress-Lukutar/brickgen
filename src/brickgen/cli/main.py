@@ -20,7 +20,7 @@ from brickgen.services.export_service import SUPPORTED_FORMATS, export_model
 from brickgen.services.settings_io import load_settings
 
 app = typer.Typer(
-    help="BrickGen - parametric LEGO-like block generator (headless mode).",
+    help="BrickGen - parametric stud block generator (headless mode).",
     no_args_is_help=True,
     add_completion=False,
 )

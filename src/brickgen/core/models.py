@@ -41,7 +41,7 @@ def validate_settings(values: dict[str, object]) -> BlockSettings:
 
 
 class BlockSettings(BaseModel):
-    '''Parametric description of a LEGO-like hollow stud block.
+    '''Parametric description of a hollow stud block.
 
     The block is a hollow rectangular shell without a bottom: outer footprint
     ``cells_x * unit_size`` by ``cells_y * unit_size``, wall thickness
