@@ -2,8 +2,8 @@
 File:   builder.py
 Brief:  CadQuery geometry builder for parametric stud blocks.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.9.0
+Date:   2026-11-16
+Version: v0.9.3
 '''
 
 from __future__ import annotations
@@ -116,11 +116,14 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
         inset_y1 = t if (ix, iy + 1) not in cavity_neighbors else 0.0
         cav_w = unit - inset_x0 - inset_x1
         cav_h = unit - inset_y0 - inset_y1
-        cell_cavity = cq.Workplane(
-            "XY",
-            origin=(x0 + inset_x0 + cav_w / 2.0, y0 + inset_y0 + cav_h / 2.0, 0),
-        ).box(cav_w, cav_h, height - t + CUT_OVERSHOOT,
-              centered=(True, True, False)).translate((0, 0, -CUT_OVERSHOOT))
+        cell_cavity = (
+            cq.Workplane(
+                "XY",
+                origin=(x0 + inset_x0 + cav_w / 2.0, y0 + inset_y0 + cav_h / 2.0, 0),
+            )
+            .box(cav_w, cav_h, height - t + CUT_OVERSHOOT, centered=(True, True, False))
+            .translate((0, 0, -CUT_OVERSHOOT))
+        )
         cavity = cell_cavity if cavity is None else cavity.union(cell_cavity)
 
     solid = outer
@@ -167,20 +170,31 @@ def _bottom_chamfer_cutter(
     y1 = y0 + unit
 
     if side == "+X":
-        points, plane, perp_center = [(x0, 0), (x1, 0), (x1, height)], "XZ", (0, (y0 + y1) / 2.0)
+        points, plane, perp_center = (
+            [(x0, 0), (x1, 0), (x1, height)],
+            "XZ",
+            (0, (y0 + y1) / 2.0),
+        )
     elif side == "-X":
-        points, plane, perp_center = [(x0, 0), (x1, 0), (x0, height)], "XZ", (0, (y0 + y1) / 2.0)
+        points, plane, perp_center = (
+            [(x0, 0), (x1, 0), (x0, height)],
+            "XZ",
+            (0, (y0 + y1) / 2.0),
+        )
     elif side == "+Y":
-        points, plane, perp_center = [(y0, 0), (y1, 0), (y1, height)], "YZ", ((x0 + x1) / 2.0, 0)
+        points, plane, perp_center = (
+            [(y0, 0), (y1, 0), (y1, height)],
+            "YZ",
+            ((x0 + x1) / 2.0, 0),
+        )
     else:  # "-Y"
-        points, plane, perp_center = [(y0, 0), (y1, 0), (y0, height)], "YZ", ((x0 + x1) / 2.0, 0)
+        points, plane, perp_center = (
+            [(y0, 0), (y1, 0), (y0, height)],
+            "YZ",
+            ((x0 + x1) / 2.0, 0),
+        )
 
-    prism = (
-        cq.Workplane(plane)
-        .polyline(points)
-        .close()
-        .extrude(unit / 2.0, both=True)
-    )
+    prism = cq.Workplane(plane).polyline(points).close().extrude(unit / 2.0, both=True)
     return prism.translate((perp_center[0], perp_center[1], 0))
 
 
@@ -188,8 +202,9 @@ def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
     '''Quarter-round inward ribs at every concave corner of the figure.
 
     A concave corner is a lattice vertex where exactly 3 of the 4 adjacent
-    cells are included (the missing cell creates the inner angle). The rib
-    fills that corner with a quarter-round fillet (instead of a tube),
+    cells have cavities (the missing cell creates the inner angle). Chamfered
+    cells have no cavity and therefore do not contribute to such corners. The
+    rib fills that corner with a quarter-round fillet (instead of a tube),
     spans the full cavity height and overshoots into the top face.
 
     Args:
@@ -205,6 +220,7 @@ def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
     radius = min(2.0 * t, unit - 2.0 * t)
     included = set(_included_cells(settings))
     chamfered = {(ix, iy) for ix, iy, _ in settings.sloped_cells}
+    cavity_cells = included - chamfered
 
     ribs: list[cq.Workplane] = []
     for i in range(1, settings.cells_x):
@@ -215,33 +231,26 @@ def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
                 (-1, 1): (i - 1, j),
                 (1, 1): (i, j),
             }
-            missing = [off for off, cell in quadrants.items()
-                       if cell not in included]
+            missing = [
+                off for off, cell in quadrants.items() if cell not in cavity_cells
+            ]
             if len(missing) != 1:
-                continue  # concave corner needs exactly 3 included cells
+                continue  # concave corner needs exactly 3 cells with cavities
             mx, my = missing[0]
-            diagonal = quadrants[(-mx, -my)]
-            if diagonal in chamfered:
-                continue  # no cavity in a chamfered diagonal cell
             vx = i * unit - half_x
             vy = j * unit - half_y
-            into_x, into_y = -mx, -my  # into the diagonal included cell
-            # Anchor the rib at the cavity corner of the diagonal cell: the
-            # corner is inset by t along each side whose edge neighbor is a
-            # chamfered cell (those cavities are inset, see the cavity
-            # construction above).
-            off_x = t if quadrants[(mx, -my)] in chamfered else 0.0
-            off_y = t if quadrants[(-mx, my)] in chamfered else 0.0
-            vx += into_x * off_x
-            vy += into_y * off_y
+            into_x, into_y = -mx, -my  # into the diagonal cavity cell
             rib_box = cq.Workplane(
                 "XY",
                 origin=(vx + into_x * radius / 2.0, vy + into_y * radius / 2.0, 0),
-            ).box(radius, radius, settings.block_height,
-                  centered=(True, True, False))
-            arc = cq.Workplane(
-                "XY", origin=(vx + into_x * radius, vy + into_y * radius, 0)
-            ).circle(radius).extrude(settings.block_height)
+            ).box(radius, radius, settings.block_height, centered=(True, True, False))
+            arc = (
+                cq.Workplane(
+                    "XY", origin=(vx + into_x * radius, vy + into_y * radius, 0)
+                )
+                .circle(radius)
+                .extrude(settings.block_height)
+            )
             ribs.append(rib_box.cut(arc))
     return ribs
 
