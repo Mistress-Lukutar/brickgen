@@ -3,7 +3,7 @@ File:   preview.py
 Brief:  PyVista/VTK-based 3D preview widget with display modes.
 Author: Mistress-Lukutar
 Date:   2026-11-16
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations
@@ -211,6 +211,42 @@ def add_surface_actor(plotter, mesh: pv.PolyData) -> object:
         lighting="three lights",
         backface_params={"color": INTERIOR_COLOR, "specular": 0.1},
     )
+
+
+def mesh_to_arrays(mesh: pv.PolyData) -> dict:
+    '''Pack a preview mesh into picklable numpy arrays for IPC.
+
+    Returns:
+        Dict with 'points' (N,3 float64), 'faces' (int64 face buffer
+        [3, i, j, k, ...] as produced by pv.PolyData), and 'part'
+        (M, int8 per-triangle ids, empty when absent).
+    '''
+    points: np.ndarray = np.asarray(mesh.points, dtype=np.float64)
+    faces: np.ndarray = np.asarray(mesh.faces, dtype=np.int64).ravel()
+    if 'part' in mesh.cell_data:
+        part: np.ndarray = np.asarray(mesh.cell_data['part'], dtype=np.int8)
+    else:
+        part = np.empty(0, dtype=np.int8)
+    return {'points': points, 'faces': faces, 'part': part}
+
+
+def mesh_from_arrays(data: dict) -> pv.PolyData:
+    '''Rebuild a pv.PolyData from :func:`mesh_to_arrays` output (UI thread).
+
+    Args:
+        data: Dict with keys 'points', 'faces', and 'part' as produced by
+            :func:`mesh_to_arrays`.
+
+    Returns:
+        A reconstructed ``pv.PolyData`` mesh.
+    '''
+    points = data['points']
+    faces = data['faces']
+    mesh = pv.PolyData(points, faces)
+    part = data.get('part')
+    if part is not None and part.size > 0:
+        mesh.cell_data['part'] = part
+    return mesh
 
 
 def build_preview_mesh(

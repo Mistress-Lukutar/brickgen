@@ -3,16 +3,14 @@ File:   library.py
 Brief:  Template library panel: thumbnail previews, select, save, refresh.
 Author: Mistress-Lukutar
 Date:   2026-11-16
-Version: v0.7.0
+Version: v0.8.0
 '''
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from pathlib import Path
 
-import numpy as np
 import pyvista as pv
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
@@ -27,11 +25,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from brickgen.core.builder import build_block
 from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import BlockSettings
-from brickgen.gui.jobs import JobError, JobQueue, SKIPPED
-from brickgen.gui.preview import BLOCK_COLOR, build_preview_mesh
+from brickgen.gui.jobs import SKIPPED, JobError, JobQueue
+from brickgen.gui.preview import BLOCK_COLOR, mesh_from_arrays
 from brickgen.services.template_library import Template, list_templates, save_template
 
 logger = logging.getLogger(__name__)
@@ -60,9 +57,7 @@ def render_thumbnail(mesh: pv.PolyData) -> QPixmap:
     finally:
         plotter.close()
     height, width = img.shape[0], img.shape[1]
-    image = QImage(
-        img.tobytes(), width, height, 3 * width, QImage.Format.Format_RGB888
-    )
+    image = QImage(img.tobytes(), width, height, 3 * width, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(image)
 
 
@@ -141,12 +136,8 @@ class TemplateLibraryPanel(QWidget):
                 f"{template.settings.total_height:.1f} mm"
             )
             self._list.addItem(item)
-            settings = template.settings  # fresh local each iteration
-
-            def build_thumb(settings=settings) -> pv.PolyData:
-                return build_preview_mesh(build_block(settings), settings)
-
-            job_id = self._jobs.submit(build_thumb)  # no skip_if
+            payload = {'settings': template.settings.model_dump()}
+            job_id = self._jobs.submit('thumbnail', payload)
             self._thumb_meta[job_id] = (template.name, refresh_seq)
 
         if not templates:
@@ -188,13 +179,14 @@ class TemplateLibraryPanel(QWidget):
             return
 
         if result is SKIPPED:
-            return  # Not expected (no skip_if used); defensive.
+            return  # Not expected (thumbnail jobs are never keyed); defensive.
 
         item = self._find_item(name)
         if item is None:
             return
         try:
-            item.setIcon(render_thumbnail(result))
+            mesh = mesh_from_arrays(result)
+            item.setIcon(render_thumbnail(mesh))
         except Exception:  # noqa: BLE001 - VTK off-screen render can fail on broken GL
             logger.warning("Thumbnail VTK render failed for %s", name)
 
@@ -207,7 +199,9 @@ class TemplateLibraryPanel(QWidget):
     def _on_save_template(self) -> None:
         '''Ask for a name and save the current form settings as a template.'''
         name, ok = QInputDialog.getText(
-            self, "Save as template", "Template name:",
+            self,
+            "Save as template",
+            "Template name:",
             text=f"Block {self._get_current_settings().describe()}",
         )
         if not ok or not name.strip():

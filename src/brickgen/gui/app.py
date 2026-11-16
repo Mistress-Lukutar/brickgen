@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-16
-Version: v0.11.2
+Version: v0.12.0
 '''
 
 from __future__ import annotations
@@ -32,28 +32,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-import cadquery as cq
-import pyvista as pv
-
-from brickgen.core.builder import build_block
 from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import SLOPE_SIDES, BlockSettings, validate_settings
 from brickgen.gui.grid_editor import CellGridEditor
+from brickgen.gui.jobs import SKIPPED, JobError, JobQueue
 from brickgen.gui.library import TemplateLibraryPanel
 from brickgen.gui.preferences import PreferencesDialog
-from brickgen.gui.jobs import JobError, JobQueue, SKIPPED
 from brickgen.gui.preview import (
     DISPLAY_MODES,
     MODE_SOLID,
     PreviewWidget,
-    build_preview_mesh,
+    mesh_from_arrays,
 )
 from brickgen.services.app_settings import (
-    AppSettings,
     load_app_settings,
     save_app_settings,
 )
-from brickgen.services.export_service import SUPPORTED_FORMATS, export_model
+from brickgen.services.export_service import SUPPORTED_FORMATS
 from brickgen.services.settings_io import load_settings, save_settings
 
 logger = logging.getLogger(__name__)
@@ -97,23 +92,26 @@ class MainWindow(QMainWindow):
         '''Build the layout and render the default 1x1 block.'''
         super().__init__()
         self._settings = BlockSettings()
-        self._model = None
+        self._applied_cache_key: str | None = None
         self._app_settings = load_app_settings()
         self.setWindowTitle("BrickGen - construction block generator")
         self.resize(1400, 760)
         self.setMinimumSize(1100, 600)
 
-        # Background job queue for heavy meshing off the UI thread.
+        # Background job queue for heavy meshing off the UI thread. The model
+        # itself lives in the worker process, keyed by generation.
         self._jobs = JobQueue(self)
         self._gen_seq = 0
-        self._job_meta: dict[int, int] = {}  # job id -> generation seq
+        self._job_meta: dict[int, tuple[int, str, BlockSettings]] = {}
         self._export_meta: dict[int, str] = {}  # job id -> resolved export path
         self._jobs.job_done.connect(self._on_job_done)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_sidebar())
         splitter.addWidget(self._build_preview_pane())
-        self._library = TemplateLibraryPanel(self._collect_settings_or_default, self._jobs)
+        self._library = TemplateLibraryPanel(
+            self._collect_settings_or_default, self._jobs
+        )
         self._library.apply_requested.connect(self._on_template_selected)
         splitter.addWidget(self._library)
         splitter.setStretchFactor(0, 0)
@@ -384,8 +382,11 @@ class MainWindow(QMainWindow):
         '''Schedule a background rebuild of the model from form values.
 
         Invalid intermediate form states are reported in the status label
-        only (no dialogs), so typing stays uninterrupted.  The heavy meshing
-        is dispatched to :class:`JobQueue`; results arrive via ``_on_job_done``.
+        only (no dialogs), so typing stays uninterrupted.  A
+        ``build_preview`` task (settings snapshot + tolerances) is sent to
+        the worker process; the model is built and cached there under a
+        generation cache key, and the mesh comes back as arrays via
+        ``_on_job_done``.  Same-key submissions buffer (latest-wins).
         '''
         try:
             self._settings = self._collect_settings()
@@ -395,20 +396,19 @@ class MainWindow(QMainWindow):
 
         self._gen_seq += 1
         seq = self._gen_seq
-        settings = self._settings  # snapshot: the worker must not read mutable state
+        settings = self._settings  # snapshot: the payload must not reference live state
+        cache_key = f'gen{seq}'
 
         self._set_status(f"Generating {settings.describe()}…")
 
-        tol = self._app_settings.preview_tolerance
-        ang = self._app_settings.preview_angular_tolerance
-
-        def build() -> tuple[BlockSettings, cq.Workplane, pv.PolyData]:
-            model = build_block(settings)
-            mesh = build_preview_mesh(model, settings, tol, ang)
-            return settings, model, mesh
-
-        job_id = self._jobs.submit(build, skip_if=lambda: seq != self._gen_seq)
-        self._job_meta[job_id] = seq
+        payload = {
+            'settings': settings.model_dump(),
+            'tolerance': self._app_settings.preview_tolerance,
+            'angular': self._app_settings.preview_angular_tolerance,
+            'cache_key': cache_key,
+        }
+        job_id = self._jobs.submit('build_preview', payload, key='generation')
+        self._job_meta[job_id] = (seq, cache_key, settings)
 
     def _on_job_done(self, job_id: int, result: object) -> None:
         '''Handle a completed background job.
@@ -420,12 +420,11 @@ class MainWindow(QMainWindow):
 
         Args:
             job_id: The job identifier returned by :meth:`JobQueue.submit`.
-            result: Return value from the job callable, :data:`SKIPPED`, or
-                a :class:`JobError`.
+            result: Handler result dict, :data:`SKIPPED`, or a :class:`JobError`.
         '''
         # --- export routing (checked before generation) ---
         if job_id in self._export_meta:
-            path = self._export_meta.pop(job_id)
+            self._export_meta.pop(job_id)
             if result is SKIPPED:
                 logger.warning("Export job %d was skipped (unexpected)", job_id)
                 return
@@ -438,12 +437,13 @@ class MainWindow(QMainWindow):
             return
 
         # --- generation routing ---
-        seq = self._job_meta.pop(job_id, None)
-        if seq is None:
+        meta = self._job_meta.pop(job_id, None)
+        if meta is None:
             # Foreign job (e.g. from a later slice) — drop silently.
             if result is not SKIPPED and not isinstance(result, JobError):
                 logger.debug("Dropping foreign job id=%d", job_id)
             return
+        seq, cache_key, settings = meta
 
         if result is SKIPPED:
             return  # Superseded generation; silent discard.
@@ -457,9 +457,9 @@ class MainWindow(QMainWindow):
             self._set_status(f"Generation failed: {result.exc}", error=True)
             return
 
-        settings, model, mesh = result  # type: ignore[misc]
+        mesh = mesh_from_arrays(result)
         self._settings = settings
-        self._model = model
+        self._applied_cache_key = result.get('cache_key', cache_key)
 
         slope_note = (
             f" | slope {settings.slope_side} +{settings.slope_rise_units}u"
@@ -480,7 +480,8 @@ class MainWindow(QMainWindow):
         self._status.setText(
             f"Form {settings.describe()} | footprint "
             f"{settings.outer_length_x:.2f} x {settings.outer_length_y:.2f} mm"
-            f" | height {settings.total_height:.2f} mm{slope_note}{figure_note}{chamfer_note}"
+            f" | height {settings.total_height:.2f} mm"
+            f"{slope_note}{figure_note}{chamfer_note}"
         )
         self._preview.update_mesh(mesh, settings)
         self._preview.set_display_mode(self._mode.currentText())
@@ -490,15 +491,17 @@ class MainWindow(QMainWindow):
         '''Ask for a destination file and queue the export on the background job
         queue.
 
-        The exported bytes always come from the model captured at submit time;
-        a later generation re-render never affects this export.  Every
-        user-confirmed export runs exactly once (``skip_if=None``).
+        The exported model is the one cached in the worker process under the
+        applied generation's key: a later generation re-render never affects
+        this export.  Every user-confirmed export runs exactly once.  If the
+        worker's LRU has already evicted the key (many newer generations),
+        the error surfaces as a normal export-failure dialog.
 
         STEP is the default: it is first in the filter list and the initial
         file name. The selected filter defines the format and the file
         extension (see ``resolve_export_target``).
         '''
-        if self._model is None:
+        if self._applied_cache_key is None:
             QMessageBox.information(
                 self, "Nothing to export", "Generate a block first."
             )
@@ -518,22 +521,17 @@ class MainWindow(QMainWindow):
             return
         path, file_format = resolve_export_target(path, selected_filter)
 
-        # Capture a reference to the model at submit time so that a later
-        # generation re-render never affects this export.
-        model = self._model
-        export_tolerance = self._app_settings.export_tolerance
-        export_angular_tolerance = self._app_settings.export_angular_tolerance
+        payload = {
+            'cache_key': self._applied_cache_key,
+            'path': path,
+            'format': file_format,
+            'tolerance': self._app_settings.export_tolerance,
+            'angular': self._app_settings.export_angular_tolerance,
+        }
 
         self._set_status(f"Exporting {Path(path).name}…")
 
-        def run_export() -> Path:
-            return export_model(
-                model, Path(path), file_format,
-                tolerance=export_tolerance,
-                angular_tolerance=export_angular_tolerance,
-            )
-
-        job_id = self._jobs.submit(run_export, skip_if=None)
+        job_id = self._jobs.submit('export', payload)
         self._export_meta[job_id] = path
 
     def _on_save_settings(self) -> None:

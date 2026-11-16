@@ -1,13 +1,14 @@
 """
 File:   test_jobs.py
-Brief:  Unit tests for JobQueue (serialized background job queue) and GUI threading.
+Brief:  Unit tests for JobQueue (process-based background job queue).
 Author: Mistress-Lukutar
 Date:   2026-11-16
 """
 
 import os
-import threading
+import tempfile
 import time
+from pathlib import Path
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
@@ -42,7 +43,7 @@ from brickgen.gui.jobs import SKIPPED, JobError, JobQueue  # noqa: E402
 # vtk 9.6 numpy_support sets .shape on arrays, deprecated in numpy 2.5; the
 # warning fires from the preview pipeline exercised by the app smoke test.
 pytestmark = pytest.mark.filterwarnings(
-    "ignore:Setting the shape on a NumPy array:DeprecationWarning"
+    "ignore:Setting the shape on a NumPy Array:DeprecationWarning"
 )
 
 
@@ -57,277 +58,386 @@ def _collect_results(q: JobQueue):
 
 
 # ===========================================================================
-# 1. test_job_result_delivered
+# Test 1: test_ping_roundtrip
 # ===========================================================================
 
 
-def test_job_result_delivered():
-    """A submitted callable's return value arrives via the job_done signal."""
+def test_ping_roundtrip():
+    """A 'ping' task returns {'pong': True}; first id == 1."""
     q = JobQueue()
     results = _collect_results(q)
 
-    def my_fn():
-        return 42
-
-    job_id = q.submit(my_fn)
+    job_id = q.submit('ping', {})
 
     _wait_until(lambda: len(results) == 1, timeout=5.0)
 
     assert job_id == 1, 'first job on a fresh queue must have id 1'
     rid, result = results[0]
     assert rid == job_id
-    assert result == 42
+    assert result == {'pong': True}
+
+    q.close()
 
 
 # ===========================================================================
-# 2. test_fifo_order_and_ids
+# Test 2: test_echo_fifo_order
 # ===========================================================================
 
 
-def test_fifo_order_and_ids():
-    """Three jobs execute in submission order (FIFO) with monotonically
-    increasing ids on a fresh queue."""
+def test_echo_fifo_order():
+    """Three 'echo' payloads submitted in order deliver in order; ids 1,2,3."""
     q = JobQueue()
-    results: list[str] = []
-    order = _collect_results(q)
+    results = _collect_results(q)
 
-    def job_a():
-        time.sleep(0.05)
-        results.append('a')
+    q.submit('echo', {'n': 1})
+    q.submit('echo', {'n': 2})
+    q.submit('echo', {'n': 3})
 
-    def job_b():
-        time.sleep(0.02)
-        results.append('b')
+    _wait_until(lambda: len(results) == 3, timeout=5.0)
 
-    def job_c():
-        time.sleep(0.01)
-        results.append('c')
+    assert len(results) == 3
+    assert results[0][0] == 1 and results[0][1] == {'n': 1}
+    assert results[1][0] == 2 and results[1][1] == {'n': 2}
+    assert results[2][0] == 3 and results[2][1] == {'n': 3}
 
-    id_a = q.submit(job_a)
-    id_b = q.submit(job_b)
-    id_c = q.submit(job_c)
-
-    _wait_until(lambda: len(order) == 3, timeout=5.0)
-
-    assert id_a == 1 and id_b == 2 and id_c == 3
-    # The worker thread serialises execution; all three append in submission order.
-    assert results == ['a', 'b', 'c']
+    q.close()
 
 
 # ===========================================================================
-# 3. test_skip_if_prevents_execution
+# Test 3: test_unknown_task_is_joberror
 # ===========================================================================
 
 
-def test_skip_if_prevents_execution():
-    """A job whose skip_if returns True is skipped: fn not called, SKIPPED result."""
+def test_unknown_task_is_joberror():
+    """Submit 'no_such_task' -> JobError, message mentions the task name."""
     q = JobQueue()
-    results: list[str] = []
-    order = _collect_results(q)
+    results = _collect_results(q)
 
-    q.submit(lambda: results.append('ran'), skip_if=lambda: True)
-
-    _wait_until(lambda: len(order) == 1, timeout=5.0)
-
-    assert order[0][1] is SKIPPED
-    assert results == []
-
-
-# ===========================================================================
-# 4. test_job_error_wraps_exception
-# ===========================================================================
-
-
-def test_job_error_wraps_exception():
-    """An exception raised inside a job is wrapped in JobError on the GUI thread."""
-    q = JobQueue()
-    order = _collect_results(q)
-
-    def boom():
-        raise ValueError('boom')
-
-    q.submit(boom)
-
-    _wait_until(lambda: len(order) == 1, timeout=5.0)
-
-    _, result = order[0]
-    assert isinstance(result, JobError)
-    assert result.exc.args == ('boom',)
-
-
-# ===========================================================================
-# 5. test_queue_survives_exception_and_processes_next
-# ===========================================================================
-
-
-def test_queue_survives_exception_and_processes_next():
-    """The worker thread survives a job exception and processes the next queued job."""
-    q = JobQueue()
-    results: list[int] = []
-    _collect_results(q)  # connect result-collection slot (side effect)
-
-    def fail():
-        raise RuntimeError('oops')
-
-    q.submit(fail)
-    q.submit(lambda: results.append(99))
+    job_id = q.submit('no_such_task', {'x': 42})
 
     _wait_until(lambda: len(results) == 1, timeout=5.0)
 
-    assert results == [99]
+    rid, result = results[0]
+    assert rid == job_id
+    assert isinstance(result, JobError)
+    assert 'no_such_task' in result.message
+
+    q.close()
 
 
 # ===========================================================================
-# 6. test_busy_count_lifecycle
+# Test 4: test_boom_error_envelope
+# ===========================================================================
+
+
+def test_boom_error_envelope():
+    """'boom' -> JobError whose message contains 'ValueError' and 'boom handler'."""
+    q = JobQueue()
+    results = _collect_results(q)
+
+    job_id = q.submit('boom', {})
+
+    _wait_until(lambda: len(results) == 1, timeout=5.0)
+
+    rid, result = results[0]
+    assert rid == job_id
+    assert isinstance(result, JobError)
+    assert 'ValueError' in result.message
+    assert 'boom handler' in result.message
+
+    q.close()
+
+
+# ===========================================================================
+# Test 5: test_keyed_buffer_latest_wins
+# ===========================================================================
+
+
+def test_keyed_buffer_latest_wins():
+    """Keyed latest-wins buffering with SKIPPED emission.
+
+    Submit ('sleep_echo', {'seconds': 1.0, 'value': 'first'}, key='gen'); wait
+    until busy; then submit ('echo', {'n': 2}, key='gen') (buffered) and then
+    ('echo', {'n': 3}, key='gen') (replaces -> id of job 2 is SKIPPED).
+
+    Collect until 3 deliveries: exactly one SKIPPED, delivered echo results
+    are 'first' and 3 (never 2), total deliveries == 3.
+    """
+    q = JobQueue()
+    results = _collect_results(q)
+
+    # Submit first job (sleep_echo with key='gen')
+    q.submit('sleep_echo', {'seconds': 1.0, 'value': 'first'}, key='gen')
+
+    # Wait until busy_count == 1 so the child has truly started processing.
+    _wait_until(lambda: q.busy_count() == 1, timeout=5.0)
+    assert q.busy_count() == 1
+
+    # Submit buffered job (echo n=2, same key) — replaces nothing, just buffers.
+    q.submit('echo', {'n': 2}, key='gen')
+
+    # Submit another buffered job (echo n=3, same key) — replaces echo n=2 -> SKIPPED.
+    q.submit('echo', {'n': 3}, key='gen')
+
+    # Collect until we have 3 deliveries (1 result + 1 SKIPPED + 1 more result).
+    _wait_until(lambda: len(results) == 3, timeout=10.0)
+
+    statuses = [r for _, r in results]
+    values = [r for r in statuses if r is not SKIPPED and isinstance(r, dict)]
+
+    # Exactly one SKIPPED
+    assert statuses.count(SKIPPED) == 1
+
+    # The echo results should be 'first' (from sleep_echo) and {'n': 3} (from
+    # the winning buffered job). Never 2.
+    value_list = [v.get('value') if isinstance(v, dict) else v for v in values]
+    assert 'first' in value_list, f"Expected 'first' in results: {values}"
+    assert {'n': 3} in values or (
+        isinstance(values[-1], dict) and values[-1].get('n') == 3
+    ), f"Expected echo n=3 in results: {values}"
+
+    # Total deliveries == 3
+    assert len(results) == 3
+
+    q.close()
+
+
+# ===========================================================================
+# Test 6: test_keyless_jobs_all_run
+# ===========================================================================
+
+
+def test_keyless_jobs_all_run():
+    """Three key=None echo jobs all execute (no buffering)."""
+    q = JobQueue()
+    results = _collect_results(q)
+
+    q.submit('echo', {'a': 1})
+    q.submit('echo', {'b': 2})
+    q.submit('echo', {'c': 3})
+
+    _wait_until(lambda: len(results) == 3, timeout=5.0)
+
+    assert len(results) == 3
+    result_by_id = {r[0]: r[1] for r in results}
+    assert {'a': 1} in result_by_id.values()
+    assert {'b': 2} in result_by_id.values()
+    assert {'c': 3} in result_by_id.values()
+
+    q.close()
+
+
+# ===========================================================================
+# Test 7: test_busy_count_lifecycle
 # ===========================================================================
 
 
 def test_busy_count_lifecycle():
-    """busy_count() tracks queued + running jobs correctly (increments on submit,
-    decrements after completion)."""
+    """sleep_echo(0.4) -> busy_count()==1 while running (poll until 1, wait until 0)."""
     q = JobQueue()
     results = _collect_results(q)
-    block_event = threading.Event()
 
-    def blocking_job():
-        block_event.wait()
+    q.submit('sleep_echo', {'seconds': 0.4, 'value': 'done'})
 
-    q.submit(blocking_job)
-
-    # Wait until the job is queued (busy_count > 0 means it has been submitted
-    # and not yet finished).
+    # Poll until busy_count reaches 1 (job dispatched to child).
     _wait_until(lambda: q.busy_count() == 1, timeout=5.0)
     assert q.busy_count() == 1
-
-    # Release the blocking job.
-    block_event.set()
 
     # Wait until the job completes.
     _wait_until(lambda: q.busy_count() == 0, timeout=5.0)
     _wait_until(lambda: len(results) == 1, timeout=5.0)
 
+    assert len(results) == 1
+    assert results[0][1] == {'value': 'done'}
+
+    q.close()
+
 
 # ===========================================================================
-# 7. test_latest_wins_skips_stale_generation
+# Test 8: test_close_shuts_child_down
 # ===========================================================================
 
 
-def test_latest_wins_skips_stale_generation():
-    """QUEUED stale jobs are skipped via skip_if; only the latest generation
-    executes.
-
-    The worker thread evaluates skip_if at execution start.  Because both jobs
-    are submitted before the worker picks up job 1, the sequence counter is
-    already 2 when job 1's skip_if runs -- so job 1 is skipped and job 2
-    (which matches seq==2) executes normally.
-    """
+def test_close_shuts_child_down():
+    """After all jobs drain, close() twice (idempotent) returns promptly (< timeout)."""
     q = JobQueue()
-    results: list[tuple[int, object]] = _collect_results(q)
+    results = _collect_results(q)
 
-    gen_seq_ref = [0]
+    # Drain the queue first.
+    q.submit('echo', {'x': 1})
+    _wait_until(lambda: len(results) == 1, timeout=5.0)
 
-    def make_build(seq):
-        def build():
-            time.sleep(0.05)
-            return seq
+    start = time.monotonic()
+    q.close(timeout=5.0)
+    elapsed1 = time.monotonic() - start
+    assert elapsed1 < 5.0, f'first close took {elapsed1:.1f}s (expected < 5s)'
 
-        return build
+    start = time.monotonic()
+    q.close(timeout=5.0)
+    elapsed2 = time.monotonic() - start
+    assert elapsed2 < 5.0, f'second close took {elapsed2:.1f}s (expected < 5s)'
 
-    # Submit job 1 (seq=1) -- skip_if checks if seq matches current gen_seq.
-    q.submit(make_build(1), skip_if=lambda: 1 != gen_seq_ref[0])
-
-    # Bump the sequence counter before the worker processes job 1's skip_if.
-    time.sleep(0.05)
-    gen_seq_ref[0] = 2
-
-    # Submit job 2 (seq=2).
-    q.submit(make_build(2), skip_if=lambda: 2 != gen_seq_ref[0])
-
-    _wait_until(lambda: len(results) == 2, timeout=10.0)
-
-    # Exactly one skipped and one result of 2.
-    statuses = [r for _, r in results]
-    assert statuses.count(SKIPPED) == 1
-    assert statuses.count(2) == 1
+    # Second close should be essentially instant (no-op).
+    assert elapsed2 < 0.5, 'idempotent close should be near-instant'
 
 
 # ===========================================================================
-# 8. test_in_flight_job_completes_not_interruptible
+# Test 9: test_build_preview_handler_arrays
 # ===========================================================================
 
 
-def test_in_flight_job_completes_not_interruptible():
-    """An in-flight job is NOT interrupted by a later skip_if; it runs to
-    completion. Only QUEUED stale jobs skip."""
+def test_build_preview_handler_arrays():
+    """Build preview and export roundtrip: validate mesh arrays and model cache."""
+    from brickgen.core.models import BlockSettings
+    from brickgen.gui.preview import mesh_from_arrays
+
     q = JobQueue()
-    results: list[tuple[int, object]] = _collect_results(q)
+    results = _collect_results(q)
 
-    # Start at 1 so the worker's skip_if (1 != gen_seq) returns False immediately
-    # when it picks up job 1.  Then fn_started confirms the worker is past skip_if
-    # and executing fn() -- i.e. job 1 is truly in-flight.
-    gen_seq_ref = [1]
-    block_event = threading.Event()
-    fn_started = threading.Event()  # set by fn() after skip_if is evaluated
+    default_settings = BlockSettings()
+    settings_dump = default_settings.model_dump()
 
-    def make_blocking(seq):
-        """Factory that returns a callable which blocks on block_event."""
+    # Submit build_preview job.
+    q.submit(
+        'build_preview',
+        {
+            'settings': settings_dump,
+            'tolerance': 0.15,
+            'angular': 0.1,
+            'cache_key': 'g1',
+        },
+        key='preview',
+    )
 
-        def build():
-            fn_started.set()  # confirms skip_if ran and returned False
-            time.sleep(0.05)
-            block_event.wait()
-            return seq
+    _wait_until(lambda: len(results) == 1, timeout=60.0)
 
-        return build
+    assert len(results) == 1
+    rid, result = results[0]
+    assert isinstance(result, dict), f'Expected dict result, got {type(result)}'
+    assert 'points' in result
+    assert 'faces' in result
+    assert 'part' in result
+    assert 'g1' in result.get('cache_key', '')
 
-    q.submit(make_blocking(1), skip_if=lambda: 1 != gen_seq_ref[0])
+    points = result['points']
+    faces = result['faces']
+    part = result['part']
 
-    # Wait until the worker has evaluated skip_if for job 1 and started fn().
-    _wait_until(lambda: fn_started.is_set(), timeout=5.0)
+    # Validate array shapes.
+    import numpy as np
 
-    # Bump sequence while job 1 is in-flight.
-    gen_seq_ref[0] = 2
+    assert isinstance(points, np.ndarray) and points.dtype == np.float64
+    assert points.shape[1] == 3
+    assert len(points) > 0, 'Mesh should have non-empty points'
 
-    q.submit(make_blocking(2), skip_if=lambda: 2 != gen_seq_ref[0])
+    assert isinstance(faces, np.ndarray) and faces.dtype == np.int64
+    assert len(faces) >= 3  # at least one triangle header
 
-    # Release both jobs.
-    block_event.set()
+    assert isinstance(part, np.ndarray) and part.dtype == np.int8
 
-    _wait_until(lambda: len(results) == 2, timeout=10.0)
+    # Reconstruct mesh and validate.
+    mesh = mesh_from_arrays(result)
+    assert mesh.n_cells > 0
+    assert 'part' in mesh.cell_data
 
-    results_vals = [r for _, r in results]
-    # Both jobs complete because job 1 was already running when seq bumped --
-    # it cannot be interrupted; only queued jobs check skip_if at start.
-    assert results_vals.count(1) == 1
-    assert results_vals.count(2) == 1
+    # Now export using the cached model.
+    with tempfile.NamedTemporaryFile(suffix='.step', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    q.submit(
+        'export',
+        {
+            'cache_key': 'g1',
+            'path': tmp_path,
+            'format': 'STEP',
+            'tolerance': 0.1,
+            'angular': 0.1,
+        },
+    )
+
+    _wait_until(lambda: len(results) == 2, timeout=120.0)
+
+    assert len(results) == 2
+    _, export_result = results[1]
+    assert isinstance(export_result, dict)
+    assert 'written' in export_result
+    written_path = export_result['written']
+    assert Path(written_path).exists()
+    assert Path(written_path).stat().st_size > 0
+
+    q.close()
 
 
 # ===========================================================================
-# 9. test_app_async_smoke
+# Test 10: test_app_generation_and_export_smoke
 # ===========================================================================
 
 
-def test_app_async_smoke():
-    """Smoke test: instantiate MainWindow, wait for initial auto-generation to
-    complete on the background queue, then change a parameter and verify it
-    propagates.
+def test_app_generation_and_export_smoke():
+    """MainWindow generates via the process queue and exports the applied model.
 
-    Requires offscreen Qt platform (set via QT_QPA_PLATFORM env var).
-    This test is slower (~seconds) because the library panel builds thumbnails
-    through the same job queue before _model is set.
+    Requires offscreen Qt platform. Timeout is generous because the worker
+    process pays the OCC/pyvista import cost on the very first job.
     """
-    _ensure_app()  # QApplication required for queued signal delivery
+    _ensure_app()
 
     from brickgen.gui.app import MainWindow
 
     w = MainWindow()
-    w.setWindowTitle('test_app_async_smoke')
 
-    # Wait for initial generation to complete (sets self._model in _on_job_done).
-    _wait_until(lambda: w._model is not None, timeout=120.0)
-    assert w._model is not None
+    # Initial auto-generation completes on the queue (applied cache key set).
+    # NOTE: startup fires _on_generate twice (explicit call + debounced timer
+    # from form sync), so the applied key is 'gen2' — latest-wins in action.
+    _wait_until(lambda: w._applied_cache_key is not None, timeout=180.0)
+    assert w._applied_cache_key == 'gen2'
+    assert w._preview._mesh is not None and w._preview._mesh.n_cells > 0
 
-    # Change a parameter and wait for the settings to propagate.
+    # A parameter change schedules the next generation (latest-wins key).
     w._cells_x.setValue(3)
-    _wait_until(lambda: w._settings.cells_x == 3, timeout=5.0)
-    assert w._settings.cells_x == 3
+    _wait_until(lambda: w._applied_cache_key == 'gen3', timeout=180.0)
+
+    # Export the applied generation exactly like _on_export does after its dialog.
+    out = os.path.join(tempfile.gettempdir(), 'brickgen_app_export_smoke.step')
+    payload = {
+        'cache_key': w._applied_cache_key,
+        'path': out,
+        'format': 'STEP',
+        'tolerance': 0.1,
+        'angular': 0.1,
+    }
+    job_id = w._jobs.submit('export', payload)
+    w._export_meta[job_id] = out
+
+    _wait_until(lambda: job_id not in w._export_meta, timeout=120.0)
+    assert Path(out).exists() and Path(out).stat().st_size > 0
+
+    w.close()
+    w._jobs.close()
+
+
+# ===========================================================================
+# Compatibility: JobError.exc shim
+# ===========================================================================
+
+
+def test_joberror_exc_shim():
+    """JobError.exc returns a RuntimeError wrapping the message (compatibility shim)."""
+    err = JobError('test error')
+    assert err.message == 'test error'
+    exc = err.exc
+    assert isinstance(exc, RuntimeError)
+    assert str(exc) == 'test error'
+    # Existing code path: str(result.exc) should work.
+    assert str(err.exc) == 'test error'
+
+
+# ===========================================================================
+# Compatibility: SKIPPED import
+# ===========================================================================
+
+
+def test_skipped_is_object():
+    """SKIPPED is a module-level sentinel object."""
+    from brickgen.gui.jobs import SKIPPED as imported_skipped
+
+    assert imported_skipped is SKIPPED
