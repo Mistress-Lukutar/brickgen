@@ -3,7 +3,7 @@ File:   builder.py
 Brief:  CadQuery geometry builder for parametric stud blocks.
 Author: Mistress-Lukutar
 Date:   2026-11-16
-Version: v0.9.3
+Version: v0.9.4
 '''
 
 from __future__ import annotations
@@ -14,6 +14,28 @@ from brickgen.core.models import BlockSettings
 
 # Small overshoot used when cutting through faces to avoid coincident boolean faces.
 CUT_OVERSHOOT = 1.0
+
+
+def _as_single_solid(shape: cq.Shape) -> cq.Shape:
+    '''Unwrap a boolean result compound holding exactly one solid.'''
+    solids = shape.Solids()
+    return solids[0] if len(solids) == 1 else shape
+
+
+def _fuse_all(base: cq.Shape, tools: list[cq.Shape]) -> cq.Shape:
+    '''Fuse all tools into the base in a single boolean operation.
+
+    Args:
+        base: The base solid to fuse into.
+        tools: List of tool shapes to fuse with the base.
+
+    Returns:
+        A new Shape that is the result of fusing all tools onto the base,
+        or *base* unchanged when the tools list is empty.
+    '''
+    if not tools:
+        return base
+    return base.fuse(*tools)
 
 
 def build_block(settings: BlockSettings) -> cq.Workplane:
@@ -95,15 +117,15 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
     # otherwise the bottom opening extends under the wedge (too wide).
     cavity_neighbors = material - chamfered
 
-    outer: cq.Workplane | None = None
-    cavity: cq.Workplane | None = None
+    cells: list[cq.Workplane] = []
+    cavities: list[cq.Workplane] = []
     for ix, iy in sorted(material):
         x0 = ix * unit - half_x
         y0 = iy * unit - half_y
         cell = cq.Workplane("XY", origin=(x0 + unit / 2.0, y0 + unit / 2.0, 0)).box(
             unit, unit, height, centered=(True, True, False)
         )
-        outer = cell if outer is None else outer.union(cell)
+        cells.append(cell)
         if (ix, iy) in chamfered:
             continue  # solid wedge: no cavity opening in chamfered cells
         # Cavity box: inset t only on sides facing the region boundary or a
@@ -124,20 +146,37 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
             .box(cav_w, cav_h, height - t + CUT_OVERSHOOT, centered=(True, True, False))
             .translate((0, 0, -CUT_OVERSHOOT))
         )
-        cavity = cell_cavity if cavity is None else cavity.union(cell_cavity)
+        cavities.append(cell_cavity)
 
-    solid = outer
-    if cavity is not None:
-        solid = solid.cut(cavity)
+    # Fuse all cells into one outer shape in a single boolean operation.
+    if len(cells) == 1:
+        outer_shape = cells[0].val()
+    else:
+        outer_shape = _fuse_all(cells[0].val(), [c.val() for c in cells[1:]])
 
-    for rib in _figure_corner_ribs(settings):
-        solid = solid.union(rib)
+    # Cut all cavity boxes in one operation.
+    if cavities:
+        outer_shape = outer_shape.cut(*(c.val() for c in cavities))
+
+    solid = cq.Workplane("XY").newObject([_as_single_solid(outer_shape)])
+
+    # Fuse corner ribs in a single boolean operation.
+    ribs = _figure_corner_ribs(settings)
+    if ribs:
+        fused = _fuse_all(solid.val(), [rib.val() for rib in ribs])
+        solid = cq.Workplane("XY").newObject([_as_single_solid(fused)])
 
     if settings.pins_enabled:
         solid = _fuse_pins(solid, settings)
 
-    for ix, iy, side in settings.sloped_cells:
-        solid = solid.cut(_bottom_chamfer_cutter(settings, ix, iy, side))
+    # Cut all chamfer cutters in one operation.
+    cutters = [
+        _bottom_chamfer_cutter(settings, ix, iy, side)
+        for ix, iy, side in settings.sloped_cells
+    ]
+    if cutters:
+        result = solid.val().cut(*(c.val() for c in cutters))
+        solid = cq.Workplane("XY").newObject([_as_single_solid(result)])
     return solid
 
 
@@ -420,6 +459,7 @@ def _fuse_tubes(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
     '''
     r_out = settings.tube_outer_diameter / 2.0
     r_in = settings.tube_inner_diameter / 2.0
+    tubes: list[cq.Workplane] = []
     for cx, cy in _tube_centers(settings):
         tube = (
             cq.Workplane("XY", origin=(cx, cy, 0))
@@ -427,8 +467,11 @@ def _fuse_tubes(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
             .circle(r_in)
             .extrude(settings.block_height)
         )
-        shell = shell.union(tube)
-    return shell
+        tubes.append(tube)
+    if not tubes:
+        return shell
+    fused = _fuse_all(shell.val(), [tube.val() for tube in tubes])
+    return cq.Workplane("XY").newObject([_as_single_solid(fused)])
 
 
 def _fuse_pins(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
@@ -443,6 +486,7 @@ def _fuse_pins(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
     '''
     radius = settings.pin_diameter / 2.0
     excluded = {(ix, iy) for ix, iy in settings.excluded_cells}
+    studs: list[cq.Workplane] = []
     for ix in range(settings.cells_x):
         for iy in range(settings.cells_y):
             if (ix, iy) in excluded:
@@ -454,5 +498,8 @@ def _fuse_pins(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
                 .circle(radius)
                 .extrude(settings.pin_height)
             )
-            shell = shell.union(stud)
-    return shell
+            studs.append(stud)
+    if not studs:
+        return shell
+    fused = _fuse_all(shell.val(), [stud.val() for stud in studs])
+    return cq.Workplane("XY").newObject([_as_single_solid(fused)])
