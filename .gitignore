@@ -19,6 +19,10 @@ htmlcov/
 .idea/
 .vscode/
 
+# Local agent tooling
+.agents/
+.zcode/
+
 # Generated output
 output/
 *.stl
