@@ -103,6 +103,10 @@ class TemplateLibraryPanel(QWidget):
         self._list = QListWidget()
         self._list.setViewMode(QListWidget.ViewMode.IconMode)
         self._list.setIconSize(QSize(*THUMBNAIL_SIZE))
+        # Fixed grid cells: without a grid size the icon-mode flow layout lets
+        # multi-line item labels overlap neighbouring cards (icons painted on
+        # top of each other) once thumbnails fill in asynchronously.
+        self._list.setGridSize(QSize(THUMBNAIL_SIZE[0] + 12, THUMBNAIL_SIZE[1] + 40))
         self._list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self._list.setWordWrap(True)
         self._list.itemClicked.connect(self._on_item_clicked)
