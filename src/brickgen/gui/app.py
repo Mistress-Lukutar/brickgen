@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -20,12 +21,14 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -107,7 +110,8 @@ class MainWindow(QMainWindow):
         self._jobs.job_done.connect(self._on_job_done)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_sidebar())
+        self._sidebar = self._build_sidebar()
+        splitter.addWidget(self._sidebar)
         splitter.addWidget(self._build_preview_pane())
         self._library = TemplateLibraryPanel(
             self._collect_settings_or_default, self._jobs
@@ -117,6 +121,8 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
+        self._splitter = splitter
+        self._layout_finalized = False
         self.setCentralWidget(splitter)
 
         # Auto-generation: debounced rebuild after any parameter change.
@@ -131,9 +137,14 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ layout
     def _build_sidebar(self) -> QWidget:
-        '''Create the parameters panel with actions and status label.'''
+        '''Create the parameters panel with actions and status label.
+
+        The content is wrapped in a scroll area so nothing is clipped when
+        the window is too short for the whole form.
+        '''
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setSpacing(10)
         layout.addWidget(self._build_size_group())
         layout.addWidget(self._build_layout_group())
         layout.addWidget(self._build_slope_group())
@@ -143,12 +154,27 @@ class MainWindow(QMainWindow):
         self._status = QLabel("Ready.")
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
-        return panel
+
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # The horizontal scrollbar is off, so anything narrower than the
+        # form's natural width would clip it: pin the splitter child (the
+        # scroll area itself) to at least that width plus a scrollbar.
+        form_width = (
+            panel.sizeHint().width() + scroll.verticalScrollBar().sizeHint().width()
+        )
+        panel.setMinimumWidth(form_width)
+        scroll.setMinimumWidth(form_width)
+        return scroll
 
     def _build_size_group(self) -> QGroupBox:
         '''Create the block-geometry form group.'''
         group = QGroupBox("Block parameters")
         form = QFormLayout(group)
+        form.setVerticalSpacing(8)
 
         self._cells_x = QSpinBox()
         self._cells_x.setRange(1, 64)
@@ -238,6 +264,7 @@ class MainWindow(QMainWindow):
         '''Create the slope group (only applies to stud-less blocks).'''
         self._slope_group = QGroupBox("Slope (stud-less blocks)")
         form = QFormLayout(self._slope_group)
+        form.setVerticalSpacing(8)
         self._slope_side = QComboBox()
         self._slope_side.addItems(list(SLOPE_SIDES))
         form.addRow("Raised edge", self._slope_side)
@@ -258,6 +285,7 @@ class MainWindow(QMainWindow):
         '''Create the preview display-mode group.'''
         group = QGroupBox("Preview")
         layout = QFormLayout(group)
+        layout.setVerticalSpacing(8)
         self._mode = QComboBox()
         self._mode.addItems(DISPLAY_MODES)
         self._mode.setCurrentText(MODE_SOLID)
@@ -282,6 +310,30 @@ class MainWindow(QMainWindow):
         layout.addWidget(save)
         layout.addWidget(load)
         return group
+
+    def showEvent(self, event: QShowEvent) -> None:
+        '''Pin the splitter to deterministic sizes on the first show.
+
+        The automatic initial distribution can leave the library list laid
+        out for a stale width (offset card grid, clipped second column);
+        after the final window geometry is in, set the panel widths
+        explicitly and re-flow the library grid at that width.
+        '''
+        super().showEvent(event)
+        if self._layout_finalized:
+            return
+        self._layout_finalized = True
+        QTimer.singleShot(0, self._finalize_layout)
+
+    def _finalize_layout(self) -> None:
+        '''Apply the final splitter sizes and re-layout the library cards.'''
+        sidebar_w = self._sidebar.minimumWidth()
+        library_w = self._library.minimumWidth()
+        preview_w = max(self._splitter.width() - sidebar_w - library_w, 200)
+        self._splitter.setSizes([sidebar_w, preview_w, library_w])
+        # Deferred: run once more after the whole geometry pass has settled.
+        QTimer.singleShot(0, self._library.force_relayout)
+        self._library.force_relayout()
 
     # ------------------------------------------------------- auto generation
     def _connect_auto_generate(self) -> None:
@@ -583,7 +635,7 @@ def main() -> None:
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 

@@ -12,15 +12,16 @@ import logging
 from collections.abc import Callable
 
 import pyvista as pv
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QImage, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
+    QGridLayout,
     QInputDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -29,11 +30,14 @@ from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import BlockSettings
 from brickgen.gui.jobs import SKIPPED, JobError, JobQueue
 from brickgen.gui.preview import BLOCK_COLOR, mesh_from_arrays
-from brickgen.services.template_library import Template, list_templates, save_template
+from brickgen.services.template_library import list_templates, save_template
 
 logger = logging.getLogger(__name__)
 
 THUMBNAIL_SIZE = (192, 144)
+
+# Fixed card cell: thumbnail + caption, matching the old icon-grid cell.
+CARD_SIZE = (THUMBNAIL_SIZE[0] + 12, THUMBNAIL_SIZE[1] + 40)
 
 
 def render_thumbnail(mesh: pv.PolyData) -> QPixmap:
@@ -67,6 +71,12 @@ class TemplateLibraryPanel(QWidget):
     Templates come from the builtin directory and the user directory.
     Thumbnails are built asynchronously on the background job queue so that
     the UI thread stays responsive during the heavy OCC tessellation.
+
+    The cards are laid out in an explicit ``QGridLayout`` (fixed-size
+    buttons in as many columns as the current width allows) instead of a
+    ``QListWidget`` in icon mode: the list's flow layout computes item
+    positions from a viewport width that can be stale around the startup
+    splitter/maximize resizes, permanently offsetting the grid.
     '''
 
     # Emitted with the settings of the template the user clicked.
@@ -93,6 +103,9 @@ class TemplateLibraryPanel(QWidget):
         self._refresh_seq = 0
         self._thumb_meta: dict[int, tuple[str, int]] = {}  # job id -> (name, seq)
         self._jobs.job_done.connect(self._on_job_done)
+        # Two columns of thumbnail cards minimum: 2 grid cells + scrollbar
+        # and margins, so the splitter never squeezes the panel to one column.
+        self.setMinimumWidth(2 * CARD_SIZE[0] + 28)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
@@ -100,17 +113,23 @@ class TemplateLibraryPanel(QWidget):
         header.setStyleSheet("font-weight: bold;")
         layout.addWidget(header)
 
-        self._list = QListWidget()
-        self._list.setViewMode(QListWidget.ViewMode.IconMode)
-        self._list.setIconSize(QSize(*THUMBNAIL_SIZE))
-        # Fixed grid cells: without a grid size the icon-mode flow layout lets
-        # multi-line item labels overlap neighbouring cards (icons painted on
-        # top of each other) once thumbnails fill in asynchronously.
-        self._list.setGridSize(QSize(THUMBNAIL_SIZE[0] + 12, THUMBNAIL_SIZE[1] + 40))
-        self._list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self._list.setWordWrap(True)
-        self._list.itemClicked.connect(self._on_item_clicked)
-        layout.addWidget(self._list, stretch=1)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._cards_host = QWidget()
+        self._cards_layout = QGridLayout(self._cards_host)
+        self._cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._cards_layout.setSpacing(4)
+        self._scroll.setWidget(self._cards_host)
+        layout.addWidget(self._scroll, stretch=1)
+
+        # Card widgets in display order; rebuilt by refresh(), positioned by
+        # _relayout_cards(). A dict name -> button maps thumbnails to cards.
+        self._cards: dict[str, QToolButton] = {}
+        self._card_order: list[QWidget] = []
 
         save_btn = QPushButton("Save as template...")
         save_btn.clicked.connect(self._on_save_template)
@@ -121,46 +140,85 @@ class TemplateLibraryPanel(QWidget):
 
         self.refresh()
 
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        '''Re-wrap the card grid for the new width (once the layout settles).
+
+        The deferred call runs after the scroll-area viewport has been
+        resized along with the panel, so the column count is computed from
+        the settled width.
+        '''
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._relayout_cards)
+
+    def force_relayout(self) -> None:
+        '''Re-wrap the card grid at the panel's current width.'''
+        self._relayout_cards()
+
+    def _relayout_cards(self) -> None:
+        '''Place the card buttons into the grid, wrapping by viewport width.
+
+        ``QGridLayout`` positions are computed exactly here — no flow
+        layout is involved, so a resize cannot leave the cards offset.
+        '''
+        viewport_w = self._scroll.viewport().width()
+        cols = max(1, viewport_w // CARD_SIZE[0])
+        for index, card in enumerate(self._card_order):
+            self._cards_layout.addWidget(
+                card,
+                index // cols,
+                index % cols,
+                Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+            )
+
     def refresh(self) -> None:
         '''Reload the template list and (re)render all thumbnails.
 
-        The item list renders immediately; each thumbnail fills in as its
+        The card grid renders immediately; each thumbnail fills in as its
         build job completes on the background queue.
         '''
         self._refresh_seq += 1
         refresh_seq = self._refresh_seq
         self._thumb_meta.clear()
-        self._list.clear()
+        self._cards.clear()
+        self._card_order.clear()
+        self._clear_cards_layout()
         templates = list_templates()
         for template in templates:
-            item = QListWidgetItem(template.name)
-            item.setData(Qt.ItemDataRole.UserRole, template)
-            item.setToolTip(
+            button = QToolButton()
+            button.setText(template.name)
+            button.setIconSize(QSize(*THUMBNAIL_SIZE))
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+            )
+            button.setFixedSize(*CARD_SIZE)
+            button.setToolTip(
                 f"{template.settings.describe()} | height "
                 f"{template.settings.total_height:.1f} mm"
             )
-            self._list.addItem(item)
+            button.clicked.connect(
+                lambda checked=False, tpl=template: self.apply_requested.emit(
+                    tpl.settings
+                )
+            )
+            self._cards[template.name] = button
+            self._card_order.append(button)
             payload = {'settings': template.settings.model_dump()}
             job_id = self._jobs.submit('thumbnail', payload)
             self._thumb_meta[job_id] = (template.name, refresh_seq)
 
         if not templates:
-            self._list.addItem(QListWidgetItem("(no templates found)"))
+            empty = QLabel("(no templates found)")
+            self._card_order.append(empty)
 
-    def _find_item(self, name: str) -> QListWidgetItem | None:
-        '''Find a list item by its display text.
+        self._relayout_cards()
 
-        Args:
-            name: Display text to match.
-
-        Returns:
-            The matching item, or ``None`` if not found.
-        '''
-        for row in range(self._list.count()):
-            item = self._list.item(row)
-            if item is not None and item.text() == name:
-                return item
-        return None
+    def _clear_cards_layout(self) -> None:
+        '''Remove and dispose every widget currently in the card grid.'''
+        while self._cards_layout.count():
+            item = self._cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
 
     def _on_job_done(self, job_id: int, result: object) -> None:
         '''Handle a completed thumbnail-build job.
@@ -185,20 +243,14 @@ class TemplateLibraryPanel(QWidget):
         if result is SKIPPED:
             return  # Not expected (thumbnail jobs are never keyed); defensive.
 
-        item = self._find_item(name)
-        if item is None:
+        button = self._cards.get(name)
+        if button is None:
             return
         try:
             mesh = mesh_from_arrays(result)
-            item.setIcon(render_thumbnail(mesh))
+            button.setIcon(render_thumbnail(mesh))
         except Exception:  # noqa: BLE001 - VTK off-screen render can fail on broken GL
             logger.warning("Thumbnail VTK render failed for %s", name)
-
-    def _on_item_clicked(self, item: QListWidgetItem) -> None:
-        '''Emit the settings of the clicked template.'''
-        template = item.data(Qt.ItemDataRole.UserRole)
-        if isinstance(template, Template):
-            self.apply_requested.emit(template.settings)
 
     def _on_save_template(self) -> None:
         '''Ask for a name and save the current form settings as a template.'''
