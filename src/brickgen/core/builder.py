@@ -3,7 +3,7 @@ File:   builder.py
 Brief:  CadQuery geometry builder for parametric stud blocks.
 Author: Mistress-Lukutar
 Date:   2026-11-16
-Version: v0.9.4
+Version: v0.9.5
 '''
 
 from __future__ import annotations
@@ -17,9 +17,17 @@ CUT_OVERSHOOT = 1.0
 
 
 def _as_single_solid(shape: cq.Shape) -> cq.Shape:
-    '''Unwrap a boolean result compound holding exactly one solid.'''
-    solids = shape.Solids()
-    return solids[0] if len(solids) == 1 else shape
+    '''Merge same-domain faces and unwrap a compound holding one solid.
+
+    One-shot multi-tool booleans leave adjacent coplanar/co-cylindrical faces
+    unmerged (sequential unions used to merge them implicitly), which both
+    inflates the face count and crashes the OCC mesher on large blocks
+    (24x24 and up). ``Shape.clean`` (UnifySameDomain) restores the compact
+    topology; the operation is geometrically exact.
+    '''
+    unified = shape.clean()
+    solids = unified.Solids()
+    return solids[0] if len(solids) == 1 else unified
 
 
 def _fuse_all(base: cq.Shape, tools: list[cq.Shape]) -> cq.Shape:
