@@ -47,12 +47,11 @@ DISPLAY_MODES: list[str] = [
 ANGULAR_TOLERANCE = 0.1
 
 # Semantic part ids stored in mesh cell_data["part"] by the classifier.
+# Consumed by feature-edge extraction (semantic_edges), not by coloring.
 PART_BODY = 0
 PART_STUD = 1
 PART_TUBE = 2
 PART_BOTTOM = 3
-# Colors per part id for scalars-based surface coloring (body, stud, tube, bottom rim).
-PART_COLORS: list[str] = ["#3f7fbf", "#8ec1f0", "#2b5c8a", "#3a78b5"]
 # Color for interior (back) faces so the cavity reads darker than the outside.
 INTERIOR_COLOR = "#1f3d5c"
 
@@ -179,10 +178,12 @@ def semantic_edges(mesh: pv.PolyData) -> pv.PolyData:
 
 
 def add_surface_actor(plotter, mesh: pv.PolyData) -> object:
-    '''Add the shaded surface actor with semantic part coloring to a plotter.
+    '''Add the shaded surface actor with a uniform block color to a plotter.
 
     Works with any pyvista plotter (QtInteractor or off-screen Plotter).
-    Falls back to the plain block color when the mesh carries no part ids.
+    SSAO provides the depth cues, so the surface is tinted with the single
+    block color; ``cell_data["part"]`` is only consumed by feature-edge
+    extraction, not by coloring.
 
     Args:
         plotter: A PyVista Plotter or QtInteractor instance.
@@ -191,18 +192,6 @@ def add_surface_actor(plotter, mesh: pv.PolyData) -> object:
     Returns:
         The added actor (for caller convenience).
     '''
-    if "part" in mesh.cell_data:
-        return plotter.add_mesh(
-            mesh,
-            scalars="part",
-            cmap=PART_COLORS,
-            clim=(-0.5, float(len(PART_COLORS)) - 0.5),
-            show_scalar_bar=False,
-            smooth_shading=False,
-            specular=0.3,
-            lighting="three lights",
-            backface_params={"color": INTERIOR_COLOR, "specular": 0.1},
-        )
     return plotter.add_mesh(
         mesh,
         color=BLOCK_COLOR,
