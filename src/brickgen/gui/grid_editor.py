@@ -28,11 +28,12 @@ class CellGridEditor(QWidget):
     '''Schematic top view of the cell grid (X right, Y up).
 
     Clicking a cell cycles its state:
-    normal (blue) -> excluded (gray) -> bottom-chamfered (orange, arrows
-    show the outward sides the wedge thins toward) -> normal. A chamfer is
-    only offered on sides that look outward of the figure; clicking a
-    chamfered cell again adds its next outward side (corner cells can be
-    chamfered on two sides) or returns to normal.
+    normal (blue) -> excluded (gray) -> bottom-chamfered (orange, an arrow
+    shows the outward side the wedge thins toward) -> normal. A chamfer is
+    only offered on sides that look outward of the figure, and a cell is
+    chamfered in exactly one direction; clicking a chamfered cell again
+    rotates the chamfer to its next outward side, and after the last one
+    the cell returns to normal.
     '''
 
     # Emitted after any state change.
@@ -86,13 +87,17 @@ class CellGridEditor(QWidget):
             cells: List of [ix, iy] pairs (out-of-range pairs are dropped).
         '''
         self._excluded = {
-            (int(ix), int(iy)) for ix, iy in cells
+            (int(ix), int(iy))
+            for ix, iy in cells
             if 0 <= int(ix) < self._cols and 0 <= int(iy) < self._rows
         }
         self.update()
 
     def set_sloped(self, cells: list[list]) -> None:
         '''Replace the chamfer list.
+
+        A cell is chamfered in exactly one direction; when several triplets
+        name the same cell, only the first one is kept.
 
         Args:
             cells: List of [ix, iy, side] triplets (invalid are dropped).
@@ -108,9 +113,8 @@ class CellGridEditor(QWidget):
                 continue
             if not (0 <= cell[0] < self._cols and 0 <= cell[1] < self._rows):
                 continue
-            sides = sloped.setdefault(cell, [])
-            if side not in sides:
-                sides.append(side)
+            if cell not in sloped:
+                sloped[cell] = [side]
         self._sloped = sloped
         self.update()
 
@@ -156,13 +160,17 @@ class CellGridEditor(QWidget):
             if available:
                 self._sloped[cell] = [available[0]]
         else:
-            # chamfered: add the next available side, or return to normal
+            # chamfered: rotate to the next available outward side; after
+            # the last one, return to normal
+            available = self._available_sides(ix, iy)
             current = self._sloped.get(cell, [])
-            remaining = [s for s in self._available_sides(ix, iy)
-                         if s not in current]
-            if remaining:
-                current.append(remaining[0])
-                self._sloped[cell] = current
+            idx = (
+                available.index(current[0])
+                if current and current[0] in available
+                else -1
+            )
+            if idx + 1 < len(available):
+                self._sloped[cell] = [available[idx + 1]]
             else:
                 del self._sloped[cell]
         self.update()
@@ -215,10 +223,12 @@ class CellGridEditor(QWidget):
         painter.drawLine(tail, tip)
         perp = QPointF(-dy, dx)
         size = 3.5
-        left = QPointF(tip.x() - dx * size + perp.x() * size,
-                       tip.y() - dy * size + perp.y() * size)
-        right = QPointF(tip.x() - dx * size - perp.x() * size,
-                        tip.y() - dy * size - perp.y() * size)
+        left = QPointF(
+            tip.x() - dx * size + perp.x() * size, tip.y() - dy * size + perp.y() * size
+        )
+        right = QPointF(
+            tip.x() - dx * size - perp.x() * size, tip.y() - dy * size - perp.y() * size
+        )
         painter.drawPolygon(QPolygonF([tip, left, right]))
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
