@@ -2,8 +2,8 @@
 File:   preview.py
 Brief:  PyVista/VTK-based 3D preview widget with display modes.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.9.0
+Date:   2026-11-16
+Version: v0.9.2
 '''
 
 from __future__ import annotations
@@ -21,96 +21,17 @@ logger = logging.getLogger(__name__)
 PREVIEW_TESSELLATION_TOLERANCE = 0.15
 
 BLOCK_COLOR = "#3f7fbf"
-EDGE_COLOR = "#111111"
+LINE_COLOR = "#111111"
 
-# Display modes offered by the GUI. Edges are topological B-Rep edges
-# (CAD-style), not triangulation edges.
+# Display modes offered by the GUI. Wireframe lines are the edges of the
+# tessellated mesh itself, not separate B-Rep geometry.
 MODE_SOLID = "Solid"
-MODE_EDGES = "Solid + edges"
+MODE_SOLID_WIREFRAME = "Solid + wireframe"
 MODE_WIREFRAME = "Wireframe"
-DISPLAY_MODES: list[str] = [MODE_SOLID, MODE_EDGES, MODE_WIREFRAME]
+DISPLAY_MODES: list[str] = [MODE_SOLID, MODE_SOLID_WIREFRAME, MODE_WIREFRAME]
 
-# B-Rep edges are discretized adaptively with the SAME two constraints as
-# the OCC tessellation (Shape.tessellate): linear chord deviation <= tolerance
-# and turn angle between segments <= angular tolerance (0.1 rad default).
-# Without the angular bound, coarse tolerances produce polygonal edges over
-# a visually smooth meshed surface (the angular constraint keeps the mesh
-# dense on cylinders while the chord-only edges collapse to triangles).
-ANGULAR_TOLERANCE = 0.1  # rad, matches Shape.tessellate default
-MAX_EDGE_SEGMENTS = 256
-
-
-def _sample_edge(
-    edge: cq.Edge, tolerance: float, angular_tolerance: float
-) -> list[cq.Vector]:
-    '''Sample an edge as a polyline matching the mesh constraints.
-
-    The segment count doubles until every chord deviates from the true
-    curve by no more than ``tolerance`` AND the turn angle between adjacent
-    chords stays within ``angular_tolerance`` (or the segment cap is hit).
-
-    Args:
-        edge: CadQuery edge to sample.
-        tolerance: Maximum chord deviation in mm.
-        angular_tolerance: Maximum turn angle between segments in rad.
-
-    Returns:
-        Sampled points of the polyline (including both endpoints).
-    '''
-    segments = 1
-    while True:
-        fractions = [i / segments for i in range(segments + 1)]
-        points = [edge.positionAt(f) for f in fractions]
-        max_dev = 0.0
-        for pa, pb, fa, fb in zip(points, points[1:], fractions, fractions[1:]):
-            mid = edge.positionAt((fa + fb) / 2.0)
-            chord = cq.Vector((pa.x + pb.x) / 2.0, (pa.y + pb.y) / 2.0,
-                              (pa.z + pb.z) / 2.0)
-            max_dev = max(max_dev, (mid - chord).Length)
-        max_turn = 0.0
-        for a, b, c in zip(points, points[1:], points[2:]):
-            v1 = cq.Vector(b.x - a.x, b.y - a.y, b.z - a.z)
-            v2 = cq.Vector(c.x - b.x, c.y - b.y, c.z - b.z)
-            if v1.Length > 0 and v2.Length > 0:
-                max_turn = max(max_turn, v1.getAngle(v2))
-        if (max_dev <= tolerance and max_turn <= angular_tolerance) \
-                or segments >= MAX_EDGE_SEGMENTS:
-            return points
-        segments *= 2
-
-
-def brep_edges_polydata(
-    solid: cq.Shape, tolerance: float = 0.15, angular_tolerance: float = ANGULAR_TOLERANCE
-) -> pv.PolyData:
-    '''Discretize the topological edges of a shape into line polylines.
-
-    Sampling respects the same linear (chord deviation <= ``tolerance``)
-    and angular (<= 0.1 rad) constraints as the OCC surface tessellation,
-    so curved edges visually match the mesh at any precision. This yields
-    CAD-style feature edges independent of the mesh; discretizing curves
-    is far cheaper than meshing.
-
-    Args:
-        solid: CadQuery shape whose edges are sampled.
-        tolerance: Maximum chord deviation in mm (matches mesh tolerance).
-
-    Returns:
-        PolyData containing one line cell per edge.
-    '''
-    points: list[tuple[float, float, float]] = []
-    lines: list[int] = []
-    for edge in solid.Edges():
-        sampled = _sample_edge(edge, tolerance, angular_tolerance)
-        indices = []
-        for p in sampled:
-            indices.append(len(points))
-            points.append((p.x, p.y, p.z))
-        lines.extend([len(indices), *indices])
-    if not lines:
-        return pv.PolyData()
-    return pv.PolyData(
-        np.asarray(points), lines=np.asarray(lines, dtype=np.int64)
-    )
+# Angular tessellation tolerance for the mesh, rad (Shape.tessellate default).
+ANGULAR_TOLERANCE = 0.1
 
 
 def solid_to_mesh(
@@ -137,13 +58,12 @@ def solid_to_mesh(
 
 
 class PreviewWidget(QtInteractor):
-    '''Interactive 3D preview: shaded B-Rep solid with CAD-style edges.
+    '''Interactive 3D preview: shaded mesh with optional wireframe modes.
 
     Wraps a pyvista QtInteractor. The surface is the OCC tessellation
-    (required for shaded rendering in any OpenGL viewer); the "edges" are
-    topological B-Rep curves discretized independently of the mesh, exactly
-    like feature edges in CAD viewers. The mesh is tessellated once per
-    model and display-mode/grid changes only touch actors, not geometry.
+    (required for shaded rendering in any OpenGL viewer); wireframe lines
+    are the edges of that same mesh. The mesh is tessellated once per model
+    and display-mode/grid changes only touch actors, not geometry.
     '''
 
     def __init__(self, parent: object | None = None) -> None:
@@ -155,9 +75,8 @@ class PreviewWidget(QtInteractor):
         super().__init__(parent=parent)
         self.set_background("white")
         self._mesh: pv.PolyData | None = None
-        self._edges: pv.PolyData | None = None
         self._mesh_actor = None
-        self._edges_actor = None
+        self._wire_actor = None
         self._grid_actor = None
         self._mode = MODE_SOLID
         self._grid_enabled = False
@@ -169,7 +88,7 @@ class PreviewWidget(QtInteractor):
         tolerance: float = PREVIEW_TESSELLATION_TOLERANCE,
         angular_tolerance: float = ANGULAR_TOLERANCE,
     ) -> None:
-        '''Tessellate the model solid and rebuild both display actors.
+        '''Tessellate the model solid and rebuild the display actors.
 
         Args:
             model: Workplane whose first solid is displayed.
@@ -180,13 +99,13 @@ class PreviewWidget(QtInteractor):
         if solid is None:
             return
         self._mesh = solid_to_mesh(solid, tolerance, angular_tolerance)
-        self._edges = brep_edges_polydata(solid, tolerance, angular_tolerance)
         self._rebuild_actors()
         self._update_grid()
         self.reset_camera()
         logger.debug(
-            "Preview mesh: %d points / %d cells; %d B-Rep edges",
-            self._mesh.n_points, self._mesh.n_cells, self._edges.n_cells,
+            "Preview mesh: %d points / %d cells",
+            self._mesh.n_points,
+            self._mesh.n_cells,
         )
 
     def set_display_mode(self, mode: str) -> None:
@@ -212,13 +131,15 @@ class PreviewWidget(QtInteractor):
 
     # ------------------------------------------------------------------ internals
     def _rebuild_actors(self) -> None:
-        '''Remove and re-add the surface/edges actors for the active mode.'''
-        for attr in ("_mesh_actor", "_edges_actor"):
+        '''Remove and re-add the mesh/wireframe actors for the active mode.'''
+        for attr in ("_mesh_actor", "_wire_actor"):
             actor = getattr(self, attr)
             if actor is not None:
                 self.remove_actor(actor)
                 setattr(self, attr, None)
-        if self._mesh is not None and self._mode != MODE_WIREFRAME:
+        if self._mesh is None:
+            return
+        if self._mode != MODE_WIREFRAME:
             self._mesh_actor = self.add_mesh(
                 self._mesh,
                 color=BLOCK_COLOR,
@@ -226,15 +147,26 @@ class PreviewWidget(QtInteractor):
                 specular=0.3,
                 lighting="three lights",
             )
-        if self._edges is not None and self._mode != MODE_SOLID:
+        if self._mode == MODE_SOLID:
+            return
+        if self._mode == MODE_SOLID_WIREFRAME:
             # Tubes give the lines real volume so they win the depth test
             # against the surface (plain polylines z-fight with the mesh).
-            self._edges_actor = self.add_mesh(
-                self._edges,
-                color=EDGE_COLOR,
+            self._wire_actor = self.add_mesh(
+                self._mesh,
+                color=LINE_COLOR,
+                style="wireframe",
                 line_width=2.5,
                 lighting=False,
                 render_lines_as_tubes=True,
+            )
+        else:  # MODE_WIREFRAME
+            self._wire_actor = self.add_mesh(
+                self._mesh,
+                color=LINE_COLOR,
+                style="wireframe",
+                line_width=1.5,
+                lighting=False,
             )
 
     def _update_grid(self) -> None:

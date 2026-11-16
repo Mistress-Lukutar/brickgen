@@ -2,8 +2,8 @@
 File:   preferences.py
 Brief:  Modal preferences dialog: precisions and default export format.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.9.0
+Date:   2026-11-16
+Version: v0.9.1
 '''
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class PreferencesDialog(QDialog):
         self._preview_tol.setSingleStep(0.01)
         self._preview_tol.setDecimals(3)
         self._preview_tol.setValue(settings.preview_tolerance)
-        form.addRow("Preview precision (mesh + edges), mm", self._preview_tol)
+        form.addRow("Preview precision (mesh), mm", self._preview_tol)
 
         self._export_tol = QDoubleSpinBox()
         self._export_tol.setRange(0.01, 1.0)
