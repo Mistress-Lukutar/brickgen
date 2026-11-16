@@ -2,8 +2,8 @@
 File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.9.0
+Date:   2026-11-16
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -39,7 +39,11 @@ from brickgen.gui.grid_editor import CellGridEditor
 from brickgen.gui.library import TemplateLibraryPanel
 from brickgen.gui.preferences import PreferencesDialog
 from brickgen.gui.preview import DISPLAY_MODES, MODE_SOLID, PreviewWidget
-from brickgen.services.app_settings import AppSettings, load_app_settings, save_app_settings
+from brickgen.services.app_settings import (
+    AppSettings,
+    load_app_settings,
+    save_app_settings,
+)
 from brickgen.services.export_service import SUPPORTED_FORMATS, export_model
 from brickgen.services.settings_io import load_settings, save_settings
 
@@ -399,6 +403,7 @@ class MainWindow(QMainWindow):
         )
         self._preview.show_model(
             self._model,
+            self._settings,
             self._app_settings.preview_tolerance,
             self._app_settings.preview_angular_tolerance,
         )
@@ -413,7 +418,9 @@ class MainWindow(QMainWindow):
         extension (see ``resolve_export_target``).
         '''
         if self._model is None:
-            QMessageBox.information(self, "Nothing to export", "Generate a block first.")
+            QMessageBox.information(
+                self, "Nothing to export", "Generate a block first."
+            )
             return
         formats = list(SUPPORTED_FORMATS)
         default_format = self._app_settings.default_format
@@ -431,7 +438,9 @@ class MainWindow(QMainWindow):
         path, file_format = resolve_export_target(path, selected_filter)
         try:
             written = export_model(
-                self._model, Path(path), file_format,
+                self._model,
+                Path(path),
+                file_format,
                 tolerance=self._app_settings.export_tolerance,
                 angular_tolerance=self._app_settings.export_angular_tolerance,
             )
@@ -474,9 +483,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ helpers
     def _status_style(self, error: bool) -> None:
         '''Color the status label green (ok) or red (error).'''
-        self._status.setStyleSheet(
-            "color: #0a6;" if not error else "color: #b00;"
-        )
+        self._status.setStyleSheet("color: #0a6;" if not error else "color: #b00;")
 
     def _set_status(self, text: str, error: bool = False) -> None:
         '''Set status text with the matching color.'''
@@ -486,7 +493,9 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     '''Application entry point: configure logging and run the Qt GUI loop.'''
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+    )
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
     window = MainWindow()
