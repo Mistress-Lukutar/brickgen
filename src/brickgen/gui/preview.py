@@ -3,7 +3,7 @@ File:   preview.py
 Brief:  PyVista/VTK-based 3D preview widget with display modes.
 Author: Mistress-Lukutar
 Date:   2026-11-16
-Version: v0.10.0
+Version: v0.11.0
 '''
 
 from __future__ import annotations
@@ -213,6 +213,36 @@ def add_surface_actor(plotter, mesh: pv.PolyData) -> object:
     )
 
 
+def build_preview_mesh(
+    model: cq.Workplane,
+    settings: BlockSettings,
+    tolerance: float = PREVIEW_TESSELLATION_TOLERANCE,
+    angular_tolerance: float = ANGULAR_TOLERANCE,
+) -> pv.PolyData:
+    '''Build the classified preview mesh for a model (safe off the UI thread).
+
+    Heavy OCC tessellation lives here so callers can run it on a worker
+    thread; widget-facing ``update_mesh`` only touches VTK actors.
+
+    The *model* must contain at least one solid (i.e. ``model.val()`` must
+    return a non-None :class:`cq.Shape`).  Callers that guard empty models
+    (e.g. the main-window generation code) are responsible for this
+    invariant.
+
+    Args:
+        model: CadQuery Workplane whose first solid is tessellated.
+        settings: BlockSettings used to build a face-part classifier.
+        tolerance: Linear tessellation tolerance in mm.
+        angular_tolerance: Angular tessellation tolerance in rad.
+
+    Returns:
+        Triangle PolyData with per-face part classification.
+    '''
+    return solid_to_mesh(
+        model.val(), tolerance, angular_tolerance, make_face_classifier(settings)
+    )
+
+
 class PreviewWidget(QtInteractor):
     '''Interactive 3D preview: shaded mesh with optional wireframe modes.
 
@@ -242,28 +272,18 @@ class PreviewWidget(QtInteractor):
         self._grid_enabled = False
         self.enable_anti_aliasing("msaa")
 
-    def show_model(
-        self,
-        model: cq.Workplane,
-        settings: BlockSettings,
-        tolerance: float = PREVIEW_TESSELLATION_TOLERANCE,
-        angular_tolerance: float = ANGULAR_TOLERANCE,
-    ) -> None:
-        '''Tessellate the model solid and rebuild the display actors.
+    def update_mesh(self, mesh: pv.PolyData, settings: BlockSettings) -> None:
+        '''Update the preview with a pre-tessellated mesh.
+
+        Stores the mesh, resets edge data, enables SSAO, rebuilds actors,
+        refreshes the grid, and positions the camera.  All VTK-side work only —
+        no OCC tessellation is performed here.
 
         Args:
-            model: Workplane whose first solid is displayed.
-            settings: BlockSettings used to build a face-part classifier.
-            tolerance: Linear tessellation tolerance in mm.
-            angular_tolerance: Angular tessellation tolerance in rad.
+            mesh: Pre-tessellated PolyData (e.g. from :func:`build_preview_mesh`).
+            settings: BlockSettings used for SSAO radius calculation.
         '''
-        solid = model.val()
-        if solid is None:
-            return
-        face_part = make_face_classifier(settings)
-        self._mesh = solid_to_mesh(
-            solid, tolerance, angular_tolerance, face_part=face_part
-        )
+        self._mesh = mesh
         self._edge_mesh = None
         try:
             self.enable_ssao(radius=max(2.0, settings.unit_size), bias=0.02)
@@ -277,6 +297,27 @@ class PreviewWidget(QtInteractor):
             self._mesh.n_points,
             self._mesh.n_cells,
         )
+
+    def show_model(
+        self,
+        model: cq.Workplane,
+        settings: BlockSettings,
+        tolerance: float = PREVIEW_TESSELLATION_TOLERANCE,
+        angular_tolerance: float = ANGULAR_TOLERANCE,
+    ) -> None:
+        '''Synchronous convenience path: tessellate and display.
+
+        Builds the mesh via :func:`build_preview_mesh` then forwards to
+        :meth:`update_mesh`.  Blocks the caller; the main window uses the
+        queued async path instead.
+
+        Args:
+            model: Workplane whose first solid is displayed.
+            settings: BlockSettings used to build a face-part classifier.
+            tolerance: Linear tessellation tolerance in mm.
+            angular_tolerance: Angular tessellation tolerance in rad.
+        '''
+        self.update_mesh(build_preview_mesh(model, settings, tolerance, angular_tolerance), settings)
 
     def set_display_mode(self, mode: str) -> None:
         '''Switch the rendering style without retessellating.

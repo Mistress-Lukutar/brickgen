@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-16
-Version: v0.10.0
+Version: v0.11.2
 '''
 
 from __future__ import annotations
@@ -32,13 +32,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import cadquery as cq
+import pyvista as pv
+
 from brickgen.core.builder import build_block
 from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import SLOPE_SIDES, BlockSettings, validate_settings
 from brickgen.gui.grid_editor import CellGridEditor
 from brickgen.gui.library import TemplateLibraryPanel
 from brickgen.gui.preferences import PreferencesDialog
-from brickgen.gui.preview import DISPLAY_MODES, MODE_SOLID, PreviewWidget
+from brickgen.gui.jobs import JobError, JobQueue, SKIPPED
+from brickgen.gui.preview import (
+    DISPLAY_MODES,
+    MODE_SOLID,
+    PreviewWidget,
+    build_preview_mesh,
+)
 from brickgen.services.app_settings import (
     AppSettings,
     load_app_settings,
@@ -94,10 +103,17 @@ class MainWindow(QMainWindow):
         self.resize(1400, 760)
         self.setMinimumSize(1100, 600)
 
+        # Background job queue for heavy meshing off the UI thread.
+        self._jobs = JobQueue(self)
+        self._gen_seq = 0
+        self._job_meta: dict[int, int] = {}  # job id -> generation seq
+        self._export_meta: dict[int, str] = {}  # job id -> resolved export path
+        self._jobs.job_done.connect(self._on_job_done)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_sidebar())
         splitter.addWidget(self._build_preview_pane())
-        self._library = TemplateLibraryPanel(self._collect_settings_or_default)
+        self._library = TemplateLibraryPanel(self._collect_settings_or_default, self._jobs)
         self._library.apply_requested.connect(self._on_template_selected)
         splitter.addWidget(self._library)
         splitter.setStretchFactor(0, 0)
@@ -365,53 +381,118 @@ class MainWindow(QMainWindow):
         self._set_status(f"Template applied: {settings.describe()}")
 
     def _on_generate(self) -> None:
-        '''Rebuild the model from form values and refresh the preview.
+        '''Schedule a background rebuild of the model from form values.
 
         Invalid intermediate form states are reported in the status label
-        only (no dialogs), so typing stays uninterrupted.
+        only (no dialogs), so typing stays uninterrupted.  The heavy meshing
+        is dispatched to :class:`JobQueue`; results arrive via ``_on_job_done``.
         '''
         try:
             self._settings = self._collect_settings()
         except BrickGenError as exc:
             self._set_status(f"Invalid settings: {exc}", error=True)
             return
-        try:
-            self._model = build_block(self._settings)
-        except BrickGenError as exc:
-            self._set_status(f"Generation failed: {exc}", error=True)
+
+        self._gen_seq += 1
+        seq = self._gen_seq
+        settings = self._settings  # snapshot: the worker must not read mutable state
+
+        self._set_status(f"Generating {settings.describe()}…")
+
+        tol = self._app_settings.preview_tolerance
+        ang = self._app_settings.preview_angular_tolerance
+
+        def build() -> tuple[BlockSettings, cq.Workplane, pv.PolyData]:
+            model = build_block(settings)
+            mesh = build_preview_mesh(model, settings, tol, ang)
+            return settings, model, mesh
+
+        job_id = self._jobs.submit(build, skip_if=lambda: seq != self._gen_seq)
+        self._job_meta[job_id] = seq
+
+    def _on_job_done(self, job_id: int, result: object) -> None:
+        '''Handle a completed background job.
+
+        Dispatches generation results (by ``_job_meta`` seq mapping) and export
+        results (by ``_export_meta`` path lookup), dropping unknown ids as
+        foreign jobs.  Skipped/stale generation results are silently discarded;
+        export errors always show a dialog because the user explicitly acted.
+
+        Args:
+            job_id: The job identifier returned by :meth:`JobQueue.submit`.
+            result: Return value from the job callable, :data:`SKIPPED`, or
+                a :class:`JobError`.
+        '''
+        # --- export routing (checked before generation) ---
+        if job_id in self._export_meta:
+            path = self._export_meta.pop(job_id)
+            if result is SKIPPED:
+                logger.warning("Export job %d was skipped (unexpected)", job_id)
+                return
+            if isinstance(result, JobError):
+                self._set_status("Export failed.", error=True)
+                QMessageBox.critical(self, "Export failed", str(result.exc))
+                return
+            written = Path(result)
+            self._set_status(f"Exported: {written.name}")
             return
+
+        # --- generation routing ---
+        seq = self._job_meta.pop(job_id, None)
+        if seq is None:
+            # Foreign job (e.g. from a later slice) — drop silently.
+            if result is not SKIPPED and not isinstance(result, JobError):
+                logger.debug("Dropping foreign job id=%d", job_id)
+            return
+
+        if result is SKIPPED:
+            return  # Superseded generation; silent discard.
+
+        # Stale check: a newer request superseded this between scheduling and
+        # delivery; failures of stale generations are not user-relevant either.
+        if seq != self._gen_seq:
+            return
+
+        if isinstance(result, JobError):
+            self._set_status(f"Generation failed: {result.exc}", error=True)
+            return
+
+        settings, model, mesh = result  # type: ignore[misc]
+        self._settings = settings
+        self._model = model
+
         slope_note = (
-            f" | slope {self._settings.slope_side} +{self._settings.slope_rise_units}u"
-            if self._settings.slope_active
+            f" | slope {settings.slope_side} +{settings.slope_rise_units}u"
+            if settings.slope_active
             else ""
         )
         figure_note = (
-            f" | figure {self._settings.included_count} cells"
-            if not self._settings.is_rectangular
+            f" | figure {settings.included_count} cells"
+            if not settings.is_rectangular
             else ""
         )
         chamfer_note = (
-            f" | {len(self._settings.sloped_cells)} chamfered"
-            if self._settings.sloped_cells
+            f" | {len(settings.sloped_cells)} chamfered"
+            if settings.sloped_cells
             else ""
         )
         self._status_style(False)
         self._status.setText(
-            f"Form {self._settings.describe()} | footprint "
-            f"{self._settings.outer_length_x:.2f} x {self._settings.outer_length_y:.2f} mm"
-            f" | height {self._settings.total_height:.2f} mm{slope_note}{figure_note}{chamfer_note}"
+            f"Form {settings.describe()} | footprint "
+            f"{settings.outer_length_x:.2f} x {settings.outer_length_y:.2f} mm"
+            f" | height {settings.total_height:.2f} mm{slope_note}{figure_note}{chamfer_note}"
         )
-        self._preview.show_model(
-            self._model,
-            self._settings,
-            self._app_settings.preview_tolerance,
-            self._app_settings.preview_angular_tolerance,
-        )
+        self._preview.update_mesh(mesh, settings)
         self._preview.set_display_mode(self._mode.currentText())
         self._preview.set_grid_enabled(self._grid.isChecked())
 
     def _on_export(self) -> None:
-        '''Ask for a destination file and export the current model.
+        '''Ask for a destination file and queue the export on the background job
+        queue.
+
+        The exported bytes always come from the model captured at submit time;
+        a later generation re-render never affects this export.  Every
+        user-confirmed export runs exactly once (``skip_if=None``).
 
         STEP is the default: it is first in the filter list and the initial
         file name. The selected filter defines the format and the file
@@ -436,19 +517,24 @@ class MainWindow(QMainWindow):
         if not path:
             return
         path, file_format = resolve_export_target(path, selected_filter)
-        try:
-            written = export_model(
-                self._model,
-                Path(path),
-                file_format,
-                tolerance=self._app_settings.export_tolerance,
-                angular_tolerance=self._app_settings.export_angular_tolerance,
+
+        # Capture a reference to the model at submit time so that a later
+        # generation re-render never affects this export.
+        model = self._model
+        export_tolerance = self._app_settings.export_tolerance
+        export_angular_tolerance = self._app_settings.export_angular_tolerance
+
+        self._set_status(f"Exporting {Path(path).name}…")
+
+        def run_export() -> Path:
+            return export_model(
+                model, Path(path), file_format,
+                tolerance=export_tolerance,
+                angular_tolerance=export_angular_tolerance,
             )
-        except BrickGenError as exc:
-            self._set_status("Export failed.", error=True)
-            QMessageBox.critical(self, "Export failed", str(exc))
-            return
-        self._set_status(f"Exported: {written.name}")
+
+        job_id = self._jobs.submit(run_export, skip_if=None)
+        self._export_meta[job_id] = path
 
     def _on_save_settings(self) -> None:
         '''Persist current form values into a JSON preset.'''

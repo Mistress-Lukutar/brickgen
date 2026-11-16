@@ -2,8 +2,8 @@
 File:   library.py
 Brief:  Template library panel: thumbnail previews, select, save, refresh.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.5.0
+Date:   2026-11-16
+Version: v0.7.0
 '''
 
 from __future__ import annotations
@@ -30,7 +30,8 @@ from PySide6.QtWidgets import (
 from brickgen.core.builder import build_block
 from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import BlockSettings
-from brickgen.gui.preview import BLOCK_COLOR, solid_to_mesh
+from brickgen.gui.jobs import JobError, JobQueue, SKIPPED
+from brickgen.gui.preview import BLOCK_COLOR, build_preview_mesh
 from brickgen.services.template_library import Template, list_templates, save_template
 
 logger = logging.getLogger(__name__)
@@ -38,16 +39,18 @@ logger = logging.getLogger(__name__)
 THUMBNAIL_SIZE = (192, 144)
 
 
-def render_thumbnail(settings: BlockSettings) -> QPixmap:
-    '''Render an off-screen preview image for the given settings.
+def render_thumbnail(mesh: pv.PolyData) -> QPixmap:
+    '''Render an off-screen preview image for a prepared preview mesh.
+
+    UI-thread only: creates a small off-screen VTK plotter. The heavy
+    build + tessellation happens beforehand on the background job queue.
 
     Args:
-        settings: Validated block settings to render.
+        mesh: Pre-tessellated PyVista PolyData to render.
 
     Returns:
         Thumbnail pixmap (white background, iso camera view).
     '''
-    mesh = solid_to_mesh(build_block(settings).val())
     plotter = pv.Plotter(off_screen=True, window_size=THUMBNAIL_SIZE)
     try:
         plotter.set_background("white")
@@ -67,6 +70,8 @@ class TemplateLibraryPanel(QWidget):
     '''Right-side template library: click a card to apply its parameters.
 
     Templates come from the builtin directory and the user directory.
+    Thumbnails are built asynchronously on the background job queue so that
+    the UI thread stays responsive during the heavy OCC tessellation.
     '''
 
     # Emitted with the settings of the template the user clicked.
@@ -75,6 +80,7 @@ class TemplateLibraryPanel(QWidget):
     def __init__(
         self,
         current_settings: Callable[[], BlockSettings],
+        jobs: JobQueue,
         parent: QWidget | None = None,
     ) -> None:
         '''Create the library panel.
@@ -82,10 +88,16 @@ class TemplateLibraryPanel(QWidget):
         Args:
             current_settings: Callback returning the settings currently
                 entered in the form (used by "Save as template").
+            jobs: Background job queue on which thumbnail build work is
+                dispatched.
             parent: Optional parent widget.
         '''
         super().__init__(parent)
         self._get_current_settings = current_settings
+        self._jobs = jobs
+        self._refresh_seq = 0
+        self._thumb_meta: dict[int, tuple[str, int]] = {}  # job id -> (name, seq)
+        self._jobs.job_done.connect(self._on_job_done)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
@@ -111,7 +123,14 @@ class TemplateLibraryPanel(QWidget):
         self.refresh()
 
     def refresh(self) -> None:
-        '''Reload the template list and (re)render all thumbnails.'''
+        '''Reload the template list and (re)render all thumbnails.
+
+        The item list renders immediately; each thumbnail fills in as its
+        build job completes on the background queue.
+        '''
+        self._refresh_seq += 1
+        refresh_seq = self._refresh_seq
+        self._thumb_meta.clear()
         self._list.clear()
         templates = list_templates()
         for template in templates:
@@ -122,12 +141,62 @@ class TemplateLibraryPanel(QWidget):
                 f"{template.settings.total_height:.1f} mm"
             )
             self._list.addItem(item)
-            try:
-                item.setIcon(render_thumbnail(template.settings))
-            except BrickGenError as exc:
-                logger.warning("Thumbnail render failed for %s: %s", template.name, exc)
+            settings = template.settings  # fresh local each iteration
+
+            def build_thumb(settings=settings) -> pv.PolyData:
+                return build_preview_mesh(build_block(settings), settings)
+
+            job_id = self._jobs.submit(build_thumb)  # no skip_if
+            self._thumb_meta[job_id] = (template.name, refresh_seq)
+
         if not templates:
             self._list.addItem(QListWidgetItem("(no templates found)"))
+
+    def _find_item(self, name: str) -> QListWidgetItem | None:
+        '''Find a list item by its display text.
+
+        Args:
+            name: Display text to match.
+
+        Returns:
+            The matching item, or ``None`` if not found.
+        '''
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item is not None and item.text() == name:
+                return item
+        return None
+
+    def _on_job_done(self, job_id: int, result: object) -> None:
+        '''Handle a completed thumbnail-build job.
+
+        Args:
+            job_id: The job identifier returned by :meth:`JobQueue.submit`.
+            result: Return value from the job callable, :data:`SKIPPED`, or
+                a :class:`JobError`.
+        '''
+        meta = self._thumb_meta.pop(job_id, None)
+        if meta is None:
+            return  # Foreign job (e.g. generation/export — other slots handle those).
+
+        name, refresh_seq = meta
+        if refresh_seq != self._refresh_seq:
+            return  # A newer refresh replaced the list; discard stale result.
+
+        if isinstance(result, JobError):
+            logger.warning("Thumbnail build failed for %s: %s", name, result.exc)
+            return
+
+        if result is SKIPPED:
+            return  # Not expected (no skip_if used); defensive.
+
+        item = self._find_item(name)
+        if item is None:
+            return
+        try:
+            item.setIcon(render_thumbnail(result))
+        except Exception:  # noqa: BLE001 - VTK off-screen render can fail on broken GL
+            logger.warning("Thumbnail VTK render failed for %s", name)
 
     def _on_item_clicked(self, item: QListWidgetItem) -> None:
         '''Emit the settings of the clicked template.'''
