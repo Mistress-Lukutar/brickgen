@@ -276,8 +276,9 @@ class MainWindow(QMainWindow):
 
         A checklist of the actions available for the selected cell; checking
         an item reveals its parameter pairs indented below it. Slope and
-        stud are mutually exclusive (a wedge top cannot carry a stud), a
-        chamfer combines with any top, exclusion hides everything else.
+        stud are mutually exclusive (a wedge top cannot carry a stud), the
+        round base conflicts with the slope and chamfer wedges, exclusion
+        hides everything else.
         '''
         self._cell_group = QGroupBox("Cell (click the layout to select)")
         outer = QVBoxLayout(self._cell_group)
@@ -292,8 +293,14 @@ class MainWindow(QMainWindow):
         )
         self._cb_slope = QCheckBox("Slope")
         self._cb_slope.setToolTip(
-            "Solid top wedge: the raised edge rises N x unit heights.\n"
-            "Geometrically impossible together with a stud."
+            "Top wedge: the raised edge rises N x unit heights, the cell\n"
+            "keeps the usual bottom opening. Geometrically impossible\n"
+            "together with a stud or a round base."
+        )
+        self._cb_round = QCheckBox("Round base")
+        self._cb_round.setToolTip(
+            "Replace the square base with the inscribed circle; the bottom\n"
+            "hole becomes round as well. Conflicts with slope and chamfer."
         )
         self._cb_chamfer = QCheckBox("Chamfer (bottom)")
         self._cb_chamfer.setToolTip(
@@ -326,6 +333,7 @@ class MainWindow(QMainWindow):
             self._cb_stud,
             self._cb_slope,
             self._slope_params,
+            self._cb_round,
             self._cb_chamfer,
             self._chamfer_params,
         ):
@@ -334,6 +342,7 @@ class MainWindow(QMainWindow):
         self._cb_exclude.toggled.connect(self._on_inspector_exclude)
         self._cb_stud.toggled.connect(self._on_inspector_stud)
         self._cb_slope.toggled.connect(self._on_inspector_slope)
+        self._cb_round.toggled.connect(self._on_inspector_round)
         self._cb_chamfer.toggled.connect(self._on_inspector_chamfer)
         self._slope_edge.currentTextChanged.connect(self._on_slope_params_changed)
         self._slope_rise.valueChanged.connect(self._on_slope_params_changed)
@@ -442,6 +451,7 @@ class MainWindow(QMainWindow):
             self._cb_exclude,
             self._cb_stud,
             self._cb_slope,
+            self._cb_round,
             self._cb_chamfer,
         )
         for box in boxes:
@@ -464,6 +474,8 @@ class MainWindow(QMainWindow):
             self._cb_stud.setChecked(self._cell_grid.effective_stud(ix, iy))
             self._cb_slope.setEnabled(not state.excluded)
             self._cb_slope.setChecked(state.slope is not None)
+            self._cb_round.setEnabled(not state.excluded)
+            self._cb_round.setChecked(state.round)
             self._cb_chamfer.setEnabled(not state.excluded and bool(sides))
             self._cb_chamfer.setChecked(state.chamfer is not None)
             self._sync_slope_params(state)
@@ -536,7 +548,7 @@ class MainWindow(QMainWindow):
         self._edit_selected(mutate)
 
     def _on_inspector_slope(self, checked: bool) -> None:
-        '''Toggle the top slope; it replaces the stud (conflict).'''
+        '''Toggle the top slope; it replaces the stud and round base.'''
 
         def mutate(state: CellState) -> None:
             state.slope = (
@@ -546,6 +558,18 @@ class MainWindow(QMainWindow):
             )
             if checked:
                 state.stud = None  # the wedge top replaces the stud
+                state.round = False  # a wedge needs a square base
+
+        self._edit_selected(mutate)
+
+    def _on_inspector_round(self, checked: bool) -> None:
+        '''Toggle the round base; it clears the wedge features (conflict).'''
+
+        def mutate(state: CellState) -> None:
+            state.round = checked
+            if checked:
+                state.slope = None
+                state.chamfer = None
 
         self._edit_selected(mutate)
 
@@ -556,6 +580,8 @@ class MainWindow(QMainWindow):
             state.chamfer = (
                 self._chamfer_edge.currentText() if checked else None
             )
+            if checked:
+                state.round = False  # a chamfer needs a square base
 
         self._edit_selected(mutate)
 
@@ -593,6 +619,7 @@ class MainWindow(QMainWindow):
             "stud_cells": self._cell_grid.stud_cells(),
             "sloped_cells": self._cell_grid.sloped_cells(),
             "chamfered_cells": self._cell_grid.chamfered_cells(),
+            "round_cells": self._cell_grid.round_cells(),
         }
         values.update({field: spin.value() for field, spin in self._floats.items()})
         return validate_settings(values)
@@ -624,6 +651,7 @@ class MainWindow(QMainWindow):
             self._settings.stud_cells,
             self._settings.sloped_cells,
             self._settings.chamfered_cells,
+            self._settings.round_cells,
         )
         for field, spin in self._floats.items():
             spin.setValue(getattr(self._settings, field))
@@ -748,12 +776,17 @@ class MainWindow(QMainWindow):
             if settings.chamfered_cells
             else ""
         )
+        round_note = (
+            f" | {len(settings.round_cells)} round"
+            if settings.round_cells
+            else ""
+        )
         self._status_style(False)
         self._status.setText(
             f"Form {settings.describe()} | footprint "
             f"{settings.outer_length_x:.2f} x {settings.outer_length_y:.2f} mm"
             f" | height {settings.total_height:.2f} mm"
-            f"{slope_note}{figure_note}{chamfer_note}"
+            f"{slope_note}{figure_note}{chamfer_note}{round_note}"
         )
         self._preview.update_mesh(mesh, settings)
         self._preview.set_display_mode(self._mode.currentText())

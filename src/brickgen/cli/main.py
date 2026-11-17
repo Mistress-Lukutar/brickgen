@@ -128,6 +128,11 @@ def generate(
         help="Bottom-chamfered cells 'ix,iy,side;...', side "
         f"{'/'.join(SLOPE_SIDES)}.",
     ),
+    round_cells: str = typer.Option(
+        "",
+        "--round-cells",
+        help="Round-base cells 'ix,iy;...' (inscribed cylinder, round hole).",
+    ),
     settings_file: Path | None = typer.Option(
         None, "--settings", "-s", help="Load parameters from a JSON preset first."
     ),
@@ -163,6 +168,7 @@ def generate(
             "stud_cells": _parse_cell_list(stud_cells, 2, "stud-cells"),
             "sloped_cells": _parse_cell_list(slope_cells, 4, "slope-cells"),
             "chamfered_cells": _parse_cell_list(chamfer_cells, 3, "chamfer-cells"),
+            "round_cells": _parse_cell_list(round_cells, 2, "round-cells"),
         }
         settings = settings.model_copy(update=overrides)
         settings = validate_settings(settings.model_dump())

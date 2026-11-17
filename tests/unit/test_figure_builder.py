@@ -136,16 +136,16 @@ def test_figure_no_ribs_without_concave_corner() -> None:
 
 
 def test_slope_cell_in_figure_variant() -> None:
-    '''A slope cell inside an L figure: solid wedge, no ribs from it.'''
+    '''A slope cell inside an L figure: hollow wedge, rib at the corner.'''
     settings = BlockSettings(
         cells_x=2,
         cells_y=2,
         excluded_cells=[[1, 1]],
         sloped_cells=[[1, 0, "+X", 1]],
     )
-    # the sloped cell has no cavity, so the L corner has only 2 cavity
-    # quadrants left -> no quarter-round rib
-    assert _figure_corner_ribs(settings) == []
+    # the sloped cell keeps a normal cavity, so the L corner has exactly
+    # 3 cavity quadrants -> one quarter-round rib
+    assert len(_figure_corner_ribs(settings)) == 1
     solid = build_block(settings).val()
     assert solid.BoundingBox().zmax == pytest.approx(
         2 * settings.block_height, abs=1e-4

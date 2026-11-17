@@ -42,6 +42,9 @@ class CellState:
             replaces the top entirely, so it clears this override.
         slope: ``(side, rise)`` of the top wedge; None when the top is flat
             or studded.
+        round: Round base - the square is replaced by the inscribed circle.
+            Conflicts with the slope and chamfer wedges, so enabling it
+            clears both.
         chamfer: Single outward side of the bottom chamfer; the core model
             supports several sides per cell, the GUI edits exactly one.
     '''
@@ -49,6 +52,7 @@ class CellState:
     excluded: bool = False
     stud: bool | None = None
     slope: tuple[str, int] | None = None
+    round: bool = False
     chamfer: str | None = None
 
     def is_default(self) -> bool:
@@ -57,6 +61,7 @@ class CellState:
             not self.excluded
             and self.stud is None
             and self.slope is None
+            and not self.round
             and self.chamfer is None
         )
 
@@ -65,11 +70,12 @@ class CellGridEditor(QWidget):
     '''Schematic top view of the cell grid (X right, Y up).
 
     Left-clicking a cell selects it (red outline); the features of the
-    selected cell - exclusion, top stud, top slope, bottom chamfer - are
-    edited through :meth:`set_state` by the inspector panel in the main
-    window. Cell colors: blue = included, gray = excluded, orange = bottom
-    chamfer. Icons: white dot = stud, dark wedge = slope (full edge marks
-    the raised side), black arrow = chamfer direction.
+    selected cell - exclusion, top stud, top slope, round base, bottom
+    chamfer - are edited through :meth:`set_state` by the inspector panel
+    in the main window. Cell colors: blue = included, gray = excluded,
+    orange = bottom chamfer. Round cells render as circles. Icons: white
+    dot = stud, dark wedge = slope (full edge marks the raised side),
+    black arrow = chamfer direction.
     '''
 
     # Emitted after any cell state change.
@@ -226,6 +232,12 @@ class CellGridEditor(QWidget):
             result.append([ix, iy, side, rise])
         return sorted(result)
 
+    def round_cells(self) -> list[list[int]]:
+        '''Round-base cells as sorted [ix, iy] pairs.'''
+        return sorted(
+            [ix, iy] for (ix, iy), st in self._states.items() if st.round
+        )
+
     def chamfered_cells(self) -> list[list]:
         '''Bottom-chamfer list as sorted [ix, iy, side] triplets.'''
         result: list[list] = []
@@ -242,6 +254,7 @@ class CellGridEditor(QWidget):
         stud: list[list[int]],
         sloped: list[list],
         chamfered: list[list],
+        round_cells: list[list[int]] | None = None,
     ) -> None:
         '''Replace all cell states from model-style lists.
 
@@ -254,6 +267,7 @@ class CellGridEditor(QWidget):
             stud: [ix, iy] pairs of explicit stud cells.
             sloped: [ix, iy, side, rise] quadruplets.
             chamfered: [ix, iy, side] triplets.
+            round_cells: [ix, iy] pairs of round-base cells.
         '''
         states: dict[tuple[int, int], CellState] = {}
 
@@ -278,6 +292,10 @@ class CellGridEditor(QWidget):
             cell = _cell_of(item)
             if cell is not None and cell not in states:
                 states[cell] = CellState(stud=True)
+        for item in round_cells or []:
+            cell = _cell_of(item)
+            if cell is not None and cell not in states:
+                states[cell] = CellState(round=True)
         for item in sloped:
             cell = _cell_of(item)
             if cell is None:
@@ -337,7 +355,11 @@ class CellGridEditor(QWidget):
                     else:
                         painter.setBrush(_FILL_INCLUDED)
                     painter.setPen(QPen(_EDGE_COLOR, 1))
-                    painter.drawRect(rect)
+                    if state.round and not state.excluded:
+                        # round base: the inscribed circle replaces the square
+                        painter.drawEllipse(rect.adjusted(1.0, 1.0, -1.0, -1.0))
+                    else:
+                        painter.drawRect(rect)
                     if state.excluded:
                         continue
                     if state.slope is not None:
@@ -347,7 +369,7 @@ class CellGridEditor(QWidget):
                     if state.chamfer is not None:
                         self._draw_arrow(painter, rect, state.chamfer)
                     if self._selected == (ix, iy):
-                        self._draw_selection(painter, rect)
+                        self._draw_selection(painter, rect, state.round)
         finally:
             painter.end()
 
@@ -398,11 +420,19 @@ class CellGridEditor(QWidget):
         )
         painter.drawPolygon(QPolygonF([tip, left, right]))
 
-    def _draw_selection(self, painter: QPainter, rect: QRectF) -> None:
-        '''Draw the red outline around the selected cell.'''
+    def _draw_selection(
+        self, painter: QPainter, rect: QRectF, round_shape: bool
+    ) -> None:
+        '''Draw the red outline around the selected cell.
+
+        Round cells get a circular outline matching their base shape.
+        '''
         painter.setPen(QPen(_SELECTION_COLOR, 2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(rect.adjusted(1.0, 1.0, -1.0, -1.0))
+        if round_shape:
+            painter.drawEllipse(rect)
+        else:
+            painter.drawRect(rect.adjusted(1.0, 1.0, -1.0, -1.0))
 
     # ------------------------------------------------------------- input
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming

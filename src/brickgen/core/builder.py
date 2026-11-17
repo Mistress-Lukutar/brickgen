@@ -64,9 +64,10 @@ def build_block(settings: BlockSettings) -> cq.Workplane:
     X/Y - footprint plane, Z - up, block bottom rim sits at Z=0,
     top face at Z=``block_height``, studs extend up to Z=``total_height``.
 
-    Cells with per-cell features (sloped tops, bottom chamfers, exclusions)
-    switch to the figure variant; sloped cells become solid wedges whose
-    ``side`` edge rises by ``rise x block_height``.
+    Cells with per-cell features (sloped tops, bottom chamfers, round
+    bases, exclusions) switch to the figure variant; sloped cells become
+    trapezoid wedges whose ``side`` edge rises by ``rise x block_height``
+    while keeping the standard bottom opening.
 
     Args:
         settings: Validated parametric block description.
@@ -101,7 +102,7 @@ def _included_cells(settings: BlockSettings) -> list[tuple[int, int]]:
 
 
 def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
-    '''Build a block with excluded, bottom-chamfered and/or sloped cells.
+    '''Build a block with excluded, chamfered, sloped and/or round cells.
 
     The figure variant follows the reference parts: the cavity is one piece
     shaped like the included region (perimeter walls step around excluded
@@ -113,9 +114,12 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
     Chamfered cells are solid wedges: their cavity box is omitted and a
     triangular prism is cut away below the sloped underside plane, which
     rises from the full height at the inner face to the top edge at the
-    outward face. Sloped cells are solid top wedges: a trapezoid prism over
-    the cell footprint, no cavity, no stud; they may be combined with a
-    bottom chamfer.
+    outward face. Sloped cells are trapezoid prisms that keep the standard
+    cavity: the wedge sits on the shared top slab, so the bottom opening
+    looks the same as on plain cells. Round cells replace the square base
+    with the inscribed cylinder and carry their own concentric round hole;
+    the hole never fuses with neighbors, so square cavities keep a wall
+    strip toward round cells.
 
     Args:
         settings: Validated parametric block description.
@@ -132,35 +136,44 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
     material = set(_included_cells(settings))
     chamfered = {(ix, iy) for ix, iy, _ in settings.chamfered_cells}
     sloped = settings.slope_cell_set()
+    round_cells = settings.round_cell_set()
     slope_by_cell = {
         (int(item[0]), int(item[1])): (str(item[2]), int(item[3]))
         for item in settings.sloped_cells
     }
-    # For cavity-side decisions a chamfered or sloped neighbor counts as
-    # boundary: those cells have no cavity of their own, so a wall strip is
-    # required between the normal cell's cavity and their solid body,
-    # otherwise the bottom opening would extend under them (too wide).
-    cavity_neighbors = material - chamfered - sloped
+    # For cavity-side decisions a chamfered (solid wedge) or round neighbor
+    # counts as boundary: chamfered cells have no cavity of their own, and
+    # a round cell's concentric hole recedes from the shared edge, so a
+    # wall strip is required; otherwise the bottom opening would extend
+    # under/behind them (too wide). Sloped cells keep a normal cavity and
+    # fuse with adjacent ones.
+    cavity_neighbors = material - chamfered - round_cells
 
     cells: list[cq.Workplane] = []
     cavities: list[cq.Workplane] = []
     for ix, iy in sorted(material):
         x0 = ix * unit - half_x
         y0 = iy * unit - half_y
-        if (ix, iy) in sloped:
+        if (ix, iy) in round_cells:
+            cells.append(_round_cell_solid(settings, ix, iy))
+        elif (ix, iy) in sloped:
             side, rise_units = slope_by_cell[(ix, iy)]
             cells.append(_slope_cell_solid(settings, ix, iy, side, rise_units))
-            continue  # solid wedge: no cavity opening in sloped cells
-        cell = cq.Workplane("XY", origin=(x0 + unit / 2.0, y0 + unit / 2.0, 0)).box(
-            unit, unit, height, centered=(True, True, False)
-        )
-        cells.append(cell)
+        else:
+            cells.append(
+                cq.Workplane(
+                    "XY", origin=(x0 + unit / 2.0, y0 + unit / 2.0, 0)
+                ).box(unit, unit, height, centered=(True, True, False))
+            )
         if (ix, iy) in chamfered:
             continue  # solid wedge: no cavity opening in chamfered cells
+        if (ix, iy) in round_cells:
+            cavities.append(_round_cell_hole(settings, ix, iy))
+            continue
         # Cavity box: inset t only on sides facing the region boundary or a
-        # solid (chamfered/sloped) cell; sides shared with a normal material
-        # neighbor stay open so the cavities of adjacent cells fuse into a
-        # single contour-shaped cavity.
+        # cell without a fusable cavity (chamfered/round); sides shared with
+        # a normal or sloped material neighbor stay open so the cavities of
+        # adjacent cells fuse into a single contour-shaped cavity.
         inset_x0 = t if (ix - 1, iy) not in cavity_neighbors else 0.0
         inset_x1 = t if (ix + 1, iy) not in cavity_neighbors else 0.0
         inset_y0 = t if (ix, iy - 1) not in cavity_neighbors else 0.0
@@ -323,15 +336,78 @@ def _slope_cell_solid(
     return prism.translate((perp_center[0], perp_center[1], 0))
 
 
+def _cell_center(settings: BlockSettings, ix: int, iy: int) -> tuple[float, float]:
+    '''XY center of cell (ix, iy) in block coordinates, mm.'''
+    return (
+        (ix + 0.5) * settings.unit_size - settings.outer_length_x / 2.0,
+        (iy + 0.5) * settings.unit_size - settings.outer_length_y / 2.0,
+    )
+
+
+# Radial bulge of the round cell cylinder over the exact inscribed circle.
+# Adjacent round cells (or a cylinder and a neighboring box) touch the
+# shared cell edge along a single tangent line, which OCC refuses to fuse
+# into one solid; the tiny overlap makes the union robust while staying
+# visually identical to the inscribed circle.
+ROUND_CELL_OVERSHOOT = 0.05
+
+
+def _round_cell_solid(settings: BlockSettings, ix: int, iy: int) -> cq.Workplane:
+    '''Cylinder replacing the square base of a round cell.
+
+    The cylinder is inscribed in the cell footprint (diameter
+    ``unit_size``) plus :data:`ROUND_CELL_OVERSHOOT` so neighboring cells
+    fuse, and spans the full block height.
+
+    Args:
+        settings: Validated parametric block description.
+        ix: Cell index along X.
+        iy: Cell index along Y.
+
+    Returns:
+        The round cell solid, centered in the cell footprint.
+    '''
+    cx, cy = _cell_center(settings, ix, iy)
+    return (
+        cq.Workplane("XY", origin=(cx, cy, 0))
+        .circle(settings.unit_size / 2.0 + ROUND_CELL_OVERSHOOT)
+        .extrude(settings.block_height)
+    )
+
+
+def _round_cell_hole(settings: BlockSettings, ix: int, iy: int) -> cq.Workplane:
+    '''Concentric round bottom hole of a round cell.
+
+    The bore diameter is ``unit_size - 2 x wall_thickness`` (the inscribed
+    circle inset by the wall thickness) and the ceiling sits at
+    ``block_height - wall_thickness``, open from below.
+
+    Args:
+        settings: Validated parametric block description.
+        ix: Cell index along X.
+        iy: Cell index along Y.
+
+    Returns:
+        The hole cutter solid, spanning the cell height minus the top slab.
+    '''
+    cx, cy = _cell_center(settings, ix, iy)
+    return (
+        cq.Workplane("XY", origin=(cx, cy, 0))
+        .circle(settings.unit_size / 2.0 - settings.wall_thickness)
+        .extrude(settings.block_height - settings.wall_thickness + CUT_OVERSHOOT)
+        .translate((0, 0, -CUT_OVERSHOOT))
+    )
+
+
 def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
     '''Quarter-round inward ribs at every concave corner of the figure.
 
     A concave corner is a lattice vertex where exactly 3 of the 4 adjacent
     cells have cavities (the missing cell creates the inner angle). Chamfered
-    and sloped cells are solid (no cavity) and therefore do not contribute to
-    such corners. The rib fills that corner with a quarter-round fillet
-    (instead of a tube), spans the full cavity height and overshoots into the
-    top face.
+    cells are solid (no cavity) and round cells keep a hole that recedes
+    from the lattice vertex, so neither contributes to such corners. The
+    rib fills that corner with a quarter-round fillet (instead of a tube),
+    spans the full cavity height and overshoots into the top face.
 
     Args:
         settings: Validated parametric block description.
@@ -346,7 +422,7 @@ def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
     radius = min(2.0 * t, unit - 2.0 * t)
     included = set(_included_cells(settings))
     chamfered = {(ix, iy) for ix, iy, _ in settings.chamfered_cells}
-    cavity_cells = included - chamfered - settings.slope_cell_set()
+    cavity_cells = included - chamfered - settings.round_cell_set()
 
     ribs: list[cq.Workplane] = []
     for i in range(1, settings.cells_x):

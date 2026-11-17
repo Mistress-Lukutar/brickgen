@@ -56,18 +56,24 @@ class BlockSettings(BaseModel):
     - ``stud`` - cylindrical stud on the top face. This is the default top
       for plain cells when ``pins_enabled`` is true; ``stud_cells`` /
       ``flat_cells`` override the default per cell.
-    - ``sloped cell`` - solid wedge: the ``side`` edge of the cell rises by
+    - ``sloped cell`` - top wedge: the ``side`` edge of the cell rises by
       ``rise x block_height`` and the cell top slopes down to the opposite
-      edge. Sloped cells are solid (no cavity, no stud) and may be combined
-      with a bottom chamfer.
+      edge. The cell keeps the standard bottom opening (only chamfered
+      cells are solid), so a slope combines with the usual hollow shell.
     - ``chamfered cell`` - ``[ix, iy, side]`` triplet: the cell bottom is a
       solid wedge thinned toward ``side`` (no cavity opening). ``side`` must
-      look outward (neighbor across it excluded or outside the grid).
+      look outward (neighbor across it excluded or outside the grid). The
+      chamfer makes the cell solid, so a sloped+chamfered cell has no
+      bottom opening either.
+    - ``round cell`` - the square base is replaced by the inscribed circle
+      (cylinder) with a concentric round bottom hole inset by the wall
+      thickness. Round cells never fuse their hole with neighbors and
+      cannot carry a slope or a chamfer.
     - ``excluded cell`` - removed from the figure entirely.
 
-    Exclusions, chamfers or slopes switch the builder to the figure variant:
-    contour walls follow the shape, concave corners get inward quarter-round
-    ribs instead of tubes.
+    Exclusions, chamfers, slopes or round cells switch the builder to the
+    figure variant: contour walls follow the shape, concave corners get
+    inward quarter-round ribs instead of tubes.
 
     Attributes:
         cells_x: Number of cells along X (block length in cells).
@@ -88,11 +94,13 @@ class BlockSettings(BaseModel):
         stud_cells: ``[ix, iy]`` cells explicitly with a stud (used when
             ``pins_enabled`` is false).
         sloped_cells: ``[ix, iy, side, rise]`` quadruplets for cells whose
-            top is a solid wedge: the ``side`` edge rises by
+            top is a wedge: the ``side`` edge rises by
             ``rise x block_height``. ``rise`` is 1..MAX_SLOPE_RISE.
         chamfered_cells: ``[ix, iy, side]`` triplets for cells whose bottom
             is chamfered (solid wedge, no cavity opening). A cell may be
             chamfered on several sides; combined freely with any top.
+        round_cells: ``[ix, iy]`` cells whose square base is replaced by the
+            inscribed cylinder with a round bottom hole.
     '''
 
     cells_x: int = Field(default=1, ge=1, le=MAX_CELLS)
@@ -110,6 +118,7 @@ class BlockSettings(BaseModel):
     stud_cells: list[list[int]] = Field(default_factory=list)
     sloped_cells: list[list] = Field(default_factory=list)
     chamfered_cells: list[list] = Field(default_factory=list)
+    round_cells: list[list[int]] = Field(default_factory=list)
 
     model_config = {"extra": "forbid"}
 
@@ -252,6 +261,12 @@ class BlockSettings(BaseModel):
         '''Normalize the explicit stud list to sorted [ix, iy] pairs.'''
         return cls._normalize_cell_pairs(value, "stud cell")
 
+    @field_validator("round_cells")
+    @classmethod
+    def _validate_round_cells(cls, value: list) -> list[list[int]]:
+        '''Normalize the round-base list to sorted [ix, iy] pairs.'''
+        return cls._normalize_cell_pairs(value, "round cell")
+
     @staticmethod
     def _normalize_cell_pairs(value: list, label: str) -> list[list[int]]:
         '''Normalize a raw cell list to sorted [ix, iy] integer pairs.
@@ -292,6 +307,7 @@ class BlockSettings(BaseModel):
             self.excluded_cells
             or self.chamfered_cells
             or self.sloped_cells
+            or self.round_cells
         )
 
     @property
@@ -303,6 +319,11 @@ class BlockSettings(BaseModel):
     def has_sloped_tops(self) -> bool:
         '''True when at least one cell has a sloped top wedge.'''
         return bool(self.sloped_cells)
+
+    @property
+    def has_round_cells(self) -> bool:
+        '''True when at least one cell has a round (cylinder) base.'''
+        return bool(self.round_cells)
 
     @property
     def max_slope_rise_units(self) -> int:
@@ -332,6 +353,10 @@ class BlockSettings(BaseModel):
     def slope_cell_set(self) -> set[tuple[int, int]]:
         '''Set of (ix, iy) cells with a sloped top wedge.'''
         return {(int(item[0]), int(item[1])) for item in self.sloped_cells}
+
+    def round_cell_set(self) -> set[tuple[int, int]]:
+        '''Set of (ix, iy) cells with a round (cylinder) base.'''
+        return {(int(item[0]), int(item[1])) for item in self.round_cells}
 
     def flat_cell_set(self) -> set[tuple[int, int]]:
         '''Set of (ix, iy) cells explicitly without a stud.'''
@@ -397,6 +422,8 @@ class BlockSettings(BaseModel):
         sloped = self.slope_cell_set()
         flat = self.flat_cell_set()
         stud = self.stud_cell_set()
+        round_cells = self.round_cell_set()
+        chamfered = {(int(item[0]), int(item[1])) for item in self.chamfered_cells}
         for ix, iy in excluded:
             if not (0 <= ix < self.cells_x and 0 <= iy < self.cells_y):
                 raise SettingsValidationError(
@@ -405,7 +432,8 @@ class BlockSettings(BaseModel):
                 )
         self._check_cell_bounds(flat, "flat")
         self._check_cell_bounds(stud, "stud")
-        for ix, iy in sloped | flat | stud:
+        self._check_cell_bounds(round_cells, "round")
+        for ix, iy in sloped | flat | stud | round_cells:
             if (ix, iy) in excluded:
                 raise SettingsValidationError(
                     f"cell [{ix}, {iy}] cannot be both excluded and featured"
@@ -428,6 +456,19 @@ class BlockSettings(BaseModel):
             raise SettingsValidationError(
                 f"cell [{ix}, {iy}] cannot be both sloped and stud: a wedge "
                 "top cannot carry a stud"
+            )
+        conflict = round_cells & sloped
+        if conflict:
+            ix, iy = min(conflict)
+            raise SettingsValidationError(
+                f"cell [{ix}, {iy}] cannot be both round and sloped: a wedge "
+                "top needs a square base"
+            )
+        conflict = round_cells & chamfered
+        if conflict:
+            ix, iy = min(conflict)
+            raise SettingsValidationError(
+                f"cell [{ix}, {iy}] cannot be both round and chamfered"
             )
         side_offsets = {"+X": (1, 0), "-X": (-1, 0), "+Y": (0, 1), "-Y": (0, -1)}
         for ix, iy, side in self.chamfered_cells:

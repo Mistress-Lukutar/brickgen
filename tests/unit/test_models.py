@@ -187,6 +187,42 @@ def test_slope_inside_figure_is_allowed() -> None:
     assert not settings.is_rectangular
 
 
+# ------------------------------------------------------- round base cells
+def test_round_cell_validation() -> None:
+    '''Bounds, duplicates and wedge conflicts are rejected for round cells.'''
+    with pytest.raises(SettingsValidationError, match="outside"):
+        BlockSettings(cells_x=2, cells_y=1, round_cells=[[5, 0]])
+    with pytest.raises(SettingsValidationError, match="twice"):
+        BlockSettings(cells_x=2, cells_y=1, round_cells=[[0, 0], [0, 0]])
+    with pytest.raises(SettingsValidationError, match="round and sloped"):
+        BlockSettings(
+            cells_x=2, cells_y=1, round_cells=[[0, 0]], sloped_cells=[[0, 0, "+X", 1]]
+        )
+    with pytest.raises(SettingsValidationError, match="round and chamfered"):
+        BlockSettings(
+            cells_x=2, cells_y=1, round_cells=[[0, 0]], chamfered_cells=[[0, 0, "-X"]]
+        )
+    with pytest.raises(SettingsValidationError, match="excluded"):
+        BlockSettings(
+            cells_x=2, cells_y=1, excluded_cells=[[0, 0]], round_cells=[[0, 0]]
+        )
+
+
+def test_round_cell_combines_with_top_overrides() -> None:
+    '''A round base is independent of the top type: stud or flat both fine.'''
+    round_stud = BlockSettings(cells_x=2, cells_y=1, round_cells=[[0, 0]])
+    assert round_stud.cell_top(0, 0) == "stud"
+    assert round_stud.cell_top(1, 0) == "stud"
+    assert (0, 0) in round_stud.stud_cells_all()
+    assert not round_stud.is_rectangular
+
+    round_flat = BlockSettings(
+        cells_x=2, cells_y=1, round_cells=[[0, 0]], flat_cells=[[0, 0]]
+    )
+    assert round_flat.cell_top(0, 0) == "flat"
+    assert round_flat.has_studs  # only cell (1,0) carries a stud
+
+
 def test_v1_migration() -> None:
     '''v1 keys map onto the v2 fields on load.'''
     # global stud-less slope -> per-cell wedges covering the whole grid
