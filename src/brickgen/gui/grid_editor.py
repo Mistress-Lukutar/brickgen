@@ -8,7 +8,7 @@ Version: v0.6.0
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QPointF, QRectF, Signal
+from PySide6.QtCore import QPointF, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 

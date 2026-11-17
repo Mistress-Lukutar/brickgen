@@ -11,11 +11,13 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable
+from typing import cast
 
 import cadquery as cq
 import numpy as np
 import pyvista as pv
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from PySide6.QtWidgets import QWidget
 from pyvistaqt import QtInteractor
 
 from brickgen.core.models import BlockSettings
@@ -177,7 +179,7 @@ def semantic_edges(mesh: pv.PolyData) -> pv.PolyData:
     return out
 
 
-def add_surface_actor(plotter, mesh: pv.PolyData) -> object:
+def add_surface_actor(plotter, mesh: pv.PolyData) -> pv.Actor:
     '''Add the shaded surface actor with a uniform block color to a plotter.
 
     Works with any pyvista plotter (QtInteractor or off-screen Plotter).
@@ -264,7 +266,10 @@ def build_preview_mesh(
         Triangle PolyData with per-face part classification.
     '''
     return solid_to_mesh(
-        model.val(), tolerance, angular_tolerance, make_face_classifier(settings)
+        cast(cq.Shape, model.val()),  # cadquery val() is loosely typed
+        tolerance,
+        angular_tolerance,
+        make_face_classifier(settings),
     )
 
 
@@ -279,23 +284,23 @@ class PreviewWidget(QtInteractor):
     tube bore rims, bottom rim.
     '''
 
-    def __init__(self, parent: object | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         '''Create the renderer with a white background.
 
         Args:
             parent: Optional parent widget.
         '''
         super().__init__(parent=parent)
-        self.set_background("white")
+        self.set_background("white")  # type: ignore[arg-type]  # pyvista stub bug
         self._mesh: pv.PolyData | None = None
-        self._mesh_actor = None
+        self._mesh_actor: pv.Actor | None = None
         self._edge_mesh: pv.PolyData | None = None
-        self._edge_actor = None
-        self._wire_actor = None
-        self._grid_actor = None
+        self._edge_actor: pv.Actor | None = None
+        self._wire_actor: pv.Actor | None = None
+        self._grid_actor: pv.CubeAxesActor | None = None
         self._mode = MODE_SOLID
         self._grid_enabled = False
-        self.enable_anti_aliasing("msaa")
+        self.enable_anti_aliasing("msaa")  # type: ignore[call-arg]  # pyvista stub bug
 
     def update_mesh(self, mesh: pv.PolyData, settings: BlockSettings) -> None:
         '''Update the preview with a pre-tessellated mesh.
@@ -315,7 +320,9 @@ class PreviewWidget(QtInteractor):
         self._mesh = mesh
         self._edge_mesh = None
         try:
-            self.enable_ssao(radius=max(2.0, settings.unit_size), bias=0.02)
+            self.enable_ssao(  # type: ignore[call-arg]  # pyvista stub bug
+                radius=max(2.0, settings.unit_size), bias=0.02
+            )
         except Exception:  # noqa: BLE001 - SSAO is optional eye-candy; GL may lack it
             logger.warning("SSAO unavailable in this environment", exc_info=True)
         self._rebuild_actors()
@@ -324,7 +331,8 @@ class PreviewWidget(QtInteractor):
             self.camera_position = camera_position
             self.camera_set = True
         else:
-            self.reset_camera()
+            # reset_camera: pyvista stub bug (decorated _Wrapped signature).
+            self.reset_camera()  # type: ignore[call-arg]
         logger.debug(
             "Preview mesh: %d points / %d cells",
             self._mesh.n_points,
@@ -350,7 +358,9 @@ class PreviewWidget(QtInteractor):
             tolerance: Linear tessellation tolerance in mm.
             angular_tolerance: Angular tessellation tolerance in rad.
         '''
-        self.update_mesh(build_preview_mesh(model, settings, tolerance, angular_tolerance), settings)
+        self.update_mesh(
+            build_preview_mesh(model, settings, tolerance, angular_tolerance), settings
+        )
 
     def set_display_mode(self, mode: str) -> None:
         '''Switch the rendering style without retessellating.
@@ -424,5 +434,6 @@ class PreviewWidget(QtInteractor):
             self.remove_actor(self._grid_actor)
             self._grid_actor = None
         if self._grid_enabled and self._mesh is not None:
-            self._grid_actor = self.show_grid(font_size=8)
+            # show_grid: pyvista stub bug (decorated _Wrapped signature).
+            self._grid_actor = self.show_grid(font_size=8)  # type: ignore[call-arg]
         self.render()

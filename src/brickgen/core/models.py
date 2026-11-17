@@ -98,8 +98,14 @@ class BlockSettings(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    @field_validator("unit_size", "wall_thickness", "block_height",
-                     "pin_diameter", "pin_height", "tube_inner_diameter")
+    @field_validator(
+        "unit_size",
+        "wall_thickness",
+        "block_height",
+        "pin_diameter",
+        "pin_height",
+        "tube_inner_diameter",
+    )
     @classmethod
     def _validate_positive_finite(cls, value: float) -> float:
         '''Reject non-finite values (NaN/inf slip past ``gt=0``).'''
@@ -203,16 +209,16 @@ class BlockSettings(BaseModel):
             )
         if self.block_height <= self.wall_thickness:
             raise SettingsValidationError(
-                "block_height must exceed wall_thickness (top face keeps wall thickness)"
+                "block_height must exceed wall_thickness "
+                "(top face keeps wall thickness)"
             )
         if self.pins_enabled and self.pin_diameter >= self.unit_size:
-            raise SettingsValidationError(
-                "pin_diameter must be smaller than unit_size"
-            )
+            raise SettingsValidationError("pin_diameter must be smaller than unit_size")
         if self.has_tubes and not self.slope_active:
-            cavity_min = min(
-                self.outer_length_x, self.outer_length_y
-            ) - 2.0 * self.wall_thickness
+            cavity_min = (
+                min(self.outer_length_x, self.outer_length_y)
+                - 2.0 * self.wall_thickness
+            )
             if self.tube_outer_diameter >= cavity_min:
                 raise SettingsValidationError(
                     "tube_outer_diameter must fit inside the cavity"

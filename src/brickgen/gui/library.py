@@ -52,14 +52,21 @@ def render_thumbnail(mesh: pv.PolyData) -> QPixmap:
     Returns:
         Thumbnail pixmap (white background, iso camera view).
     '''
-    plotter = pv.Plotter(off_screen=True, window_size=THUMBNAIL_SIZE)
+    plotter = pv.Plotter(off_screen=True, window_size=list(THUMBNAIL_SIZE))
     try:
-        plotter.set_background("white")
-        plotter.add_mesh(mesh, color=BLOCK_COLOR, lighting="three lights")
+        plotter.set_background("white")  # type: ignore[arg-type]  # pyvista stub bug
+        # lighting="three lights" matches the preview shading (stub says bool).
+        plotter.add_mesh(
+            mesh,
+            color=BLOCK_COLOR,
+            lighting="three lights",  # type: ignore[arg-type]
+        )
         plotter.camera_position = "iso"
         img = plotter.screenshot(return_img=True)
     finally:
         plotter.close()
+    if img is None:  # return_img=True always returns an ndarray; defensive
+        raise RuntimeError("Off-screen screenshot returned no image")
     height, width = img.shape[0], img.shape[1]
     image = QImage(img.tobytes(), width, height, 3 * width, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(image)
@@ -116,9 +123,7 @@ class TemplateLibraryPanel(QWidget):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._cards_host = QWidget()
         self._cards_layout = QGridLayout(self._cards_host)
         self._cards_layout.setContentsMargins(0, 0, 0, 0)
@@ -187,9 +192,7 @@ class TemplateLibraryPanel(QWidget):
             button = QToolButton()
             button.setText(template.name)
             button.setIconSize(QSize(*THUMBNAIL_SIZE))
-            button.setToolButtonStyle(
-                Qt.ToolButtonStyle.ToolButtonTextUnderIcon
-            )
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
             button.setFixedSize(*CARD_SIZE)
             button.setToolTip(
                 f"{template.settings.describe()} | height "
@@ -216,6 +219,8 @@ class TemplateLibraryPanel(QWidget):
         '''Remove and dispose every widget currently in the card grid.'''
         while self._cards_layout.count():
             item = self._cards_layout.takeAt(0)
+            if item is None:
+                break
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
@@ -245,6 +250,9 @@ class TemplateLibraryPanel(QWidget):
 
         button = self._cards.get(name)
         if button is None:
+            return
+        if not isinstance(result, dict):
+            logger.warning("Thumbnail job for %s returned unexpected payload", name)
             return
         try:
             mesh = mesh_from_arrays(result)

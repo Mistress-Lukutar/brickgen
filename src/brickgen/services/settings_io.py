@@ -80,9 +80,7 @@ def load_settings(path: Path) -> BlockSettings:
     schema = payload.get(SETTINGS_SCHEMA_KEY)
     if isinstance(schema, dict):
         if schema.get("name") != SETTINGS_SCHEMA_NAME:
-            raise SettingsIOError(
-                f"{path} is not a {SETTINGS_SCHEMA_NAME} preset"
-            )
+            raise SettingsIOError(f"{path} is not a {SETTINGS_SCHEMA_NAME} preset")
         payload = {k: v for k, v in payload.items() if k != SETTINGS_SCHEMA_KEY}
     try:
         return BlockSettings.model_validate(payload)

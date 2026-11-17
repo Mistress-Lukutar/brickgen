@@ -8,12 +8,23 @@ Version: v0.9.5
 
 from __future__ import annotations
 
+from typing import cast
+
 import cadquery as cq
 
 from brickgen.core.models import BlockSettings
 
 # Small overshoot used when cutting through faces to avoid coincident boolean faces.
 CUT_OVERSHOOT = 1.0
+
+
+def _shape_of(wp: cq.Workplane) -> cq.Shape:
+    '''Typed view of a workplane's first object.
+
+    CadQuery's ``Workplane.val()`` declares a loose union (Vector | Location |
+    Shape | Sketch); every call site here holds a Shape, so narrow it once.
+    '''
+    return cast(cq.Shape, wp.val())
 
 
 def _as_single_solid(shape: cq.Shape) -> cq.Shape:
@@ -158,20 +169,20 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
 
     # Fuse all cells into one outer shape in a single boolean operation.
     if len(cells) == 1:
-        outer_shape = cells[0].val()
+        outer_shape = _shape_of(cells[0])
     else:
-        outer_shape = _fuse_all(cells[0].val(), [c.val() for c in cells[1:]])
+        outer_shape = _fuse_all(_shape_of(cells[0]), [_shape_of(c) for c in cells[1:]])
 
     # Cut all cavity boxes in one operation.
     if cavities:
-        outer_shape = outer_shape.cut(*(c.val() for c in cavities))
+        outer_shape = outer_shape.cut(*(_shape_of(c) for c in cavities))
 
     solid = cq.Workplane("XY").newObject([_as_single_solid(outer_shape)])
 
     # Fuse corner ribs in a single boolean operation.
     ribs = _figure_corner_ribs(settings)
     if ribs:
-        fused = _fuse_all(solid.val(), [rib.val() for rib in ribs])
+        fused = _fuse_all(_shape_of(solid), [_shape_of(rib) for rib in ribs])
         solid = cq.Workplane("XY").newObject([_as_single_solid(fused)])
 
     if settings.pins_enabled:
@@ -183,7 +194,7 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
         for ix, iy, side in settings.sloped_cells
     ]
     if cutters:
-        result = solid.val().cut(*(c.val() for c in cutters))
+        result = _shape_of(solid).cut(*(_shape_of(c) for c in cutters))
         solid = cq.Workplane("XY").newObject([_as_single_solid(result)])
     return solid
 
@@ -220,25 +231,25 @@ def _bottom_chamfer_cutter(
         points, plane, perp_center = (
             [(x0, 0), (x1, 0), (x1, height)],
             "XZ",
-            (0, (y0 + y1) / 2.0),
+            (0.0, (y0 + y1) / 2.0),
         )
     elif side == "-X":
         points, plane, perp_center = (
             [(x0, 0), (x1, 0), (x0, height)],
             "XZ",
-            (0, (y0 + y1) / 2.0),
+            (0.0, (y0 + y1) / 2.0),
         )
     elif side == "+Y":
         points, plane, perp_center = (
             [(y0, 0), (y1, 0), (y1, height)],
             "YZ",
-            ((x0 + x1) / 2.0, 0),
+            ((x0 + x1) / 2.0, 0.0),
         )
     else:  # "-Y"
         points, plane, perp_center = (
             [(y0, 0), (y1, 0), (y0, height)],
             "YZ",
-            ((x0 + x1) / 2.0, 0),
+            ((x0 + x1) / 2.0, 0.0),
         )
 
     prism = cq.Workplane(plane).polyline(points).close().extrude(unit / 2.0, both=True)
@@ -478,7 +489,7 @@ def _fuse_tubes(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
         tubes.append(tube)
     if not tubes:
         return shell
-    fused = _fuse_all(shell.val(), [tube.val() for tube in tubes])
+    fused = _fuse_all(_shape_of(shell), [_shape_of(tube) for tube in tubes])
     return cq.Workplane("XY").newObject([_as_single_solid(fused)])
 
 
@@ -509,5 +520,5 @@ def _fuse_pins(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
             studs.append(stud)
     if not studs:
         return shell
-    fused = _fuse_all(shell.val(), [stud.val() for stud in studs])
+    fused = _fuse_all(_shape_of(shell), [_shape_of(stud) for stud in studs])
     return cq.Workplane("XY").newObject([_as_single_solid(fused)])

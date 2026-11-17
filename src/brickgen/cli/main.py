@@ -60,14 +60,18 @@ def _parse_exclude(spec: str) -> list[list[int]]:
 
 @app.command()
 def generate(
-    cells_x: int = typer.Option(1, "--cells-x", "-x", min=1, max=64,
-                                help="Cells along X (length)."),
-    cells_y: int = typer.Option(1, "--cells-y", "-y", min=1, max=64,
-                                help="Cells along Y (width)."),
+    cells_x: int = typer.Option(
+        1, "--cells-x", "-x", min=1, max=64, help="Cells along X (length)."
+    ),
+    cells_y: int = typer.Option(
+        1, "--cells-y", "-y", min=1, max=64, help="Cells along Y (width)."
+    ),
     unit_size: float = typer.Option(4.0, "--unit-size", help="1x1 cell footprint, mm."),
     wall: float = typer.Option(0.8, "--wall", help="Wall thickness, mm."),
     height: float = typer.Option(3.0, "--height", help="Block height, mm."),
-    pin_diameter: float = typer.Option(2.6, "--pin-diameter", help="Stud diameter, mm."),
+    pin_diameter: float = typer.Option(
+        2.6, "--pin-diameter", help="Stud diameter, mm."
+    ),
     pin_height: float = typer.Option(2.0, "--pin-height", help="Stud height, mm."),
     no_pins: bool = typer.Option(False, "--no-pins", help="Omit top studs."),
     no_tubes: bool = typer.Option(False, "--no-tubes", help="Omit inner tubes."),
@@ -75,7 +79,10 @@ def generate(
         1.2, "--tube-bore", help="Inner tube bore diameter, mm."
     ),
     slope_rise: int = typer.Option(
-        0, "--slope-rise", min=0, max=16,
+        0,
+        "--slope-rise",
+        min=0,
+        max=16,
         help="Slope rise in unit heights (stud-less blocks only, 0 = off).",
     ),
     slope_side: str = typer.Option(
@@ -85,7 +92,8 @@ def generate(
         "", "--exclude", help="Cells to exclude, e.g. '0,1;2,1' (ix,iy from 0)."
     ),
     slope_cells: str = typer.Option(
-        "", "--slope-cells",
+        "",
+        "--slope-cells",
         help="Bottom-chamfered cells 'ix,iy,side;...', side +X/-X/+Y/-Y.",
     ),
     settings_file: Path | None = typer.Option(
@@ -98,7 +106,9 @@ def generate(
     The export format is derived from the output extension
     (step/stl/amf/3mf/svg/vrml/brep, case-insensitive).
     '''
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+    )
     try:
         if settings_file is not None:
             settings = load_settings(settings_file)

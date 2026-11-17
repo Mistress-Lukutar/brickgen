@@ -30,15 +30,18 @@ def _expected_volume(settings: BlockSettings) -> float:
     cavity_depth = settings.block_height - settings.wall_thickness
     shell = outer - cavity_x * cavity_y * cavity_depth
     pin = (
-        math.pi * (settings.pin_diameter / 2.0) ** 2 * settings.pin_height
-        if settings.pins_enabled
-        else 0.0
-    ) * settings.cells_x * settings.cells_y
+        (
+            math.pi * (settings.pin_diameter / 2.0) ** 2 * settings.pin_height
+            if settings.pins_enabled
+            else 0.0
+        )
+        * settings.cells_x
+        * settings.cells_y
+    )
     r_out = settings.tube_outer_diameter / 2.0
     r_in = settings.tube_inner_diameter / 2.0
     tubes = (
-        len(_tube_centers(settings))
-        * math.pi * (r_out**2 - r_in**2) * cavity_depth
+        len(_tube_centers(settings)) * math.pi * (r_out**2 - r_in**2) * cavity_depth
         if settings.has_tubes
         else 0.0
     )
@@ -131,9 +134,7 @@ def test_no_pins_variant(default_settings: BlockSettings) -> None:
     '''With studs disabled the height equals body height only.'''
     settings = default_settings.model_copy(update={"pins_enabled": False})
     solid = build_block(settings).val()
-    assert solid.BoundingBox().zlen == pytest.approx(
-        settings.block_height, abs=1e-4
-    )
+    assert solid.BoundingBox().zlen == pytest.approx(settings.block_height, abs=1e-4)
     assert solid.Volume() == pytest.approx(_expected_volume(settings), rel=1e-3)
 
 

@@ -43,8 +43,9 @@ def test_builtin_templates_are_valid(monkeypatch, tmp_path: Path) -> None:
 
 def test_save_and_reload_roundtrip(isolated_user_dir: Path) -> None:
     '''A saved user template appears in the list with its settings.'''
-    settings = BlockSettings(cells_x=3, cells_y=2, pins_enabled=False,
-                             slope_rise_units=1, slope_side="-X")
+    settings = BlockSettings(
+        cells_x=3, cells_y=2, pins_enabled=False, slope_rise_units=1, slope_side="-X"
+    )
     path = save_template("My Slope", settings)
     assert path.parent == isolated_user_dir
     templates = list_templates()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any, cast
 
 import cadquery as cq
 from cadquery.occ_impl.exporters import ExportTypes, export
@@ -47,6 +48,7 @@ def export_model(
         output_path: Destination file path (parent directories are created).
         file_format: One of ``SUPPORTED_FORMATS`` keys (STEP, STL, AMF, 3MF, ...).
         tolerance: Mesh tolerance in mm for tessellated formats (STL/AMF/3MF).
+        angular_tolerance: Angular mesh tolerance in rad (STL/AMF/3MF).
 
     Returns:
         The resolved path of the written file.
@@ -66,7 +68,9 @@ def export_model(
         export(
             model,
             str(output_path),
-            exportType=export_type,
+            # ExportTypes members carry the Literal string the exporter stub
+            # wants, but cadquery types the parameter too narrowly for dict[str, str].
+            exportType=cast(Any, export_type),
             tolerance=tolerance,
             angularTolerance=angular_tolerance,
         )

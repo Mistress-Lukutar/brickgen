@@ -35,8 +35,12 @@ def _sloped_volume(settings: BlockSettings) -> float:
 def slope_2x4() -> BlockSettings:
     '''2x4 slope block, raised edge on +X, rise of one unit height.'''
     return BlockSettings(
-        cells_x=2, cells_y=4, pins_enabled=False,
-        tubes_enabled=False, slope_rise_units=1, slope_side="+X",
+        cells_x=2,
+        cells_y=4,
+        pins_enabled=False,
+        tubes_enabled=False,
+        slope_rise_units=1,
+        slope_side="+X",
     )
 
 
@@ -65,8 +69,9 @@ def test_slope_volume_matches_analytic(slope_2x4: BlockSettings) -> None:
 
 def test_slope_sides_are_mirror_symmetric() -> None:
     '''+X and -X variants have equal volume (mirrored profiles).'''
-    plus = BlockSettings(cells_x=3, cells_y=2, pins_enabled=False,
-                         slope_rise_units=2, slope_side="+X")
+    plus = BlockSettings(
+        cells_x=3, cells_y=2, pins_enabled=False, slope_rise_units=2, slope_side="+X"
+    )
     minus = plus.model_copy(update={"slope_side": "-X"})
     v_plus = build_block(plus).val().Volume()
     v_minus = build_block(minus).val().Volume()
@@ -76,8 +81,9 @@ def test_slope_sides_are_mirror_symmetric() -> None:
 
 def test_slope_along_y() -> None:
     '''Y-direction slopes match the analytic volume as well.'''
-    settings = BlockSettings(cells_x=2, cells_y=3, pins_enabled=False,
-                             slope_rise_units=1, slope_side="+Y")
+    settings = BlockSettings(
+        cells_x=2, cells_y=3, pins_enabled=False, slope_rise_units=1, slope_side="+Y"
+    )
     solid = build_block(settings).val()
     assert solid.BoundingBox().zmax == pytest.approx(6.0, abs=1e-4)
     assert solid.Volume() == pytest.approx(_sloped_volume(settings), rel=1e-3)
@@ -104,18 +110,20 @@ def test_slope_cavity_is_centered(slope_2x4: BlockSettings) -> None:
     slope axis, producing rim walls of t/2 and 3t/2.
     '''
     t = slope_2x4.wall_thickness
-    solid = build_block(slope_2x4).val()
     slab = (
         Workplane("XY")
-        .box(slope_2x4.outer_length_x, slope_2x4.outer_length_y, 0.1,
-             centered=(True, True, False))
+        .box(
+            slope_2x4.outer_length_x,
+            slope_2x4.outer_length_y,
+            0.1,
+            centered=(True, True, False),
+        )
         .intersect(build_block(slope_2x4))
     )
     ring = slab.val().Volume()
-    rim_area = (
-        slope_2x4.outer_length_x * slope_2x4.outer_length_y
-        - (slope_2x4.outer_length_x - 2 * t) * (slope_2x4.outer_length_y - 2 * t)
-    )
+    rim_area = slope_2x4.outer_length_x * slope_2x4.outer_length_y - (
+        slope_2x4.outer_length_x - 2 * t
+    ) * (slope_2x4.outer_length_y - 2 * t)
     assert ring == pytest.approx(rim_area * 0.1, rel=1e-3)
 
 
@@ -126,8 +134,12 @@ def test_steep_slope_has_no_hole() -> None:
     sloped top face when rise exceeded the slope-axis length.
     '''
     settings = BlockSettings(
-        cells_x=2, cells_y=2, pins_enabled=False, tubes_enabled=False,
-        slope_rise_units=3, slope_side="+X",
+        cells_x=2,
+        cells_y=2,
+        pins_enabled=False,
+        tubes_enabled=False,
+        slope_rise_units=3,
+        slope_side="+X",
     )
     solid = build_block(settings).val()
     bb = solid.BoundingBox()
@@ -142,8 +154,12 @@ def test_top_face_thickness_is_uniform() -> None:
     Sampled at several positions along the slope axis via thin slab cuts.
     '''
     settings = BlockSettings(
-        cells_x=2, cells_y=2, pins_enabled=False, tubes_enabled=False,
-        slope_rise_units=2, slope_side="+X",
+        cells_x=2,
+        cells_y=2,
+        pins_enabled=False,
+        tubes_enabled=False,
+        slope_rise_units=2,
+        slope_side="+X",
     )
     t = settings.wall_thickness
     lx = settings.outer_length_x

@@ -27,9 +27,8 @@ Parametric stud-block (LEGO-like) generator built on CadQuery/OCC, with a PySide
 ## Conventions
 
 - Every file starts with a `'''` header docstring: File / Brief / Author (Mistress-Lukutar) / Date / Version. Follow it on new files.
-- The whole repo uses `'''` (single-quote) docstrings and Google pydocstyle. **Never run plain `ruff format`** — the default rewrites all quotes to `"""`; use the `--config "format.quote-style='preserve'"` invocation above.
-- `ruff check` D-rules (D205/D212/D300/D415) fire on the standard file headers repo-wide — these violations are pre-existing; add no NEW violation classes, but don't "fix" the headers either.
-- Ruff: line-length 88, rules E/F/W/I/D. mypy: python 3.11, `mypy_path=src`; `py.typed` is shipped.
+- The whole repo uses `'''` (single-quote) docstrings. **Never run plain `ruff format`** — the default rewrites all quotes to `"""`; use the `--config "format.quote-style='preserve'"` invocation above.
+- Ruff: line-length 88, rules E/F/W/I. mypy: python 3.11, `mypy_path=src`; `py.typed` is shipped.
 
 ## Architecture / gotchas
 

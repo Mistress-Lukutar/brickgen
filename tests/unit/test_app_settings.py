@@ -32,8 +32,9 @@ def isolated_settings(monkeypatch, tmp_path: Path) -> Path:
 
 def test_roundtrip(isolated_settings: Path) -> None:
     '''Saved preferences load back equal.'''
-    settings = AppSettings(preview_tolerance=0.05, export_tolerance=0.02,
-                           default_format="STL")
+    settings = AppSettings(
+        preview_tolerance=0.05, export_tolerance=0.02, default_format="STL"
+    )
     save_app_settings(settings)
     assert load_app_settings() == settings
 
@@ -73,9 +74,8 @@ def test_settings_path_uses_documents() -> None:
 
 def test_angular_tolerance_defaults_and_bounds() -> None:
     '''Angular tolerance persists and must be within (0, 1] rad.'''
-    settings = AppSettings(preview_angular_tolerance=0.05,
-                           export_angular_tolerance=0.2)
-    path = save_app_settings(settings)
+    settings = AppSettings(preview_angular_tolerance=0.05, export_angular_tolerance=0.2)
+    save_app_settings(settings)
     assert load_app_settings().preview_angular_tolerance == 0.05
     assert load_app_settings().export_angular_tolerance == 0.2
     with pytest.raises(ValueError):

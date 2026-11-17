@@ -35,6 +35,11 @@ class JobError:
     '''
 
     def __init__(self, message: str) -> None:
+        '''Store the child-process traceback text.
+
+        Args:
+            message: Full traceback text from the child process.
+        '''
         self.message = message
 
     @property
@@ -179,9 +184,11 @@ class JobQueue(QObject):
                 self._busy -= 1
             self.job_done.emit(job_id, JobError(f'Executor unavailable: {exc}'))
             return
-        future.add_done_callback(
-            lambda fut, job_id=job_id, key=key: self._on_done(job_id, key, fut)
-        )
+
+        def _on_job_done(fut: Future) -> None:
+            self._on_done(job_id, key, fut)
+
+        future.add_done_callback(_on_job_done)
 
     def _on_done(self, job_id: int, key: str | None, future: Future) -> None:
         '''Completion callback (executor management thread).

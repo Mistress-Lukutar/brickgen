@@ -77,9 +77,7 @@ def test_rejects_unknown_fields() -> None:
 def test_rejects_tube_that_does_not_fit_cavity() -> None:
     '''A tube wider than the cavity must fail validation.'''
     with pytest.raises(SettingsValidationError):
-        validate_settings(
-            {"cells_x": 2, "cells_y": 2, "tube_inner_diameter": 5.2}
-        )
+        validate_settings({"cells_x": 2, "cells_y": 2, "tube_inner_diameter": 5.2})
 
 
 def test_has_tubes_requires_2x2() -> None:

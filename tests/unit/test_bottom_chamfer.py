@@ -148,7 +148,8 @@ def test_internal_wall_between_cavity_and_wedge_void() -> None:
     '''Regression (user report): the bottom opening must not extend into
     neighboring cells. The normal cell's cavity is inset by wall thickness
     on sides facing a chamfered cell, creating an internal wall between
-    the cavity and the void under the wedge.'''
+    the cavity and the void under the wedge.
+    '''
     settings = BlockSettings(
         cells_x=2,
         cells_y=2,

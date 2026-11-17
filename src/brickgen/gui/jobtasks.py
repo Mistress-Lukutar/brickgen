@@ -16,6 +16,9 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
+
+import cadquery as cq
 
 from brickgen.gui.preview import mesh_to_arrays
 
@@ -60,7 +63,7 @@ def run_task(task: str, payload: dict) -> dict:
 
 # LRU cache of models built in this process, keyed by caller-supplied cache_key.
 # Maximum 3 entries; used to avoid rebuilding the same model for export.
-_MODEL_CACHE: OrderedDict[str, object] = OrderedDict()
+_MODEL_CACHE: OrderedDict[str, cq.Workplane] = OrderedDict()
 _MAX_CACHE_SIZE = 3
 
 
@@ -152,7 +155,9 @@ def _handle_build_preview(payload: dict) -> dict:
     ang = payload['angular']
     cache_key = payload['cache_key']
 
-    mesh = solid_to_mesh(model.val(), tol, ang, make_face_classifier(settings))
+    mesh = solid_to_mesh(
+        cast(cq.Shape, model.val()), tol, ang, make_face_classifier(settings)
+    )
     arrays = mesh_to_arrays(mesh)
 
     # Cache model under cache_key (LRU eviction).
@@ -194,7 +199,7 @@ def _handle_thumbnail(payload: dict) -> dict:
     model = build_block(settings)
 
     mesh = solid_to_mesh(
-        model.val(),
+        cast(cq.Shape, model.val()),
         payload.get('tolerance', 0.15),
         payload.get('angular', 0.1),
         make_face_classifier(settings),

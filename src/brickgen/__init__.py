@@ -8,8 +8,8 @@ Version: v0.4.0
 
 from __future__ import annotations
 
-from brickgen.core.models import BlockSettings
 from brickgen.core.builder import build_block
+from brickgen.core.models import BlockSettings
 
 __all__ = ["BlockSettings", "build_block", "__version__"]
 

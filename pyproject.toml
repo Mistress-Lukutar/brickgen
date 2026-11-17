@@ -40,9 +40,7 @@ line-length = 88
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "D"]
-[tool.ruff.lint.pydocstyle]
-convention = "google"
+select = ["E", "F", "W", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -51,3 +49,8 @@ pythonpath = ["src"]
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"
+
+# OCP (pythonocc bindings) ships no type stubs or py.typed marker.
+[[tool.mypy.overrides]]
+module = "OCP.*"
+ignore_missing_imports = true

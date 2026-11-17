@@ -9,19 +9,20 @@ Version: v0.9.2
 from __future__ import annotations
 
 import numpy as np
-import pyvista as pv
 import pytest
+import pyvista as pv
 
 from brickgen.core.builder import build_block
 from brickgen.core.models import BlockSettings
 
 # vtk 9.6 numpy_support sets .shape on arrays, deprecated in numpy 2.5; the
-# warning fires on every cell_data read and is a VTK-internal issue.
+# warning fires on every cell_data read and is a VTK-internal issue, so the
+# filter must be active before preview (and thus VTK) is imported.
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Setting the shape on a NumPy array:DeprecationWarning"
 )
 
-from brickgen.gui.preview import (
+from brickgen.gui.preview import (  # noqa: E402  # see filterwarnings note above
     DISPLAY_MODES,
     MODE_SOLID,
     MODE_SOLID_FEATURE_EDGES,
@@ -64,7 +65,7 @@ def test_mesh_has_no_duplicate_points(mesh_2x4) -> None:
 
 
 def test_display_modes_list() -> None:
-    '''Four display modes: solid, solid + feature edges, solid + wireframe, wireframe.'''
+    '''Four display modes: solid, +feature edges, +wireframe, wireframe-only.'''
     assert DISPLAY_MODES == [
         MODE_SOLID,
         MODE_SOLID_FEATURE_EDGES,
@@ -139,7 +140,7 @@ def test_stud_triangles_above_top_plane(classified_4x2_mesh) -> None:
 
 
 def test_tube_triangles_near_tube_centers(classified_4x2_mesh) -> None:
-    '''Every tube-classified triangle centroid is within the tube outer diameter of a tube center.'''
+    '''Tube-classified centroids sit within one tube outer diameter of a center.'''
     mesh, settings = classified_4x2_mesh
     parts = np.asarray(mesh.cell_data["part"])
     centroids = _get_centroids(mesh)
@@ -189,7 +190,7 @@ def test_classifier_1x1_no_tubes(classified_1x1_mesh) -> None:
 
 
 def test_classifier_slope_block(classified_slope_mesh) -> None:
-    '''A slope block (pins_enabled=False, slope_rise_units=1) has no studs/tubes but some body.'''
+    '''Slope block (no pins, rise=1): no studs/tubes, but some body parts.'''
     mesh, _ = classified_slope_mesh
     parts = np.asarray(mesh.cell_data["part"])
     counts = np.bincount(parts)
@@ -199,7 +200,7 @@ def test_classifier_slope_block(classified_slope_mesh) -> None:
 
 
 def test_semantic_edges_deterministic(classified_4x2_mesh) -> None:
-    '''semantic_edges returns identical cell count on repeated calls and zero for unclassified meshes.'''
+    '''Repeated semantic_edges calls agree; unclassified meshes yield no edges.'''
     mesh, _ = classified_4x2_mesh
     edges1 = semantic_edges(mesh)
     edges2 = semantic_edges(mesh)

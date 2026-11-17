@@ -89,7 +89,8 @@ def resolve_export_target(path: str, selected_filter: str) -> tuple[str, str]:
 
 class MainWindow(QMainWindow):
     '''Parameters on the left, VTK preview in the middle, template library on
-    the right. The model regenerates automatically after any change.'''
+    the right. The model regenerates automatically after any change.
+    '''
 
     def __init__(self) -> None:
         '''Build the layout and render the default 1x1 block.'''
@@ -375,7 +376,7 @@ class MainWindow(QMainWindow):
         Raises:
             SettingsValidationError: If values fail geometry validation.
         '''
-        values: dict[str, int | float | bool | str | list] = {
+        values: dict[str, object] = {
             "cells_x": self._cells_x.value(),
             "cells_y": self._cells_y.value(),
             "pins_enabled": self._pins.isChecked(),
@@ -484,7 +485,11 @@ class MainWindow(QMainWindow):
                 self._set_status("Export failed.", error=True)
                 QMessageBox.critical(self, "Export failed", str(result.exc))
                 return
-            written = Path(result)
+            if not isinstance(result, dict) or 'written' not in result:
+                logger.error("Export job %d returned unexpected payload", job_id)
+                self._set_status("Export failed.", error=True)
+                return
+            written = Path(str(result['written']))
             self._set_status(f"Exported: {written.name}")
             return
 
@@ -509,6 +514,9 @@ class MainWindow(QMainWindow):
             self._set_status(f"Generation failed: {result.exc}", error=True)
             return
 
+        if not isinstance(result, dict):
+            logger.error("Generation job %d returned unexpected payload", job_id)
+            return
         mesh = mesh_from_arrays(result)
         self._settings = settings
         self._applied_cache_key = result.get('cache_key', cache_key)

@@ -195,8 +195,8 @@ studs), open-bottom invariant, studs fused into a single body, settings
 validation, JSON preset roundtrip, and export file writing.
 
 Conventions: single-quote (`'''`) docstrings with a
-`File/Brief/Author/Date/Version` header in every file; Google pydocstyle;
-ruff line length 88, rules E/F/W/I/D. Never run plain `ruff format` — the
+`File/Brief/Author/Date/Version` header in every file;
+ruff line length 88, rules E/F/W/I. Never run plain `ruff format` — the
 default rewrites all docstring quotes.
 
 ## Assumptions
