@@ -1,0 +1,17 @@
+{
+  "schema": {
+    "name": "brickgen-settings",
+    "version": 2
+  },
+  "template_name": "Slope brick 1x2 (+Y)",
+  "cells_x": 1,
+  "cells_y": 2,
+  "sloped_cells": [
+    [
+      0,
+      1,
+      "+Y",
+      1
+    ]
+  ]
+}

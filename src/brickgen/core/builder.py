@@ -2,8 +2,8 @@
 File:   builder.py
 Brief:  CadQuery geometry builder for parametric stud blocks.
 Author: Mistress-Lukutar
-Date:   2026-11-16
-Version: v0.9.5
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -64,9 +64,9 @@ def build_block(settings: BlockSettings) -> cq.Workplane:
     X/Y - footprint plane, Z - up, block bottom rim sits at Z=0,
     top face at Z=``block_height``, studs extend up to Z=``total_height``.
 
-    Stud-less blocks with ``slope_rise_units > 0`` get a sloped top: the
-    ``slope_side`` edge rises by ``slope_rise`` and the top face slopes down
-    to the opposite edge (tubes and studs do not apply in that variant).
+    Cells with per-cell features (sloped tops, bottom chamfers, exclusions)
+    switch to the figure variant; sloped cells become solid wedges whose
+    ``side`` edge rises by ``rise x block_height``.
 
     Args:
         settings: Validated parametric block description.
@@ -74,8 +74,6 @@ def build_block(settings: BlockSettings) -> cq.Workplane:
     Returns:
         A CadQuery workplane holding a single fused solid.
     '''
-    if settings.slope_active:
-        return _build_sloped_block(settings)
     if not settings.is_rectangular:
         return _build_figure_block(settings)
     return _build_flat_block(settings)
@@ -103,18 +101,21 @@ def _included_cells(settings: BlockSettings) -> list[tuple[int, int]]:
 
 
 def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
-    '''Build a block with excluded and/or bottom-chamfered cells.
+    '''Build a block with excluded, bottom-chamfered and/or sloped cells.
 
     The figure variant follows the reference parts: the cavity is one piece
     shaped like the included region (perimeter walls step around excluded
     cells, no internal partition walls), and every concave corner of the
     region carries an inward quarter-round rib instead of a tube. Tubes do
-    not apply in this variant; studs remain on top of every material cell.
+    not apply in this variant; studs sit only on cells whose effective top
+    is ``stud`` (see :meth:`BlockSettings.cell_top`).
 
     Chamfered cells are solid wedges: their cavity box is omitted and a
     triangular prism is cut away below the sloped underside plane, which
     rises from the full height at the inner face to the top edge at the
-    outward face.
+    outward face. Sloped cells are solid top wedges: a trapezoid prism over
+    the cell footprint, no cavity, no stud; they may be combined with a
+    bottom chamfer.
 
     Args:
         settings: Validated parametric block description.
@@ -129,18 +130,27 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
     half_y = settings.outer_length_y / 2.0
 
     material = set(_included_cells(settings))
-    chamfered = {(ix, iy) for ix, iy, _ in settings.sloped_cells}
-    # For cavity-side decisions a chamfered neighbor counts as boundary:
-    # the wedge cell has no cavity of its own, so a wall strip is required
-    # between the normal cell's cavity and the void under the wedge,
-    # otherwise the bottom opening extends under the wedge (too wide).
-    cavity_neighbors = material - chamfered
+    chamfered = {(ix, iy) for ix, iy, _ in settings.chamfered_cells}
+    sloped = settings.slope_cell_set()
+    slope_by_cell = {
+        (int(item[0]), int(item[1])): (str(item[2]), int(item[3]))
+        for item in settings.sloped_cells
+    }
+    # For cavity-side decisions a chamfered or sloped neighbor counts as
+    # boundary: those cells have no cavity of their own, so a wall strip is
+    # required between the normal cell's cavity and their solid body,
+    # otherwise the bottom opening would extend under them (too wide).
+    cavity_neighbors = material - chamfered - sloped
 
     cells: list[cq.Workplane] = []
     cavities: list[cq.Workplane] = []
     for ix, iy in sorted(material):
         x0 = ix * unit - half_x
         y0 = iy * unit - half_y
+        if (ix, iy) in sloped:
+            side, rise_units = slope_by_cell[(ix, iy)]
+            cells.append(_slope_cell_solid(settings, ix, iy, side, rise_units))
+            continue  # solid wedge: no cavity opening in sloped cells
         cell = cq.Workplane("XY", origin=(x0 + unit / 2.0, y0 + unit / 2.0, 0)).box(
             unit, unit, height, centered=(True, True, False)
         )
@@ -148,9 +158,9 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
         if (ix, iy) in chamfered:
             continue  # solid wedge: no cavity opening in chamfered cells
         # Cavity box: inset t only on sides facing the region boundary or a
-        # chamfered cell; sides shared with a normal material neighbor stay
-        # open so the cavities of adjacent cells fuse into a single
-        # contour-shaped cavity.
+        # solid (chamfered/sloped) cell; sides shared with a normal material
+        # neighbor stay open so the cavities of adjacent cells fuse into a
+        # single contour-shaped cavity.
         inset_x0 = t if (ix - 1, iy) not in cavity_neighbors else 0.0
         inset_x1 = t if (ix + 1, iy) not in cavity_neighbors else 0.0
         inset_y0 = t if (ix, iy - 1) not in cavity_neighbors else 0.0
@@ -185,13 +195,12 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
         fused = _fuse_all(_shape_of(solid), [_shape_of(rib) for rib in ribs])
         solid = cq.Workplane("XY").newObject([_as_single_solid(fused)])
 
-    if settings.pins_enabled:
-        solid = _fuse_pins(solid, settings)
+    solid = _fuse_pins(solid, settings)
 
     # Cut all chamfer cutters in one operation.
     cutters = [
         _bottom_chamfer_cutter(settings, ix, iy, side)
-        for ix, iy, side in settings.sloped_cells
+        for ix, iy, side in settings.chamfered_cells
     ]
     if cutters:
         result = _shape_of(solid).cut(*(_shape_of(c) for c in cutters))
@@ -256,14 +265,73 @@ def _bottom_chamfer_cutter(
     return prism.translate((perp_center[0], perp_center[1], 0))
 
 
+def _slope_cell_solid(
+    settings: BlockSettings, ix: int, iy: int, side: str, rise_units: int
+) -> cq.Workplane:
+    '''Trapezoid-prism cell solid with one raised edge and a sloped top.
+
+    The outer profile is a trapezoid in the plane of the slope axis: heights
+    ``block_height`` on the low side and ``block_height + rise`` on the
+    raised ``side`` edge. The cell is solid (no cavity, no stud).
+
+    Args:
+        settings: Validated parametric block description.
+        ix: Cell index along X.
+        iy: Cell index along Y.
+        side: Edge that rises (``+X``/``-X``/``+Y``/``-Y``).
+        rise_units: Rise of that edge in unit block heights (N x block_height).
+
+    Returns:
+        The slope cell solid, spanning the cell footprint exactly.
+    '''
+    unit = settings.unit_size
+    height = settings.block_height
+    top_high = height + rise_units * height
+    half_x = settings.outer_length_x / 2.0
+    half_y = settings.outer_length_y / 2.0
+    x0 = ix * unit - half_x
+    x1 = x0 + unit
+    y0 = iy * unit - half_y
+    y1 = y0 + unit
+
+    if side == "+X":
+        points, plane, perp_center = (
+            [(x0, 0), (x1, 0), (x1, top_high), (x0, height)],
+            "XZ",
+            (0.0, (y0 + y1) / 2.0),
+        )
+    elif side == "-X":
+        points, plane, perp_center = (
+            [(x0, 0), (x1, 0), (x1, height), (x0, top_high)],
+            "XZ",
+            (0.0, (y0 + y1) / 2.0),
+        )
+    elif side == "+Y":
+        points, plane, perp_center = (
+            [(y0, 0), (y1, 0), (y1, top_high), (y0, height)],
+            "YZ",
+            ((x0 + x1) / 2.0, 0.0),
+        )
+    else:  # "-Y"
+        points, plane, perp_center = (
+            [(y0, 0), (y1, 0), (y1, height), (y0, top_high)],
+            "YZ",
+            ((x0 + x1) / 2.0, 0.0),
+        )
+
+    prism = cq.Workplane(plane).polyline(points).close().extrude(unit / 2.0, both=True)
+    return prism.translate((perp_center[0], perp_center[1], 0))
+
+
 def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
     '''Quarter-round inward ribs at every concave corner of the figure.
 
     A concave corner is a lattice vertex where exactly 3 of the 4 adjacent
     cells have cavities (the missing cell creates the inner angle). Chamfered
-    cells have no cavity and therefore do not contribute to such corners. The
-    rib fills that corner with a quarter-round fillet (instead of a tube),
-    spans the full cavity height and overshoots into the top face.
+    and sloped cells are solid (no cavity) and therefore do not contribute to
+    such corners. The rib fills that corner with a quarter-round fillet
+    (instead of a tube), spans the full cavity height and overshoots into the
+    top face.
 
     Args:
         settings: Validated parametric block description.
@@ -277,8 +345,8 @@ def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
     half_y = settings.outer_length_y / 2.0
     radius = min(2.0 * t, unit - 2.0 * t)
     included = set(_included_cells(settings))
-    chamfered = {(ix, iy) for ix, iy, _ in settings.sloped_cells}
-    cavity_cells = included - chamfered
+    chamfered = {(ix, iy) for ix, iy, _ in settings.chamfered_cells}
+    cavity_cells = included - chamfered - settings.slope_cell_set()
 
     ribs: list[cq.Workplane] = []
     for i in range(1, settings.cells_x):
@@ -316,6 +384,9 @@ def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
 def _build_flat_block(settings: BlockSettings) -> cq.Workplane:
     '''Build the standard flat-topped block (studs and/or tubes).
 
+    Studs follow the per-cell top resolution: cells with a sloped or flat
+    top get none, explicit ``stud_cells`` get one even on stud-less blocks.
+
     Args:
         settings: Validated parametric block description.
 
@@ -340,103 +411,11 @@ def _build_flat_block(settings: BlockSettings) -> cq.Workplane:
         .translate((0, 0, -CUT_OVERSHOOT))
     )
 
-    if settings.pins_enabled:
-        outer = _fuse_pins(outer, settings)
+    outer = _fuse_pins(outer, settings)
     if settings.has_tubes:
         outer = _fuse_tubes(outer, settings)
 
     return outer
-
-
-def _build_sloped_block(settings: BlockSettings) -> cq.Workplane:
-    '''Build the stud-less block with one raised edge and a sloped top face.
-
-    The outer profile is a trapezoid in the plane of the slope axis: heights
-    ``block_height`` on the low side and ``block_height + slope_rise`` on the
-    raised side. The cavity mirrors that profile inset by the wall thickness,
-    leaving a sloped top face of the wall thickness and an open bottom.
-
-    Args:
-        settings: Validated parametric block description.
-
-    Returns:
-        A CadQuery workplane holding a single fused solid.
-    '''
-    t = settings.wall_thickness
-    length_x = settings.outer_length_x
-    length_y = settings.outer_length_y
-    height = settings.block_height
-    top_high = height + settings.slope_rise
-
-    along_x = settings.slope_side in ("+X", "-X")
-    profile_len = length_x if along_x else length_y
-    extrude_len = length_y if along_x else length_x
-    high_first = settings.slope_side in ("-X", "-Y")
-
-    # Outer trapezoid: (0,0) -> (L,0) -> (L,top_a) -> (0,top_b).
-    top_a = height if high_first else top_high
-    top_b = top_high if high_first else height
-    outer = _extrude_profile(
-        [(0.0, 0.0), (profile_len, 0.0), (profile_len, top_a), (0.0, top_b)],
-        extrude_len,
-        along_x,
-    )
-
-    # Cavity: XY-inset by t on all sides; ceiling strictly parallel to the
-    # sloped outer top (sampled from the outer top line at the inset ends),
-    # so the top face keeps a uniform vertical thickness t for any rise.
-    # Pushed below the rim so the bottom stays open.
-    def _top_at(pos: float) -> float:
-        '''Outer top-plane height along the slope axis at ``pos``.'''
-        fraction = pos / profile_len
-        return top_b + (top_a - top_b) * fraction
-
-    cavity = _extrude_profile(
-        [
-            (t, -CUT_OVERSHOOT),
-            (profile_len - t, -CUT_OVERSHOOT),
-            (profile_len - t, _top_at(profile_len - t) - t),
-            (t, _top_at(t) - t),
-        ],
-        extrude_len - 2.0 * t,
-        along_x,
-    )
-    outer = outer.cut(cavity)
-    return outer
-
-
-def _extrude_profile(
-    points: list[tuple[float, float]],
-    extrude_len: float,
-    along_x: bool,
-) -> cq.Workplane:
-    '''Extrude an XZ (or YZ) polygon symmetrically across the other axis.
-
-    The polygon is re-centered on the profile axis using the midpoint of its
-    own extent (min..max), so profiles that do not start at zero (e.g. the
-    wall-inset cavity) stay centered in the block.
-
-    Args:
-        points: Polygon vertices in (axis, height) local coordinates, where
-            ``axis`` is X when ``along_x`` else Y.
-        extrude_len: Total extrusion length across the perpendicular axis.
-        along_x: True to sketch in the XZ plane (extrude along Y).
-
-    Returns:
-        The extruded solid, centered in both the profile axis and the
-        perpendicular axis.
-    '''
-    plane = "XZ" if along_x else "YZ"
-    solid = (
-        cq.Workplane(plane)
-        .polyline(points)
-        .close()
-        .extrude(extrude_len / 2.0, both=True)
-    )
-    axis_values = [p[0] for p in points]
-    center = (min(axis_values) + max(axis_values)) / 2.0
-    offset = (-center, 0.0, 0.0) if along_x else (0.0, -center, 0.0)
-    return solid.translate(offset)
 
 
 def _tube_centers(settings: BlockSettings) -> list[tuple[float, float]]:
@@ -494,7 +473,11 @@ def _fuse_tubes(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
 
 
 def _fuse_pins(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
-    '''Fuse one cylindrical stud per 1x1 cell onto the shell top face.
+    '''Fuse one cylindrical stud onto every cell whose top is ``stud``.
+
+    The per-cell resolution comes from :meth:`BlockSettings.stud_cells_all`:
+    sloped and flat cells get none, explicit ``stud_cells`` get one even on
+    stud-less blocks, plain cells follow ``pins_enabled``.
 
     Args:
         shell: Hollow shell to attach studs to.
@@ -504,20 +487,16 @@ def _fuse_pins(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
         The shell with all studs fused into a single solid.
     '''
     radius = settings.pin_diameter / 2.0
-    excluded = {(ix, iy) for ix, iy in settings.excluded_cells}
     studs: list[cq.Workplane] = []
-    for ix in range(settings.cells_x):
-        for iy in range(settings.cells_y):
-            if (ix, iy) in excluded:
-                continue  # excluded cells have no material to carry a stud
-            cx = (ix + 0.5) * settings.unit_size - settings.outer_length_x / 2.0
-            cy = (iy + 0.5) * settings.unit_size - settings.outer_length_y / 2.0
-            stud = (
-                cq.Workplane("XY", origin=(cx, cy, settings.block_height))
-                .circle(radius)
-                .extrude(settings.pin_height)
-            )
-            studs.append(stud)
+    for ix, iy in sorted(settings.stud_cells_all()):
+        cx = (ix + 0.5) * settings.unit_size - settings.outer_length_x / 2.0
+        cy = (iy + 0.5) * settings.unit_size - settings.outer_length_y / 2.0
+        stud = (
+            cq.Workplane("XY", origin=(cx, cy, settings.block_height))
+            .circle(radius)
+            .extrude(settings.pin_height)
+        )
+        studs.append(stud)
     if not studs:
         return shell
     fused = _fuse_all(_shape_of(shell), [_shape_of(stud) for stud in studs])

@@ -2,8 +2,8 @@
 File:   main.py
 Brief:  Typer CLI entry point for headless block generation and export.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.6.0
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -28,34 +28,59 @@ app = typer.Typer(
 logger = logging.getLogger(__name__)
 
 
-def _parse_exclude(spec: str) -> list[list[int]]:
-    '''Parse an ``--exclude`` spec like ``"0,1;2,1"`` into cell pairs.
+def _parse_cell_list(spec: str, arity: int, flag: str) -> list[list]:
+    '''Parse a cell list spec like ``"0,1;2,1"`` into fixed-arity entries.
 
     Args:
-        spec: Comma/semicolon-separated ``ix,iy`` pairs; blanks are skipped.
+        spec: Comma/semicolon-separated ``ix,iy[,side[,rise]]`` entries.
+        arity: Expected number of comma-separated fields per entry.
+        flag: Flag name used in error messages.
 
     Returns:
-        List of [ix, iy] integer pairs (empty when spec is blank).
+        List of parsed entries (ints, upper-cased side strings; empty when
+        the spec is blank).
 
     Raises:
-        typer.BadParameter: If a pair is malformed.
+        typer.BadParameter: If an entry is malformed.
     '''
-    cells: list[list[int]] = []
-    for pair in spec.replace(":", ",").split(";"):
-        parts = [p.strip() for p in pair.split(",") if p.strip()]
-        if not parts:
+    shapes = {
+        2: "ix,iy",
+        3: "ix,iy,side",
+        4: "ix,iy,side,rise",
+    }
+    entries: list[list] = []
+    for part in spec.replace(":", ",").split(";"):
+        fields = [p.strip() for p in part.split(",") if p.strip()]
+        if not fields:
             continue
-        if len(parts) != 2:
+        if len(fields) != arity:
             raise typer.BadParameter(
-                f"Invalid --exclude item '{pair.strip()}', expected 'ix,iy'"
+                f"Invalid --{flag} item '{part.strip()}', "
+                f"expected '{shapes.get(arity, 'ix,iy')}'"
             )
         try:
-            cells.append([int(parts[0]), int(parts[1])])
+            values: list[int | str] = [int(field) for field in fields[:2]]
         except ValueError as exc:
             raise typer.BadParameter(
-                f"Invalid --exclude item '{pair.strip()}', expected integers"
+                f"Invalid --{flag} item '{part.strip()}': ix/iy must be integers"
             ) from exc
-    return cells
+        if arity >= 3:
+            side = fields[2].upper()
+            if side not in SLOPE_SIDES:
+                raise typer.BadParameter(
+                    f"Invalid --{flag} side '{fields[2]}', "
+                    f"expected one of {'/'.join(SLOPE_SIDES)}"
+                )
+            values.append(side)
+        if arity == 4:
+            try:
+                values.append(int(fields[3]))
+            except ValueError as exc:
+                raise typer.BadParameter(
+                    f"Invalid --{flag} item '{part.strip()}': rise must be an integer"
+                ) from exc
+        entries.append(values)
+    return entries
 
 
 @app.command()
@@ -73,28 +98,35 @@ def generate(
         2.6, "--pin-diameter", help="Stud diameter, mm."
     ),
     pin_height: float = typer.Option(2.0, "--pin-height", help="Stud height, mm."),
-    no_pins: bool = typer.Option(False, "--no-pins", help="Omit top studs."),
+    no_pins: bool = typer.Option(
+        False,
+        "--no-pins",
+        help="Omit top studs on plain cells (explicit --stud-cells still apply).",
+    ),
     no_tubes: bool = typer.Option(False, "--no-tubes", help="Omit inner tubes."),
     tube_inner_diameter: float = typer.Option(
         1.2, "--tube-bore", help="Inner tube bore diameter, mm."
     ),
-    slope_rise: int = typer.Option(
-        0,
-        "--slope-rise",
-        min=0,
-        max=16,
-        help="Slope rise in unit heights (stud-less blocks only, 0 = off).",
-    ),
-    slope_side: str = typer.Option(
-        "+X", "--slope-side", help=f"Raised slope edge: {'/'.join(SLOPE_SIDES)}."
-    ),
     exclude: str = typer.Option(
-        "", "--exclude", help="Cells to exclude, e.g. '0,1;2,1' (ix,iy from 0)."
+        "", "--exclude", help="Cells to remove, e.g. '0,1;2,1' (ix,iy from 0)."
+    ),
+    flat_cells: str = typer.Option(
+        "", "--flat-cells", help="Explicit stud-less plain cells 'ix,iy;...'."
+    ),
+    stud_cells: str = typer.Option(
+        "", "--stud-cells", help="Explicit stud cells 'ix,iy;...' (with --no-pins)."
     ),
     slope_cells: str = typer.Option(
         "",
         "--slope-cells",
-        help="Bottom-chamfered cells 'ix,iy,side;...', side +X/-X/+Y/-Y.",
+        help="Top-slope wedge cells 'ix,iy,side,rise;...', side "
+        f"{'/'.join(SLOPE_SIDES)}, rise in unit heights.",
+    ),
+    chamfer_cells: str = typer.Option(
+        "",
+        "--chamfer-cells",
+        help="Bottom-chamfered cells 'ix,iy,side;...', side "
+        f"{'/'.join(SLOPE_SIDES)}.",
     ),
     settings_file: Path | None = typer.Option(
         None, "--settings", "-s", help="Load parameters from a JSON preset first."
@@ -126,10 +158,11 @@ def generate(
             "pins_enabled": not no_pins,
             "tubes_enabled": not no_tubes,
             "tube_inner_diameter": tube_inner_diameter,
-            "slope_rise_units": slope_rise,
-            "slope_side": slope_side,
-            "excluded_cells": _parse_exclude(exclude),
-            "sloped_cells": _parse_slope_cells(slope_cells),
+            "excluded_cells": _parse_cell_list(exclude, 2, "exclude"),
+            "flat_cells": _parse_cell_list(flat_cells, 2, "flat-cells"),
+            "stud_cells": _parse_cell_list(stud_cells, 2, "stud-cells"),
+            "sloped_cells": _parse_cell_list(slope_cells, 4, "slope-cells"),
+            "chamfered_cells": _parse_cell_list(chamfer_cells, 3, "chamfer-cells"),
         }
         settings = settings.model_copy(update=overrides)
         settings = validate_settings(settings.model_dump())
@@ -142,31 +175,6 @@ def generate(
         f"Generated {settings.describe()} block -> {written}",
         fg=typer.colors.GREEN,
     )
-
-
-def _parse_slope_cells(spec: str) -> list[list]:
-    '''Parse a ``--slope-cells`` spec like ``"1,0,+X;0,1,+Y"`` into triplets.
-
-    Args:
-        spec: Semicolon-separated ``ix,iy,side`` triplets.
-
-    Returns:
-        List of [ix, iy, side] triplets (empty when spec is blank).
-
-    Raises:
-        typer.BadParameter: If a triplet is malformed.
-    '''
-    cells: list[list] = []
-    for part in spec.split(";"):
-        parts = [p.strip() for p in part.split(",") if p.strip()]
-        if not parts:
-            continue
-        if len(parts) != 3:
-            raise typer.BadParameter(
-                f"Invalid --slope-cells item '{part.strip()}', expected 'ix,iy,side'"
-            )
-        cells.append([int(parts[0]), int(parts[1]), parts[2].upper()])
-    return cells
 
 
 @app.command()

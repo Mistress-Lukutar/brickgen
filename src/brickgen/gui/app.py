@@ -2,8 +2,8 @@
 File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
-Date:   2026-11-16
-Version: v0.12.0
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -36,8 +36,13 @@ from PySide6.QtWidgets import (
 )
 
 from brickgen.core.exceptions import BrickGenError
-from brickgen.core.models import SLOPE_SIDES, BlockSettings, validate_settings
-from brickgen.gui.grid_editor import CellGridEditor
+from brickgen.core.models import (
+    MAX_SLOPE_RISE,
+    SLOPE_SIDES,
+    BlockSettings,
+    validate_settings,
+)
+from brickgen.gui.grid_editor import CellGridEditor, CellState
 from brickgen.gui.jobs import SKIPPED, JobError, JobQueue
 from brickgen.gui.library import TemplateLibraryPanel
 from brickgen.gui.preferences import PreferencesDialog
@@ -148,7 +153,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         layout.addWidget(self._build_size_group())
         layout.addWidget(self._build_layout_group())
-        layout.addWidget(self._build_slope_group())
+        layout.addWidget(self._build_cell_group())
         layout.addWidget(self._build_display_group())
         layout.addWidget(self._build_actions_group())
         layout.addStretch(1)
@@ -199,7 +204,11 @@ class MainWindow(QMainWindow):
             self._floats[field] = spin
             form.addRow(label, spin)
 
-        self._pins = QCheckBox("Studs on top")
+        self._pins = QCheckBox("Studs on plain cells")
+        self._pins.setToolTip(
+            "Default top for cells without an explicit per-cell assignment.\n"
+            "Individual cells are edited in the layout below (click a cell)."
+        )
         self._pins.toggled.connect(self._on_pins_toggled)
         form.addRow(self._pins)
 
@@ -215,10 +224,11 @@ class MainWindow(QMainWindow):
 
     def _build_layout_group(self) -> QGroupBox:
         '''Create the top-view cell grid editor group.'''
-        group = QGroupBox("Layout (top view: click = exclude / chamfer)")
+        group = QGroupBox("Layout (top view: click selects a cell)")
         layout = QVBoxLayout(group)
         self._cell_grid = CellGridEditor()
         self._cell_grid.changed.connect(self._schedule_rebuild)
+        self._cell_grid.selection_changed.connect(self._on_cell_selection_changed)
         include_all = QPushButton("Include all cells")
         include_all.clicked.connect(self._on_include_all)
         layout.addWidget(self._cell_grid, alignment=Qt.AlignmentFlag.AlignHCenter)
@@ -261,26 +271,74 @@ class MainWindow(QMainWindow):
         self._on_generate()  # re-render the preview with the new precision
         self._set_status("Preferences saved.")
 
-    def _build_slope_group(self) -> QGroupBox:
-        '''Create the slope group (only applies to stud-less blocks).'''
-        self._slope_group = QGroupBox("Slope (stud-less blocks)")
-        form = QFormLayout(self._slope_group)
-        form.setVerticalSpacing(8)
-        self._slope_side = QComboBox()
-        self._slope_side.addItems(list(SLOPE_SIDES))
-        form.addRow("Raised edge", self._slope_side)
-        self._slope_rise = QSpinBox()
-        self._slope_rise.setRange(0, 16)
-        self._slope_rise.setSuffix(" x unit height")
-        form.addRow("Edge rise", self._slope_rise)
-        note = QLabel(
-            "One top edge rises N x block_height, the top face slopes down\n"
-            "to the opposite edge (full rectangle). Studs and tubes do not\n"
-            "apply; cell exclusions are ignored in this mode."
+    def _build_cell_group(self) -> QGroupBox:
+        '''Create the inspector of the cell selected in the layout.
+
+        A checklist of the actions available for the selected cell; checking
+        an item reveals its parameter pairs indented below it. Slope and
+        stud are mutually exclusive (a wedge top cannot carry a stud), a
+        chamfer combines with any top, exclusion hides everything else.
+        '''
+        self._cell_group = QGroupBox("Cell (click the layout to select)")
+        outer = QVBoxLayout(self._cell_group)
+        outer.setSpacing(4)
+
+        self._cb_exclude = QCheckBox("Exclude cell")
+        self._cb_exclude.setToolTip("Remove the cell from the figure entirely.")
+        self._cb_stud = QCheckBox("Stud on top")
+        self._cb_stud.setToolTip(
+            "Cylindrical stud on the cell top. Unchecking makes the cell\n"
+            "plain even when 'Studs on plain cells' is on."
         )
-        note.setWordWrap(True)
-        form.addRow(note)
-        return self._slope_group
+        self._cb_slope = QCheckBox("Slope")
+        self._cb_slope.setToolTip(
+            "Solid top wedge: the raised edge rises N x unit heights.\n"
+            "Geometrically impossible together with a stud."
+        )
+        self._cb_chamfer = QCheckBox("Chamfer (bottom)")
+        self._cb_chamfer.setToolTip(
+            "Solid bottom wedge thinned toward the chosen side; only the\n"
+            "outward sides of the cell are offered. Combines with any top."
+        )
+
+        # Parameter pairs, shown indented under their checked item.
+        self._slope_params = QWidget()
+        form = QFormLayout(self._slope_params)
+        form.setContentsMargins(24, 0, 0, 0)
+        form.setVerticalSpacing(4)
+        self._slope_edge = QComboBox()
+        self._slope_edge.addItems(list(SLOPE_SIDES))
+        self._slope_rise = QSpinBox()
+        self._slope_rise.setRange(1, MAX_SLOPE_RISE)
+        self._slope_rise.setSuffix(" x unit height")
+        form.addRow("Raised edge", self._slope_edge)
+        form.addRow("Height", self._slope_rise)
+
+        self._chamfer_params = QWidget()
+        chamfer_form = QFormLayout(self._chamfer_params)
+        chamfer_form.setContentsMargins(24, 0, 0, 0)
+        chamfer_form.setVerticalSpacing(4)
+        self._chamfer_edge = QComboBox()
+        chamfer_form.addRow("Direction", self._chamfer_edge)
+
+        for widget in (
+            self._cb_exclude,
+            self._cb_stud,
+            self._cb_slope,
+            self._slope_params,
+            self._cb_chamfer,
+            self._chamfer_params,
+        ):
+            outer.addWidget(widget)
+
+        self._cb_exclude.toggled.connect(self._on_inspector_exclude)
+        self._cb_stud.toggled.connect(self._on_inspector_stud)
+        self._cb_slope.toggled.connect(self._on_inspector_slope)
+        self._cb_chamfer.toggled.connect(self._on_inspector_chamfer)
+        self._slope_edge.currentTextChanged.connect(self._on_slope_params_changed)
+        self._slope_rise.valueChanged.connect(self._on_slope_params_changed)
+        self._chamfer_edge.currentTextChanged.connect(self._on_chamfer_param_changed)
+        return self._cell_group
 
     def _build_display_group(self) -> QGroupBox:
         '''Create the preview display-mode group.'''
@@ -344,8 +402,6 @@ class MainWindow(QMainWindow):
         for spin in self._floats.values():
             spin.valueChanged.connect(self._schedule_rebuild)
         self._tubes.toggled.connect(self._schedule_rebuild)
-        self._slope_side.currentTextChanged.connect(self._schedule_rebuild)
-        self._slope_rise.valueChanged.connect(self._schedule_rebuild)
 
     def _schedule_rebuild(self) -> None:
         '''(Re)start the debounced regeneration timer.'''
@@ -357,14 +413,165 @@ class MainWindow(QMainWindow):
         self._schedule_rebuild()
 
     def _on_include_all(self) -> None:
-        '''Reset the exclusion mask from the "Include all" button.'''
+        '''Reset every cell feature from the "Include all" button.'''
         self._cell_grid.include_all()
+        self._sync_inspector()
         self._schedule_rebuild()
 
     def _on_pins_toggled(self, checked: bool) -> None:
-        '''Enable the slope group only for stud-less blocks; regenerate.'''
-        self._slope_group.setEnabled(not checked)
+        '''Apply the new plain-cell default and regenerate.'''
+        self._cell_grid.set_default_studs(checked)
+        self._sync_inspector()
         self._schedule_rebuild()
+
+    # -------------------------------------------------------- cell inspector
+    def _on_cell_selection_changed(self) -> None:
+        '''Refresh the inspector after the layout selection changed.'''
+        self._sync_inspector()
+
+    def _sync_inspector(self) -> None:
+        '''Push the selected cell state into the inspector widgets.
+
+        Checkbox signals are blocked while syncing: the widgets mirror the
+        editor state, they do not drive it. Checking a box reveals its
+        parameter block indented below; an excluded cell disables the other
+        actions (their hidden state is kept and restored on un-excluding).
+        '''
+        cell = self._cell_grid.selected_cell()
+        boxes = (
+            self._cb_exclude,
+            self._cb_stud,
+            self._cb_slope,
+            self._cb_chamfer,
+        )
+        for box in boxes:
+            box.blockSignals(True)
+        try:
+            if cell is None:
+                self._cell_group.setTitle("Cell (click the layout to select)")
+                for box in boxes:
+                    box.setEnabled(False)
+                self._slope_params.setVisible(False)
+                self._chamfer_params.setVisible(False)
+                return
+            ix, iy = cell
+            state = self._cell_grid.state(ix, iy)
+            sides = self._cell_grid.available_chamfer_sides(ix, iy)
+            self._cell_group.setTitle(f"Cell [{ix}, {iy}]")
+            self._cb_exclude.setEnabled(True)
+            self._cb_exclude.setChecked(state.excluded)
+            self._cb_stud.setEnabled(not state.excluded)
+            self._cb_stud.setChecked(self._cell_grid.effective_stud(ix, iy))
+            self._cb_slope.setEnabled(not state.excluded)
+            self._cb_slope.setChecked(state.slope is not None)
+            self._cb_chamfer.setEnabled(not state.excluded and bool(sides))
+            self._cb_chamfer.setChecked(state.chamfer is not None)
+            self._sync_slope_params(state)
+            self._sync_chamfer_params(state, sides)
+        finally:
+            for box in boxes:
+                box.blockSignals(False)
+
+    def _sync_slope_params(self, state: CellState) -> None:
+        '''Show/refresh the slope parameter pair for the selected cell.'''
+        for widget in (self._slope_edge, self._slope_rise):
+            widget.blockSignals(True)
+        try:
+            if state.slope is not None:
+                side, rise = state.slope
+                self._slope_edge.setCurrentText(side)
+                self._slope_rise.setValue(rise)
+            self._slope_params.setVisible(state.slope is not None)
+        finally:
+            for widget in (self._slope_edge, self._slope_rise):
+                widget.blockSignals(False)
+
+    def _sync_chamfer_params(self, state: CellState, sides: list[str]) -> None:
+        '''Show/refresh the chamfer direction combo for the selected cell.'''
+        if state.chamfer is not None and state.chamfer not in sides:
+            # Stale direction (the neighbor across it was included): fall
+            # back to the first outward side, or drop the chamfer entirely.
+            state.chamfer = sides[0] if sides else None
+            self._cb_chamfer.setChecked(state.chamfer is not None)
+            cell = self._cell_grid.selected_cell()
+            if cell is not None:
+                self._cell_grid.set_state(*cell, state)
+        self._chamfer_edge.blockSignals(True)
+        try:
+            self._chamfer_edge.clear()
+            self._chamfer_edge.addItems(sides)
+            if state.chamfer is not None:
+                self._chamfer_edge.setCurrentText(state.chamfer)
+            self._chamfer_params.setVisible(state.chamfer is not None)
+        finally:
+            self._chamfer_edge.blockSignals(False)
+
+    def _edit_selected(self, mutate) -> None:
+        '''Apply a mutation to the selected cell state, then re-sync.
+
+        Args:
+            mutate: Callable receiving the (mutable) CellState.
+        '''
+        cell = self._cell_grid.selected_cell()
+        if cell is None:
+            return
+        ix, iy = cell
+        state = self._cell_grid.state(ix, iy)
+        mutate(state)
+        self._cell_grid.set_state(ix, iy, state)
+        self._sync_inspector()
+
+    def _on_inspector_exclude(self, checked: bool) -> None:
+        '''Exclude or restore the selected cell (features are preserved).'''
+        self._edit_selected(lambda state: setattr(state, "excluded", checked))
+
+    def _on_inspector_stud(self, checked: bool) -> None:
+        '''Toggle the stud top; a stud replaces a slope (conflict).'''
+
+        def mutate(state: CellState) -> None:
+            state.stud = checked
+            if checked:
+                state.slope = None
+
+        self._edit_selected(mutate)
+
+    def _on_inspector_slope(self, checked: bool) -> None:
+        '''Toggle the top slope; it replaces the stud (conflict).'''
+
+        def mutate(state: CellState) -> None:
+            state.slope = (
+                (self._slope_edge.currentText(), self._slope_rise.value())
+                if checked
+                else None
+            )
+            if checked:
+                state.stud = None  # the wedge top replaces the stud
+
+        self._edit_selected(mutate)
+
+    def _on_inspector_chamfer(self, checked: bool) -> None:
+        '''Toggle the bottom chamfer of the selected cell.'''
+
+        def mutate(state: CellState) -> None:
+            state.chamfer = (
+                self._chamfer_edge.currentText() if checked else None
+            )
+
+        self._edit_selected(mutate)
+
+    def _on_slope_params_changed(self) -> None:
+        '''Apply edited slope parameters to the selected cell.'''
+        if not self._cb_slope.isChecked():
+            return
+        slope = (self._slope_edge.currentText(), self._slope_rise.value())
+        self._edit_selected(lambda state: setattr(state, "slope", slope))
+
+    def _on_chamfer_param_changed(self) -> None:
+        '''Apply the edited chamfer direction to the selected cell.'''
+        if not self._cb_chamfer.isChecked():
+            return
+        side = self._chamfer_edge.currentText()
+        self._edit_selected(lambda state: setattr(state, "chamfer", side))
 
     # ----------------------------------------------------------------- actions
     def _collect_settings(self) -> BlockSettings:
@@ -381,10 +588,11 @@ class MainWindow(QMainWindow):
             "cells_y": self._cells_y.value(),
             "pins_enabled": self._pins.isChecked(),
             "tubes_enabled": self._tubes.isChecked(),
-            "slope_side": self._slope_side.currentText(),
-            "slope_rise_units": self._slope_rise.value(),
             "excluded_cells": self._cell_grid.excluded_cells(),
+            "flat_cells": self._cell_grid.flat_cells(),
+            "stud_cells": self._cell_grid.stud_cells(),
             "sloped_cells": self._cell_grid.sloped_cells(),
+            "chamfered_cells": self._cell_grid.chamfered_cells(),
         }
         values.update({field: spin.value() for field, spin in self._floats.items()})
         return validate_settings(values)
@@ -407,12 +615,16 @@ class MainWindow(QMainWindow):
         self._cells_y.setValue(self._settings.cells_y)
         self._pins.setChecked(self._settings.pins_enabled)
         self._tubes.setChecked(self._settings.tubes_enabled)
-        self._slope_side.setCurrentText(self._settings.slope_side)
-        self._slope_rise.setValue(self._settings.slope_rise_units)
-        self._slope_group.setEnabled(not self._settings.pins_enabled)
         self._cell_grid.set_dimensions(self._settings.cells_x, self._settings.cells_y)
-        self._cell_grid.set_excluded(self._settings.excluded_cells)
-        self._cell_grid.set_sloped(self._settings.sloped_cells)
+        self._cell_grid.set_default_studs(self._settings.pins_enabled)
+        self._cell_grid.clear_selection()
+        self._cell_grid.set_from_lists(
+            self._settings.excluded_cells,
+            self._settings.flat_cells,
+            self._settings.stud_cells,
+            self._settings.sloped_cells,
+            self._settings.chamfered_cells,
+        )
         for field, spin in self._floats.items():
             spin.setValue(getattr(self._settings, field))
 
@@ -522,8 +734,8 @@ class MainWindow(QMainWindow):
         self._applied_cache_key = result.get('cache_key', cache_key)
 
         slope_note = (
-            f" | slope {settings.slope_side} +{settings.slope_rise_units}u"
-            if settings.slope_active
+            f" | {len(settings.sloped_cells)} sloped"
+            if settings.sloped_cells
             else ""
         )
         figure_note = (
@@ -532,8 +744,8 @@ class MainWindow(QMainWindow):
             else ""
         )
         chamfer_note = (
-            f" | {len(settings.sloped_cells)} chamfered"
-            if settings.sloped_cells
+            f" | {len(settings.chamfered_cells)} chamfered"
+            if settings.chamfered_cells
             else ""
         )
         self._status_style(False)

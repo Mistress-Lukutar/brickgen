@@ -2,8 +2,8 @@
 File:   test_bottom_chamfer.py
 Brief:  Unit tests for bottom-chamfered cells (sloped underside wedges).
 Author: Mistress-Lukutar
-Date:   2026-11-16
-Version: v0.9.3
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -26,26 +26,31 @@ def test_sloped_cells_validation() -> None:
     '''Chamfer sides must look outward; conflicts are rejected.'''
     # neighbor across +X is an included cell -> invalid
     with pytest.raises(Exception, match="outward"):
-        BlockSettings(cells_x=2, cells_y=2, sloped_cells=[[0, 0, "+X"]])
+        BlockSettings(cells_x=2, cells_y=2, chamfered_cells=[[0, 0, "+X"]])
     # neighbor excluded -> valid
     settings = BlockSettings(
-        cells_x=2, cells_y=2, excluded_cells=[[1, 0]], sloped_cells=[[0, 0, "+X"]]
+        cells_x=2, cells_y=2, excluded_cells=[[1, 0]], chamfered_cells=[[0, 0, "+X"]]
     )
-    assert settings.sloped_cells == [[0, 0, "+X"]]
+    assert settings.chamfered_cells == [[0, 0, "+X"]]
     # sloped cell cannot be excluded
-    with pytest.raises(Exception, match="both excluded and sloped"):
+    with pytest.raises(Exception, match="excluded and chamfered"):
         BlockSettings(
-            cells_x=2, cells_y=2, excluded_cells=[[1, 1]], sloped_cells=[[1, 1, "+Y"]]
+            cells_x=2,
+            cells_y=2,
+            excluded_cells=[[1, 1]],
+            chamfered_cells=[[1, 1, "+Y"]],
         )
     # unknown side rejected
     with pytest.raises(Exception, match="must be one of"):
-        BlockSettings(cells_x=2, cells_y=1, sloped_cells=[[0, 0, "+Z"]])
+        BlockSettings(cells_x=2, cells_y=1, chamfered_cells=[[0, 0, "+Z"]])
     # duplicate triplet rejected
     with pytest.raises(Exception, match="twice"):
-        BlockSettings(cells_x=2, cells_y=1, sloped_cells=[[0, 0, "-X"], [0, 0, "-X"]])
+        BlockSettings(
+            cells_x=2, cells_y=1, chamfered_cells=[[0, 0, "-X"], [0, 0, "-X"]]
+        )
     # out of bounds rejected
     with pytest.raises(Exception, match="outside"):
-        BlockSettings(cells_x=2, cells_y=1, sloped_cells=[[2, 0, "+X"]])
+        BlockSettings(cells_x=2, cells_y=1, chamfered_cells=[[2, 0, "+X"]])
 
 
 def test_two_sides_on_one_cell_allowed() -> None:
@@ -54,9 +59,9 @@ def test_two_sides_on_one_cell_allowed() -> None:
         cells_x=2,
         cells_y=2,
         excluded_cells=[[1, 1]],
-        sloped_cells=[[1, 0, "+X"], [1, 0, "+Y"]],
+        chamfered_cells=[[1, 0, "+X"], [1, 0, "+Y"]],
     )
-    assert settings.sloped_cells == [[1, 0, "+X"], [1, 0, "+Y"]]
+    assert settings.chamfered_cells == [[1, 0, "+X"], [1, 0, "+Y"]]
 
 
 def test_sloped_l_shape_probes() -> None:
@@ -65,7 +70,7 @@ def test_sloped_l_shape_probes() -> None:
         cells_x=2,
         cells_y=2,
         excluded_cells=[[1, 1]],
-        sloped_cells=[[1, 0, "+X"], [0, 1, "+Y"]],
+        chamfered_cells=[[1, 0, "+X"], [0, 1, "+Y"]],
     )
     solid = build_block(settings).val()
     # +X arm: bottom void near the outer face, material near the top
@@ -89,7 +94,7 @@ def test_sloped_l_shape_probes() -> None:
 def test_chamfer_reduces_volume() -> None:
     '''Adding chamfers only removes material.'''
     base = BlockSettings(cells_x=2, cells_y=2, excluded_cells=[[1, 1]])
-    chamfered = base.model_copy(update={"sloped_cells": [[1, 0, "+X"]]})
+    chamfered = base.model_copy(update={"chamfered_cells": [[1, 0, "+X"]]})
     v_base = build_block(base).val().Volume()
     v_cham = build_block(chamfered).val().Volume()
     assert 0 < v_cham < v_base
@@ -98,7 +103,7 @@ def test_chamfer_reduces_volume() -> None:
 def test_wedge_bar_2x1_solid() -> None:
     '''A 1x2 bar chamfered on both ends is one solid wedge pair.'''
     settings = BlockSettings(
-        cells_x=2, cells_y=1, sloped_cells=[[0, 0, "-X"], [1, 0, "+X"]]
+        cells_x=2, cells_y=1, chamfered_cells=[[0, 0, "-X"], [1, 0, "+X"]]
     )
     solid = build_block(settings).val()
     assert len(build_block(settings).solids().vals()) == 1
@@ -113,26 +118,6 @@ def test_wedge_bar_2x1_solid() -> None:
     u, h = settings.unit_size, settings.block_height
     studs = 2 * math.pi * (settings.pin_diameter / 2.0) ** 2 * settings.pin_height
     assert solid.Volume() == pytest.approx(u * u * h + studs, rel=1e-3)
-
-
-def test_top_slope_still_ignores_cell_states() -> None:
-    '''The stud-less top-slope variant builds the full rectangle.'''
-    plain = BlockSettings(
-        cells_x=2,
-        cells_y=2,
-        pins_enabled=False,
-        tubes_enabled=False,
-        slope_rise_units=1,
-    )
-    with_states = plain.model_copy(
-        update={
-            "excluded_cells": [[1, 1]],
-            "sloped_cells": [[0, 0, "-X"]],
-        }
-    )
-    v_plain = build_block(plain).val().Volume()
-    v_states = build_block(with_states).val().Volume()
-    assert v_plain == pytest.approx(v_states, rel=1e-6)
 
 
 def test_rectangular_without_chamfers_uses_tubes() -> None:
@@ -154,7 +139,7 @@ def test_internal_wall_between_cavity_and_wedge_void() -> None:
         cells_x=2,
         cells_y=2,
         excluded_cells=[[1, 1]],
-        sloped_cells=[[1, 0, "+X"], [0, 1, "+Y"]],
+        chamfered_cells=[[1, 0, "+X"], [0, 1, "+Y"]],
     )
     solid = build_block(settings).val()
     # wall strip between the corner cavity and the +X wedge void
@@ -173,7 +158,7 @@ def test_no_rounded_rib_beside_chamfered_cells() -> None:
         cells_x=2,
         cells_y=2,
         excluded_cells=[[1, 1]],
-        sloped_cells=[[1, 0, "+X"], [0, 1, "+Y"]],
+        chamfered_cells=[[1, 0, "+X"], [0, 1, "+Y"]],
     )
     assert _figure_corner_ribs(settings) == []
     solid = build_block(settings).val()

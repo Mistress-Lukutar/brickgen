@@ -2,8 +2,8 @@
 File:   test_preview.py
 Brief:  Unit tests for the pyvista mesh conversion used by the preview.
 Author: Mistress-Lukutar
-Date:   2026-11-16
-Version: v0.9.2
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -97,7 +97,10 @@ def classified_1x1_mesh():
 def classified_slope_mesh():
     '''Classified preview mesh of a slope block (no studs, no tubes).'''
     settings = BlockSettings(
-        cells_x=3, cells_y=2, pins_enabled=False, slope_rise_units=1
+        cells_x=3,
+        cells_y=2,
+        pins_enabled=False,
+        sloped_cells=[[ix, iy, "+X", 1] for iy in range(2) for ix in range(3)],
     )
     solid = build_block(settings).val()
     classifier = make_face_classifier(settings)

@@ -2,8 +2,8 @@
 File:   test_figure_builder.py
 Brief:  Unit tests for blocks with excluded cells (figure variants).
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.5.0
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -135,16 +135,19 @@ def test_figure_no_ribs_without_concave_corner() -> None:
     assert solid.Volume() == pytest.approx(_figure_volume(settings), rel=1e-3)
 
 
-def test_slope_ignores_exclusions() -> None:
-    '''Slope mode builds the full rectangle regardless of the mask.'''
-    base = BlockSettings(
+def test_slope_cell_in_figure_variant() -> None:
+    '''A slope cell inside an L figure: solid wedge, no ribs from it.'''
+    settings = BlockSettings(
         cells_x=2,
         cells_y=2,
-        pins_enabled=False,
-        tubes_enabled=False,
-        slope_rise_units=1,
+        excluded_cells=[[1, 1]],
+        sloped_cells=[[1, 0, "+X", 1]],
     )
-    sloped = base.model_copy(update={"excluded_cells": [[1, 1]]})
-    v_base = build_block(base).val().Volume()
-    v_sloped = build_block(sloped).val().Volume()
-    assert v_base == pytest.approx(v_sloped, rel=1e-6)
+    # the sloped cell has no cavity, so the L corner has only 2 cavity
+    # quadrants left -> no quarter-round rib
+    assert _figure_corner_ribs(settings) == []
+    solid = build_block(settings).val()
+    assert solid.BoundingBox().zmax == pytest.approx(
+        2 * settings.block_height, abs=1e-4
+    )
+    assert len(build_block(settings).solids().vals()) == 1

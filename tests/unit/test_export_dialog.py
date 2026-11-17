@@ -2,8 +2,8 @@
 File:   test_export_dialog.py
 Brief:  Unit tests for the export dialog format/extension resolution.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.6.1
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations

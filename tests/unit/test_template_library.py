@@ -2,8 +2,8 @@
 File:   test_template_library.py
 Brief:  Unit tests for the template library service.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.5.0
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -44,7 +44,10 @@ def test_builtin_templates_are_valid(monkeypatch, tmp_path: Path) -> None:
 def test_save_and_reload_roundtrip(isolated_user_dir: Path) -> None:
     '''A saved user template appears in the list with its settings.'''
     settings = BlockSettings(
-        cells_x=3, cells_y=2, pins_enabled=False, slope_rise_units=1, slope_side="-X"
+        cells_x=3,
+        cells_y=2,
+        pins_enabled=False,
+        sloped_cells=[[0, 0, "-X", 1], [1, 0, "-X", 1], [2, 0, "-X", 1]],
     )
     path = save_template("My Slope", settings)
     assert path.parent == isolated_user_dir

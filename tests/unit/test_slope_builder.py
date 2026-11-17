@@ -1,182 +1,151 @@
 '''
 File:   test_slope_builder.py
-Brief:  Unit tests for the sloped-top stud-less block variant.
+Brief:  Unit tests for per-cell sloped-top wedge cells.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.4.1
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
 
-import pytest
-from cadquery import Workplane
+import math
 
-from brickgen.core.builder import build_block
+import cadquery as cq
+import pytest
+
+from brickgen.core.builder import _slope_cell_solid, build_block
 from brickgen.core.models import BlockSettings
 
 
-def _sloped_volume(settings: BlockSettings) -> float:
-    '''Analytic volume of the sloped block (no studs, no tubes), mm^3.
+def _wedge_volume(settings: BlockSettings, rise_units: int) -> float:
+    '''Analytic volume of one solid slope cell, mm^3.
 
-    Outer prism: trapezoid cross-section heights H and H+R; cavity mirrors
-    the profile inset by wall thickness and capped t below the top.
+    Trapezoid cross-section (heights ``block_height`` and
+    ``block_height + rise``) over the cell footprint, no cavity.
     '''
-    lx = settings.outer_length_x
-    ly = settings.outer_length_y
-    t = settings.wall_thickness
-    rise = settings.slope_rise
+    unit = settings.unit_size
     h = settings.block_height
-    outer = lx * ly * (h + rise / 2.0)
-    cavity = (lx - 2 * t) * (ly - 2 * t) * (h - t + rise / 2.0)
-    return outer - cavity
+    return unit * unit * (h + rise_units * h / 2.0)
 
 
-@pytest.fixture
-def slope_2x4() -> BlockSettings:
-    '''2x4 slope block, raised edge on +X, rise of one unit height.'''
-    return BlockSettings(
+def test_wedge_cell_helper_volume() -> None:
+    '''The slope cell helper builds a trapezoid prism of the exact volume.'''
+    settings = BlockSettings(cells_x=2, cells_y=2)
+    solid = _slope_cell_solid(settings, 0, 1, "+Y", 1).val()
+    assert solid.Volume() == pytest.approx(_wedge_volume(settings, 1), rel=1e-6)
+    bb = solid.BoundingBox()
+    assert bb.zmax == pytest.approx(2 * settings.block_height, abs=1e-4)
+    assert bb.ymin == pytest.approx(0.0, abs=1e-4)
+    assert bb.ymax == pytest.approx(settings.unit_size, abs=1e-4)
+
+
+def test_single_slope_cell_volume() -> None:
+    '''1x2 with one slope cell: shell + stud + solid wedge, one solid.'''
+    settings = BlockSettings(cells_x=1, cells_y=2, sloped_cells=[[0, 1, "+Y", 1]])
+    solid = build_block(settings).val()
+    u = settings.unit_size
+    h = settings.block_height
+    t = settings.wall_thickness
+    shell = u * u * h - (u - 2 * t) * (u - 2 * t) * (h - t)
+    stud = math.pi * (settings.pin_diameter / 2.0) ** 2 * settings.pin_height
+    expected = shell + stud + _wedge_volume(settings, 1)
+    assert solid.Volume() == pytest.approx(expected, rel=1e-3)
+    assert solid.BoundingBox().zmax == pytest.approx(2 * h, abs=1e-4)
+    assert len(build_block(settings).solids().vals()) == 1
+
+
+def test_slope_cell_has_no_stud() -> None:
+    '''The wedge cell top carries no stud even with the default on.'''
+    settings = BlockSettings(cells_x=1, cells_y=2, sloped_cells=[[0, 1, "+Y", 1]])
+    assert settings.cell_top(0, 1) == "slope"
+    assert settings.cell_top(0, 0) == "stud"
+    assert (0, 1) not in settings.stud_cells_all()
+
+
+def test_all_cells_sloped_volume() -> None:
+    '''A fully sloped stud-less block is a solid wedge field (no cavities).'''
+    settings = BlockSettings(
         cells_x=2,
         cells_y=4,
         pins_enabled=False,
         tubes_enabled=False,
-        slope_rise_units=1,
-        slope_side="+X",
+        sloped_cells=[[ix, iy, "+X", 1] for iy in range(4) for ix in range(2)],
     )
-
-
-def test_slope_active_flag() -> None:
-    '''Slope applies only without studs and with a positive rise.'''
-    assert BlockSettings(pins_enabled=False, slope_rise_units=1).slope_active
-    assert not BlockSettings(pins_enabled=True, slope_rise_units=1).slope_active
-    assert not BlockSettings(pins_enabled=False, slope_rise_units=0).slope_active
-
-
-def test_slope_bounding_box(slope_2x4: BlockSettings) -> None:
-    '''Raised edge tops at block_height + slope_rise.'''
-    solid = build_block(slope_2x4).val()
-    bb = solid.BoundingBox()
-    assert bb.xlen == pytest.approx(8.0, abs=1e-4)
-    assert bb.ylen == pytest.approx(16.0, abs=1e-4)
-    assert bb.zmax == pytest.approx(6.0, abs=1e-4)  # 3 + 1x3
-    assert bb.zmin == pytest.approx(0.0, abs=1e-4)
-
-
-def test_slope_volume_matches_analytic(slope_2x4: BlockSettings) -> None:
-    '''Sloped block volume equals the trapezoid-prism analytic value.'''
-    solid = build_block(slope_2x4).val()
-    assert solid.Volume() == pytest.approx(_sloped_volume(slope_2x4), rel=1e-3)
+    solid = build_block(settings).val()
+    lx = settings.outer_length_x
+    ly = settings.outer_length_y
+    h = settings.block_height
+    expected = lx * ly * (h + h / 2.0)
+    assert solid.Volume() == pytest.approx(expected, rel=1e-3)
+    assert solid.BoundingBox().zmax == pytest.approx(2 * h, abs=1e-4)
+    assert len(build_block(settings).solids().vals()) == 1
 
 
 def test_slope_sides_are_mirror_symmetric() -> None:
-    '''+X and -X variants have equal volume (mirrored profiles).'''
+    '''+X and -X wedges on mirrored cells have equal volume.'''
     plus = BlockSettings(
-        cells_x=3, cells_y=2, pins_enabled=False, slope_rise_units=2, slope_side="+X"
+        cells_x=2, cells_y=1, pins_enabled=False, sloped_cells=[[1, 0, "+X", 2]]
     )
-    minus = plus.model_copy(update={"slope_side": "-X"})
+    minus = BlockSettings(
+        cells_x=2, cells_y=1, pins_enabled=False, sloped_cells=[[0, 0, "-X", 2]]
+    )
     v_plus = build_block(plus).val().Volume()
     v_minus = build_block(minus).val().Volume()
     assert v_plus == pytest.approx(v_minus, rel=1e-6)
-    assert v_plus == pytest.approx(_sloped_volume(plus), rel=1e-3)
 
 
-def test_slope_along_y() -> None:
-    '''Y-direction slopes match the analytic volume as well.'''
+def test_slope_and_chamfer_combine() -> None:
+    '''A slope top and a bottom chamfer can share one cell.'''
     settings = BlockSettings(
-        cells_x=2, cells_y=3, pins_enabled=False, slope_rise_units=1, slope_side="+Y"
+        cells_x=1,
+        cells_y=2,
+        sloped_cells=[[0, 0, "+Y", 1]],
+        chamfered_cells=[[0, 0, "-Y"]],
     )
     solid = build_block(settings).val()
-    assert solid.BoundingBox().zmax == pytest.approx(6.0, abs=1e-4)
-    assert solid.Volume() == pytest.approx(_sloped_volume(settings), rel=1e-3)
+    assert len(build_block(settings).solids().vals()) == 1
+    # bottom tip toward the chamfer side (-Y): the wedge thins to zero there
+    assert not solid.isInside(cq.Vector(0.0, -3.9, 0.1))
+    # near the raised edge (+Y side of the cell) the wedge is full height
+    assert solid.isInside(cq.Vector(0.0, -0.1, 5.9))
 
 
-def test_slope_variant_is_single_solid(slope_2x4: BlockSettings) -> None:
-    '''The sloped shell is one solid body.'''
-    assert len(build_block(slope_2x4).solids().vals()) == 1
-
-
-def test_slope_ignored_when_pins_enabled() -> None:
-    '''With studs on top the slope parameters have no effect.'''
-    plain = BlockSettings(cells_x=2, cells_y=2)
-    sloped = plain.model_copy(update={"slope_rise_units": 3})
-    v_plain = build_block(plain).val().Volume()
-    v_sloped = build_block(sloped).val().Volume()
-    assert v_plain == pytest.approx(v_sloped, rel=1e-6)
-
-
-def test_slope_cavity_is_centered(slope_2x4: BlockSettings) -> None:
-    '''Bottom rim walls must be uniform: cavity centered in the footprint.
-
-    Regression: the cavity used to be shifted by wall_thickness/2 along the
-    slope axis, producing rim walls of t/2 and 3t/2.
-    '''
-    t = slope_2x4.wall_thickness
-    slab = (
-        Workplane("XY")
-        .box(
-            slope_2x4.outer_length_x,
-            slope_2x4.outer_length_y,
-            0.1,
-            centered=(True, True, False),
-        )
-        .intersect(build_block(slope_2x4))
-    )
-    ring = slab.val().Volume()
-    rim_area = slope_2x4.outer_length_x * slope_2x4.outer_length_y - (
-        slope_2x4.outer_length_x - 2 * t
-    ) * (slope_2x4.outer_length_y - 2 * t)
-    assert ring == pytest.approx(rim_area * 0.1, rel=1e-3)
-
-
-def test_steep_slope_has_no_hole() -> None:
-    '''Steep slopes keep a uniform top face thickness (no slit hole).
-
-    Regression: a non-parallel cavity ceiling used to poke through the
-    sloped top face when rise exceeded the slope-axis length.
-    '''
+def test_slope_neighbor_gets_wall_strip() -> None:
+    '''A normal cell's cavity is walled off from a solid slope cell.'''
     settings = BlockSettings(
-        cells_x=2,
-        cells_y=2,
-        pins_enabled=False,
-        tubes_enabled=False,
-        slope_rise_units=3,
-        slope_side="+X",
+        cells_x=1, cells_y=2, pins_enabled=False, sloped_cells=[[0, 1, "+Y", 1]]
     )
     solid = build_block(settings).val()
-    bb = solid.BoundingBox()
-    assert bb.zmax == pytest.approx(12.0, abs=1e-4)
-    # A through-hole in the top face would remove material below analytic.
-    assert solid.Volume() == pytest.approx(_sloped_volume(settings), rel=1e-3)
+    # cavity void in the normal cell (0,0), away from the walls
+    assert not solid.isInside(cq.Vector(0.0, -2.0, 0.3))
+    # wall strip between the cavity and the solid wedge cell (y in -0.8..0)
+    assert solid.isInside(cq.Vector(0.0, -0.4, 0.3))
 
 
-def test_top_face_thickness_is_uniform() -> None:
-    '''Vertical distance between outer top plane and cavity ceiling stays t.
-
-    Sampled at several positions along the slope axis via thin slab cuts.
-    '''
+def test_explicit_stud_on_studless_block() -> None:
+    '''``stud_cells`` add a stud even when the default top is stud-less.'''
     settings = BlockSettings(
-        cells_x=2,
-        cells_y=2,
-        pins_enabled=False,
-        tubes_enabled=False,
-        slope_rise_units=2,
-        slope_side="+X",
+        cells_x=2, cells_y=1, pins_enabled=False, stud_cells=[[1, 0]]
     )
+    solid = build_block(settings).val()
+    u = settings.unit_size
+    h = settings.block_height
     t = settings.wall_thickness
-    lx = settings.outer_length_x
-    solid = build_block(settings)
-    for pos in (0.25, 0.5, 0.75):
-        # Global x of the sample point along the slope axis.
-        x = -lx / 2.0 + pos * lx
-        # Thin probe column at the block center: inside the cavity the
-        # material spans ceiling..outer-top, so bbox zmin is the ceiling.
-        probe = (
-            Workplane("XY", origin=(x, 0, 0))
-            .rect(0.02, 0.02)
-            .extrude(settings.block_height + settings.slope_rise + 1.0)
-        )
-        column = probe.intersect(solid)
-        bb = column.val().BoundingBox()
-        outer_top = settings.block_height + settings.slope_rise * pos
-        # bbox spans the 0.02 mm probe width; allow that in tolerances.
-        assert bb.zmin == pytest.approx(outer_top - t, abs=0.02)
-        assert bb.zmax == pytest.approx(outer_top, abs=0.02)
+    shell = 2 * u * u * h - (2 * u - 2 * t) * (u - 2 * t) * (h - t)
+    stud = math.pi * (settings.pin_diameter / 2.0) ** 2 * settings.pin_height
+    assert solid.Volume() == pytest.approx(shell + stud, rel=1e-3)
+    assert solid.BoundingBox().zmax == pytest.approx(settings.total_height, abs=1e-4)
+
+
+def test_flat_override_on_default_block() -> None:
+    '''``flat_cells`` removes the stud from one cell only.'''
+    settings = BlockSettings(cells_x=2, cells_y=1, flat_cells=[[0, 0]])
+    solid = build_block(settings).val()
+    u = settings.unit_size
+    h = settings.block_height
+    t = settings.wall_thickness
+    shell = 2 * u * u * h - (2 * u - 2 * t) * (u - 2 * t) * (h - t)
+    stud = math.pi * (settings.pin_diameter / 2.0) ** 2 * settings.pin_height
+    assert solid.Volume() == pytest.approx(shell + stud, rel=1e-3)
+    assert settings.cell_top(0, 0) == "flat"
+    assert settings.cell_top(1, 0) == "stud"

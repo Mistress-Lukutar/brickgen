@@ -1,20 +1,20 @@
 {
   "schema": {
     "name": "brickgen-settings",
-    "version": 1
+    "version": 2
   },
   "template_name": "Wedge bar 2x1",
   "cells_x": 2,
   "cells_y": 1,
-  "sloped_cells": [
+  "chamfered_cells": [
     [
-      "0",
-      "0",
+      0,
+      0,
       "-X"
     ],
     [
-      "1",
-      "0",
+      1,
+      0,
       "+X"
     ]
   ]

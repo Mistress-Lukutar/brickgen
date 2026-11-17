@@ -2,8 +2,8 @@
 File:   test_app_settings.py
 Brief:  Unit tests for persistent application preferences.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.9.0
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations

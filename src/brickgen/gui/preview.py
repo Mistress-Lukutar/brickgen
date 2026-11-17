@@ -2,8 +2,8 @@
 File:   preview.py
 Brief:  PyVista/VTK-based 3D preview widget with display modes.
 Author: Mistress-Lukutar
-Date:   2026-11-16
-Version: v0.12.0
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -113,14 +113,22 @@ def solid_to_mesh(
 def make_face_classifier(settings: BlockSettings) -> Callable[[cq.Face], int]:
     '''Build a face -> part-id classifier from the block settings.
 
-    Classification order matters: studs first (faces above the top plane),
-    then cylindrical tube walls near tube centers, then bottom-rim faces at
-    Z=0, everything else is body.
+    Classification order matters: studs first (faces above the top plane
+    sitting within a stud radius of a stud cell center; slope wedges also
+    rise above the top plane but stay away from stud centers), then
+    cylindrical tube walls near tube centers, then bottom-rim faces at Z=0,
+    everything else is body.
     '''
     half_x = settings.outer_length_x / 2
     half_y = settings.outer_length_y / 2
+    unit = settings.unit_size
+    stud_centers = [
+        ((ix + 0.5) * unit - half_x, (iy + 0.5) * unit - half_y)
+        for ix, iy in sorted(settings.stud_cells_all())
+    ]
+    stud_r2 = (settings.pin_diameter / 2 + 1e-6) ** 2
     centers = [
-        (ix * settings.unit_size - half_x, iy * settings.unit_size - half_y)
+        (ix * unit - half_x, iy * unit - half_y)
         for ix in range(1, settings.cells_x)
         for iy in range(1, settings.cells_y)
     ]
@@ -128,8 +136,14 @@ def make_face_classifier(settings: BlockSettings) -> Callable[[cq.Face], int]:
 
     def classifier(face: cq.Face) -> int:
         c = face.Center()
-        if settings.pins_enabled and c.z > settings.block_height + 1e-6:
-            return PART_STUD
+        if c.z > settings.block_height + 1e-6:
+            nearest_stud2 = min(
+                ((c.x - sx) ** 2 + (c.y - sy) ** 2 for sx, sy in stud_centers),
+                default=math.inf,
+            )
+            if nearest_stud2 <= stud_r2:
+                return PART_STUD
+            return PART_BODY  # slope wedge faces above the top plane
         nearest2 = min(
             ((c.x - tx) ** 2 + (c.y - ty) ** 2 for tx, ty in centers),
             default=math.inf,

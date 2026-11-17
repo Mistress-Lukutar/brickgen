@@ -2,8 +2,8 @@
 File:   settings_io.py
 Brief:  JSON import/export of BlockSettings presets.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.1.0
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -19,7 +19,10 @@ logger = logging.getLogger(__name__)
 
 SETTINGS_SCHEMA_KEY = "schema"
 SETTINGS_SCHEMA_NAME = "brickgen-settings"
-SETTINGS_SCHEMA_VERSION = 1
+# v2: per-cell tops (flat/stud/slope) replace the global slope; the v1
+# ``sloped_cells`` triplets and ``slope_side``/``slope_rise_units`` keys are
+# migrated on load by the model (see BlockSettings._migrate_v1_settings).
+SETTINGS_SCHEMA_VERSION = 2
 
 
 def save_settings(settings: BlockSettings, path: Path) -> Path:

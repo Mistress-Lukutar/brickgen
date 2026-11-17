@@ -2,8 +2,8 @@
 File:   models.py
 Brief:  Pydantic settings model describing the parametric block geometry.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.6.0
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from brickgen.core.exceptions import SettingsValidationError
 MAX_CELLS = 64  # sanity limit per axis for GUI/CLI input
 MAX_SLOPE_RISE = 16  # sanity limit for the slope rise in unit heights
 
-# Side of the raised edge that forms the slope.
+# Side of the raised edge that forms a slope (top) or a chamfer (bottom).
 SlopeSide = Literal["+X", "-X", "+Y", "-Y"]
 SLOPE_SIDES: tuple[str, ...] = ("+X", "-X", "+Y", "-Y")
 
@@ -45,14 +45,29 @@ class BlockSettings(BaseModel):
 
     The block is a hollow rectangular shell without a bottom: outer footprint
     ``cells_x * unit_size`` by ``cells_y * unit_size``, wall thickness
-    ``wall_thickness``, open from below, with a solid top face carrying one
-    cylindrical stud per 1x1 cell. For blocks of at least 2x2 cells, hollow
-    reinforcement tubes are placed at the intersections of the mid-lines
-    between stud rows/columns (one tube per sliding 2x2 cell group center).
+    ``wall_thickness``, open from below, with a solid top face. For blocks of
+    at least 2x2 cells, hollow reinforcement tubes are placed at the
+    intersections of the mid-lines between stud rows/columns (one tube per
+    sliding 2x2 cell group center).
 
-    Stud-less blocks may instead have a sloped top: one top edge rises by
-    ``slope_rise_units * block_height`` and the top face slopes down to the
-    opposite edge, forming a wedge.
+    Every 1x1 cell carries a per-cell top feature and an optional bottom
+    chamfer:
+
+    - ``stud`` - cylindrical stud on the top face. This is the default top
+      for plain cells when ``pins_enabled`` is true; ``stud_cells`` /
+      ``flat_cells`` override the default per cell.
+    - ``sloped cell`` - solid wedge: the ``side`` edge of the cell rises by
+      ``rise x block_height`` and the cell top slopes down to the opposite
+      edge. Sloped cells are solid (no cavity, no stud) and may be combined
+      with a bottom chamfer.
+    - ``chamfered cell`` - ``[ix, iy, side]`` triplet: the cell bottom is a
+      solid wedge thinned toward ``side`` (no cavity opening). ``side`` must
+      look outward (neighbor across it excluded or outside the grid).
+    - ``excluded cell`` - removed from the figure entirely.
+
+    Exclusions, chamfers or slopes switch the builder to the figure variant:
+    contour walls follow the shape, concave corners get inward quarter-round
+    ribs instead of tubes.
 
     Attributes:
         cells_x: Number of cells along X (block length in cells).
@@ -62,23 +77,22 @@ class BlockSettings(BaseModel):
         block_height: Height of the shell from bottom rim to top face, mm.
         pin_diameter: Top stud diameter in mm.
         pin_height: Top stud height above the top face in mm.
-        pins_enabled: Whether to place studs on the top face.
+        pins_enabled: Default top for plain cells: studs. Cells listed in
+            ``flat_cells``/``stud_cells`` override this per cell; sloped and
+            excluded cells ignore it.
         tubes_enabled: Whether to place inner reinforcement tubes (2x2+ blocks).
         tube_inner_diameter: Inner bore diameter of the tubes, mm.
-        slope_rise_units: Rise of one top edge in unit block heights
-            (N x ``block_height``), forming a sloped top face. Applies only
-            to stud-less blocks (``pins_enabled=False``); 0 disables it.
-        slope_side: Which top edge is raised: ``+X``/``-X``/``+Y``/``-Y``.
         excluded_cells: 0-based ``[ix, iy]`` cells removed from the figure
-            (top view, ix along X, iy along Y). Non-empty masks switch the
-            builder to the figure variant: contour walls follow the shape,
-            concave corners get inward quarter-round ribs instead of tubes.
-        sloped_cells: ``[ix, iy, side]`` triplets for cells whose bottom is
-            chamfered (solid wedge, no cavity opening). ``side`` is the
-            outward face the wedge thins toward; it must look outward, i.e.
-            the neighbor across it is excluded or outside the grid. A cell
-            may be chamfered on several sides. Chamfers switch the builder
-            to the figure variant (tubes do not apply).
+            (top view, ix along X, iy along Y).
+        flat_cells: ``[ix, iy]`` cells explicitly without a stud (plain top).
+        stud_cells: ``[ix, iy]`` cells explicitly with a stud (used when
+            ``pins_enabled`` is false).
+        sloped_cells: ``[ix, iy, side, rise]`` quadruplets for cells whose
+            top is a solid wedge: the ``side`` edge rises by
+            ``rise x block_height``. ``rise`` is 1..MAX_SLOPE_RISE.
+        chamfered_cells: ``[ix, iy, side]`` triplets for cells whose bottom
+            is chamfered (solid wedge, no cavity opening). A cell may be
+            chamfered on several sides; combined freely with any top.
     '''
 
     cells_x: int = Field(default=1, ge=1, le=MAX_CELLS)
@@ -91,12 +105,60 @@ class BlockSettings(BaseModel):
     pins_enabled: bool = True
     tubes_enabled: bool = True
     tube_inner_diameter: float = Field(default=1.2, gt=0)
-    slope_rise_units: int = Field(default=0, ge=0, le=MAX_SLOPE_RISE)
-    slope_side: SlopeSide = "+X"
     excluded_cells: list[list[int]] = Field(default_factory=list)
+    flat_cells: list[list[int]] = Field(default_factory=list)
+    stud_cells: list[list[int]] = Field(default_factory=list)
     sloped_cells: list[list] = Field(default_factory=list)
+    chamfered_cells: list[list] = Field(default_factory=list)
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_v1_settings(cls, values: object) -> object:
+        '''Map v1 preset keys onto the v2 per-cell fields.
+
+        v1 stored bottom chamfers in ``sloped_cells`` as ``[ix, iy, side]``
+        triplets (now ``chamfered_cells``) and described the stud-less
+        whole-block slope with global ``slope_side``/``slope_rise_units``.
+        Triplet entries are moved to ``chamfered_cells``; a positive global
+        rise on a stud-less block is expanded into per-cell slopes covering
+        the whole grid.
+        '''
+        if not isinstance(values, dict):
+            return values
+        values = dict(values)
+        legacy_slope = values.pop("sloped_cells", None)
+        if isinstance(legacy_slope, list):
+            triplets: list[list] = []
+            quadruplets: list[list] = []
+            for item in legacy_slope:
+                if isinstance(item, (list, tuple)) and len(item) >= 4:
+                    quadruplets.append(list(item))
+                else:
+                    triplets.append(list(item))
+            if triplets:
+                chamfers = list(values.get("chamfered_cells", []))
+                values["chamfered_cells"] = chamfers + triplets
+            if quadruplets:
+                values["sloped_cells"] = quadruplets
+        rise = values.pop("slope_rise_units", None)
+        side = values.pop("slope_side", None)
+        if (
+            rise is not None
+            and side is not None
+            and not values.get("sloped_cells")
+            and not values.get("pins_enabled", True)
+        ):
+            # v1 whole-block slope: every cell gets the same wedge.
+            cells_x = int(values.get("cells_x", 1))
+            cells_y = int(values.get("cells_y", 1))
+            values["sloped_cells"] = [
+                [ix, iy, str(side), int(rise)]
+                for iy in range(cells_y)
+                for ix in range(cells_x)
+            ]
+        return values
 
     @field_validator(
         "unit_size",
@@ -113,34 +175,41 @@ class BlockSettings(BaseModel):
             raise SettingsValidationError("dimension must be a finite positive number")
         return value
 
-    @field_validator("slope_side")
-    @classmethod
-    def _validate_slope_side(cls, value: str) -> str:
-        '''Restrict the slope side to the supported set.'''
-        if value not in SLOPE_SIDES:
-            raise SettingsValidationError(
-                f"slope_side must be one of {', '.join(SLOPE_SIDES)}"
-            )
-        return value
-
-    @field_validator("excluded_cells")
-    @classmethod
-    def _validate_excluded_cells(cls, value: list) -> list[list[int]]:
-        '''Normalize the exclusion mask to a sorted list of [ix, iy] pairs.'''
-        result: list[list[int]] = []
-        for item in value:
-            try:
-                ix, iy = int(item[0]), int(item[1])
-            except (TypeError, ValueError, IndexError) as exc:
-                raise SettingsValidationError(
-                    f"excluded cell {item!r} must be an [ix, iy] pair"
-                ) from exc
-            result.append([ix, iy])
-        return sorted(result)
-
     @field_validator("sloped_cells")
     @classmethod
     def _validate_sloped_cells(cls, value: list) -> list[list]:
+        '''Normalize the top-slope list to sorted [ix, iy, side, rise] quads.'''
+        result: list[list] = []
+        seen: set[tuple[int, int]] = set()
+        for item in value:
+            try:
+                ix, iy = int(item[0]), int(item[1])
+                side = str(item[2])
+                rise = int(item[3])
+            except (TypeError, ValueError, IndexError) as exc:
+                raise SettingsValidationError(
+                    f"sloped cell {item!r} must be an [ix, iy, side, rise] quadruplet"
+                ) from exc
+            if side not in SLOPE_SIDES:
+                raise SettingsValidationError(
+                    f"sloped cell side '{side}' must be one of "
+                    f"{', '.join(SLOPE_SIDES)}"
+                )
+            if not 1 <= rise <= MAX_SLOPE_RISE:
+                raise SettingsValidationError(
+                    f"sloped cell rise must be between 1 and {MAX_SLOPE_RISE}"
+                )
+            if (ix, iy) in seen:
+                raise SettingsValidationError(
+                    f"sloped cell [{ix}, {iy}] is listed twice"
+                )
+            seen.add((ix, iy))
+            result.append([ix, iy, side, rise])
+        return sorted(result)
+
+    @field_validator("chamfered_cells")
+    @classmethod
+    def _validate_chamfered_cells(cls, value: list) -> list[list]:
         '''Normalize the bottom-chamfer list to sorted [ix, iy, side] triplets.'''
         result: list[list] = []
         seen: set[tuple[int, int, str]] = set()
@@ -149,20 +218,61 @@ class BlockSettings(BaseModel):
                 triplet = (int(item[0]), int(item[1]), str(item[2]))
             except (TypeError, ValueError, IndexError) as exc:
                 raise SettingsValidationError(
-                    f"sloped cell {item!r} must be an [ix, iy, side] triplet"
+                    f"chamfered cell {item!r} must be an [ix, iy, side] triplet"
                 ) from exc
             if triplet[2] not in SLOPE_SIDES:
                 raise SettingsValidationError(
-                    f"sloped cell side '{triplet[2]}' must be one of "
+                    f"chamfered cell side '{triplet[2]}' must be one of "
                     f"{', '.join(SLOPE_SIDES)}"
                 )
             if triplet in seen:
                 raise SettingsValidationError(
-                    f"sloped cell {triplet[:2]} with side '{triplet[2]}' "
+                    f"chamfered cell {triplet[:2]} with side '{triplet[2]}' "
                     "is listed twice"
                 )
             seen.add(triplet)
             result.append([triplet[0], triplet[1], triplet[2]])
+        return sorted(result)
+
+    @field_validator("excluded_cells")
+    @classmethod
+    def _validate_excluded_cells(cls, value: list) -> list[list[int]]:
+        '''Normalize the exclusion mask to a sorted list of [ix, iy] pairs.'''
+        return cls._normalize_cell_pairs(value, "excluded cell")
+
+    @field_validator("flat_cells")
+    @classmethod
+    def _validate_flat_cells(cls, value: list) -> list[list[int]]:
+        '''Normalize the explicit no-stud list to sorted [ix, iy] pairs.'''
+        return cls._normalize_cell_pairs(value, "flat cell")
+
+    @field_validator("stud_cells")
+    @classmethod
+    def _validate_stud_cells(cls, value: list) -> list[list[int]]:
+        '''Normalize the explicit stud list to sorted [ix, iy] pairs.'''
+        return cls._normalize_cell_pairs(value, "stud cell")
+
+    @staticmethod
+    def _normalize_cell_pairs(value: list, label: str) -> list[list[int]]:
+        '''Normalize a raw cell list to sorted [ix, iy] integer pairs.
+
+        Duplicate cells are rejected so preset typos surface early.
+        '''
+        result: list[list[int]] = []
+        seen: set[tuple[int, int]] = set()
+        for item in value:
+            try:
+                ix, iy = int(item[0]), int(item[1])
+            except (TypeError, ValueError, IndexError) as exc:
+                raise SettingsValidationError(
+                    f"{label} {item!r} must be an [ix, iy] pair"
+                ) from exc
+            if (ix, iy) in seen:
+                raise SettingsValidationError(
+                    f"{label} [{ix}, {iy}] is listed twice"
+                )
+            seen.add((ix, iy))
+            result.append([ix, iy])
         return sorted(result)
 
     @property
@@ -177,28 +287,88 @@ class BlockSettings(BaseModel):
 
     @property
     def is_rectangular(self) -> bool:
-        '''True when the figure is the full rectangle (no exclusions/chamfers).'''
-        return not self.excluded_cells and not self.sloped_cells
+        '''True when the figure is the full rectangle (no per-cell features).'''
+        return not (
+            self.excluded_cells
+            or self.chamfered_cells
+            or self.sloped_cells
+        )
 
     @property
     def has_bottom_chamfers(self) -> bool:
         '''True when at least one cell has a chamfered bottom.'''
+        return bool(self.chamfered_cells)
+
+    @property
+    def has_sloped_tops(self) -> bool:
+        '''True when at least one cell has a sloped top wedge.'''
         return bool(self.sloped_cells)
+
+    @property
+    def max_slope_rise_units(self) -> int:
+        '''Largest per-cell slope rise in unit heights (0 when none).'''
+        return max((int(item[3]) for item in self.sloped_cells), default=0)
 
     @property
     def included_count(self) -> int:
         '''Number of cells present in the figure.'''
         return self.cells_x * self.cells_y - len(self.excluded_cells)
 
+    def cell_top(self, ix: int, iy: int) -> str:
+        '''Effective top feature of a cell: ``"stud"``, ``"flat"`` or ``"slope"``.
+
+        Sloped cells always win; explicit ``flat_cells``/``stud_cells``
+        override the ``pins_enabled`` default; excluded cells are not
+        material and report ``"flat"``.
+        '''
+        if (ix, iy) in self.slope_cell_set():
+            return "slope"
+        if (ix, iy) in self.flat_cell_set():
+            return "flat"
+        if (ix, iy) in self.stud_cell_set() or self.pins_enabled:
+            return "stud"
+        return "flat"
+
+    def slope_cell_set(self) -> set[tuple[int, int]]:
+        '''Set of (ix, iy) cells with a sloped top wedge.'''
+        return {(int(item[0]), int(item[1])) for item in self.sloped_cells}
+
+    def flat_cell_set(self) -> set[tuple[int, int]]:
+        '''Set of (ix, iy) cells explicitly without a stud.'''
+        return {(int(item[0]), int(item[1])) for item in self.flat_cells}
+
+    def stud_cell_set(self) -> set[tuple[int, int]]:
+        '''Set of (ix, iy) cells explicitly with a stud.'''
+        return {(int(item[0]), int(item[1])) for item in self.stud_cells}
+
+    def excluded_cell_set(self) -> set[tuple[int, int]]:
+        '''Set of (ix, iy) cells removed from the figure.'''
+        return {(int(item[0]), int(item[1])) for item in self.excluded_cells}
+
+    def stud_cells_all(self) -> set[tuple[int, int]]:
+        '''Set of (ix, iy) cells that carry a stud (default or explicit).'''
+        result: set[tuple[int, int]] = set()
+        excluded = self.excluded_cell_set()
+        sloped = self.slope_cell_set()
+        flat = self.flat_cell_set()
+        explicit = self.stud_cell_set()
+        for iy in range(self.cells_y):
+            for ix in range(self.cells_x):
+                if (ix, iy) in excluded or (ix, iy) in sloped or (ix, iy) in flat:
+                    continue
+                if (ix, iy) in explicit or self.pins_enabled:
+                    result.add((ix, iy))
+        return result
+
     @property
-    def slope_active(self) -> bool:
-        '''True when the sloped-top variant applies (no studs, rise > 0).'''
-        return not self.pins_enabled and self.slope_rise_units > 0
+    def has_studs(self) -> bool:
+        '''True when at least one cell carries a stud (default or explicit).'''
+        return bool(self.stud_cells_all())
 
     @property
     def slope_rise(self) -> float:
-        '''Absolute rise of the raised edge above the top face, mm.'''
-        return self.slope_rise_units * self.block_height
+        '''Absolute rise of the tallest slope edge above the top face, mm.'''
+        return self.max_slope_rise_units * self.block_height
 
     @model_validator(mode="after")
     def _validate_geometry(self) -> BlockSettings:
@@ -212,9 +382,9 @@ class BlockSettings(BaseModel):
                 "block_height must exceed wall_thickness "
                 "(top face keeps wall thickness)"
             )
-        if self.pins_enabled and self.pin_diameter >= self.unit_size:
+        if self.has_studs and self.pin_diameter >= self.unit_size:
             raise SettingsValidationError("pin_diameter must be smaller than unit_size")
-        if self.has_tubes and not self.slope_active:
+        if self.has_tubes:
             cavity_min = (
                 min(self.outer_length_x, self.outer_length_y)
                 - 2.0 * self.wall_thickness
@@ -223,41 +393,75 @@ class BlockSettings(BaseModel):
                 raise SettingsValidationError(
                     "tube_outer_diameter must fit inside the cavity"
                 )
-        seen: set[tuple[int, int]] = set()
-        for ix, iy in self.excluded_cells:
+        excluded = self.excluded_cell_set()
+        sloped = self.slope_cell_set()
+        flat = self.flat_cell_set()
+        stud = self.stud_cell_set()
+        for ix, iy in excluded:
             if not (0 <= ix < self.cells_x and 0 <= iy < self.cells_y):
                 raise SettingsValidationError(
                     f"excluded cell [{ix}, {iy}] is outside the {self.cells_x}x"
                     f"{self.cells_y} grid"
                 )
-            if (ix, iy) in seen:
+        self._check_cell_bounds(flat, "flat")
+        self._check_cell_bounds(stud, "stud")
+        for ix, iy in sloped | flat | stud:
+            if (ix, iy) in excluded:
                 raise SettingsValidationError(
-                    f"excluded cell [{ix}, {iy}] is listed twice"
+                    f"cell [{ix}, {iy}] cannot be both excluded and featured"
                 )
-            seen.add((ix, iy))
-        excluded_set = seen
+        conflict = flat & stud
+        if conflict:
+            ix, iy = min(conflict)
+            raise SettingsValidationError(
+                f"cell [{ix}, {iy}] cannot be both flat and stud"
+            )
+        conflict = sloped & flat
+        if conflict:
+            ix, iy = min(conflict)
+            raise SettingsValidationError(
+                f"cell [{ix}, {iy}] cannot be both sloped and flat"
+            )
+        conflict = sloped & stud
+        if conflict:
+            ix, iy = min(conflict)
+            raise SettingsValidationError(
+                f"cell [{ix}, {iy}] cannot be both sloped and stud: a wedge "
+                "top cannot carry a stud"
+            )
         side_offsets = {"+X": (1, 0), "-X": (-1, 0), "+Y": (0, 1), "-Y": (0, -1)}
-        for ix, iy, side in self.sloped_cells:
+        for ix, iy, side in self.chamfered_cells:
             if not (0 <= ix < self.cells_x and 0 <= iy < self.cells_y):
                 raise SettingsValidationError(
-                    f"sloped cell [{ix}, {iy}] is outside the {self.cells_x}x"
+                    f"chamfered cell [{ix}, {iy}] is outside the {self.cells_x}x"
                     f"{self.cells_y} grid"
                 )
-            if (ix, iy) in excluded_set:
+            if (ix, iy) in excluded:
                 raise SettingsValidationError(
-                    f"cell [{ix}, {iy}] cannot be both excluded and sloped"
+                    f"cell [{ix}, {iy}] cannot be both excluded and chamfered"
                 )
             dx, dy = side_offsets[side]
             nx, ny = ix + dx, iy + dy
             neighbor_out = not (0 <= nx < self.cells_x and 0 <= ny < self.cells_y)
-            if not neighbor_out and (nx, ny) not in excluded_set:
+            if not neighbor_out and (nx, ny) not in excluded:
                 raise SettingsValidationError(
-                    f"sloped cell [{ix}, {iy}] side '{side}' must look outward "
+                    f"chamfered cell [{ix}, {iy}] side '{side}' must look outward "
                     "(neighbor across it must be excluded or outside the grid)"
                 )
         if len(self.excluded_cells) >= self.cells_x * self.cells_y:
             raise SettingsValidationError("at least one cell must remain in the figure")
         return self
+
+    def _check_cell_bounds(
+        self, cells: set[tuple[int, int]], label: str
+    ) -> None:
+        '''Raise when an override cell sits outside the grid.'''
+        for ix, iy in cells:
+            if not (0 <= ix < self.cells_x and 0 <= iy < self.cells_y):
+                raise SettingsValidationError(
+                    f"{label} cell [{ix}, {iy}] is outside the {self.cells_x}x"
+                    f"{self.cells_y} grid"
+                )
 
     @property
     def outer_length_x(self) -> float:
@@ -271,10 +475,10 @@ class BlockSettings(BaseModel):
 
     @property
     def total_height(self) -> float:
-        '''Total height including studs or the raised slope edge, mm.'''
-        if self.pins_enabled:
-            return self.block_height + self.pin_height
-        return self.block_height + self.slope_rise
+        '''Total height: block height plus studs or the tallest slope, mm.'''
+        return self.block_height + max(
+            self.pin_height if self.has_studs else 0.0, self.slope_rise
+        )
 
     def describe(self) -> str:
         '''Human-readable form label, e.g. ``2x6``.'''

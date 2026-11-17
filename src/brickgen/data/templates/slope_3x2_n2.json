@@ -1,13 +1,49 @@
 {
   "schema": {
     "name": "brickgen-settings",
-    "version": 1
+    "version": 2
   },
   "template_name": "Slope 3x2, rise 2 (-X)",
   "cells_x": 3,
   "cells_y": 2,
   "pins_enabled": false,
   "tubes_enabled": false,
-  "slope_rise_units": 2,
-  "slope_side": "-X"
+  "sloped_cells": [
+    [
+      0,
+      0,
+      "-X",
+      2
+    ],
+    [
+      1,
+      0,
+      "-X",
+      2
+    ],
+    [
+      2,
+      0,
+      "-X",
+      2
+    ],
+    [
+      0,
+      1,
+      "-X",
+      2
+    ],
+    [
+      1,
+      1,
+      "-X",
+      2
+    ],
+    [
+      2,
+      1,
+      "-X",
+      2
+    ]
+  ]
 }

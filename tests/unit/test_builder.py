@@ -2,8 +2,8 @@
 File:   test_builder.py
 Brief:  Unit tests for the CadQuery block builder geometry.
 Author: Mistress-Lukutar
-Date:   2026-11-15
-Version: v0.3.0
+Date:   2026-11-17
+Version: v0.10.0
 '''
 
 from __future__ import annotations
