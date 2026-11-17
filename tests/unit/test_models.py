@@ -260,3 +260,67 @@ def test_v1_migration() -> None:
         {"cells_x": 2, "cells_y": 1, "sloped_cells": [[0, 0, "+X", 2]]}
     )
     assert kept.sloped_cells == [[0, 0, "+X", 2]]
+
+
+# ------------------------------------------------------------ recipe names
+def test_recipe_name_distinct_stud_modes() -> None:
+    '''Plain blocks with and without studs must never share a name.'''
+    assert BlockSettings(cells_x=2, cells_y=2).recipe_name() == "2x2-studs"
+    assert (
+        BlockSettings(cells_x=2, cells_y=2, pins_enabled=False).recipe_name()
+        == "2x2-studless"
+    )
+
+
+def test_recipe_name_encodes_cell_features() -> None:
+    '''Per-cell features appear with coordinates in a stable order.'''
+    slope = BlockSettings(cells_x=1, cells_y=2, sloped_cells=[[0, 1, "+Y", 1]])
+    assert slope.recipe_name() == "1x2-studs_sl0,1,+Y,1"
+
+    combo = BlockSettings(
+        cells_x=1,
+        cells_y=2,
+        sloped_cells=[[0, 0, "+Y", 1]],
+        chamfered_cells=[[0, 0, "-Y"]],
+    )
+    assert combo.recipe_name() == "1x2-studs_sl0,0,+Y,1_ch0,0,-Y"
+
+    excl = BlockSettings(
+        cells_x=2, cells_y=2, excluded_cells=[[1, 1], [0, 0]]
+    )
+    assert excl.recipe_name() == "2x2-studs_ex0,0;1,1"
+
+    round_cell = BlockSettings(cells_x=1, cells_y=1, round_cells=[[0, 0]])
+    assert round_cell.recipe_name() == "1x1-studs_rd0,0"
+
+    overrides = BlockSettings(
+        cells_x=2,
+        cells_y=1,
+        pins_enabled=False,
+        stud_cells=[[1, 0]],
+        flat_cells=[[0, 0]],
+    )
+    assert overrides.recipe_name() == "2x1-studless_fl0,0_st1,0"
+
+
+def test_recipe_name_tubes_and_dimensions() -> None:
+    '''Tube state and non-default millimeter dimensions are encoded.'''
+    assert (
+        BlockSettings(cells_x=2, cells_y=2, tubes_enabled=False).recipe_name()
+        == "2x2-studs-notubes"
+    )
+    # 1-wide blocks never carry tubes: no token even when disabled
+    assert (
+        BlockSettings(cells_x=1, cells_y=4, tubes_enabled=False).recipe_name()
+        == "1x4-studs"
+    )
+    tall = BlockSettings(cells_x=2, cells_y=2, block_height=6.0)
+    assert tall.recipe_name() == "2x2-studs_h6"
+    exotic = BlockSettings(
+        cells_x=2,
+        cells_y=2,
+        unit_size=5.6,
+        block_height=4.5,
+        tube_inner_diameter=2.0,
+    )
+    assert exotic.recipe_name() == "2x2-studs_u5.6_h4.5_tb2"

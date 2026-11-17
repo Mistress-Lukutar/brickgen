@@ -261,12 +261,16 @@ class TemplateLibraryPanel(QWidget):
             logger.warning("Thumbnail VTK render failed for %s", name)
 
     def _on_save_template(self) -> None:
-        '''Ask for a name and save the current form settings as a template.'''
+        '''Ask for a name and save the current form settings as a template.
+
+        The recipe name is pre-filled, so templates of different blocks
+        stay distinguishable by default.
+        '''
         name, ok = QInputDialog.getText(
             self,
             "Save as template",
             "Template name:",
-            text=f"Block {self._get_current_settings().describe()}",
+            text=self._get_current_settings().recipe_name(),
         )
         if not ok or not name.strip():
             return

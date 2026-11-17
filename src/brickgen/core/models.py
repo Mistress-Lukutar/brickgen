@@ -21,6 +21,33 @@ MAX_SLOPE_RISE = 16  # sanity limit for the slope rise in unit heights
 SlopeSide = Literal["+X", "-X", "+Y", "-Y"]
 SLOPE_SIDES: tuple[str, ...] = ("+X", "-X", "+Y", "-Y")
 
+# Millimeter dimensions encoded into recipe_name() as ``token + value``
+# when they deviate from the factory default (token, field name).
+_RECIPE_MM_FIELDS: tuple[tuple[str, str], ...] = (
+    ("u", "unit_size"),
+    ("w", "wall_thickness"),
+    ("h", "block_height"),
+    ("pd", "pin_diameter"),
+    ("ph", "pin_height"),
+)
+
+
+def _cell_entries(prefix: str, cells: list[list]) -> str:
+    '''Encode a per-cell group as ``prefix`` plus ``;``-joined entries.
+
+    Each entry is its comma-separated cell record (e.g. ``ix,iy`` or
+    ``ix,iy,side,rise``); the validators keep the lists sorted, so the
+    encoding is deterministic.
+
+    Args:
+        prefix: Short group tag (``ex``/``fl``/``st``/``sl``/``ch``/``rd``).
+        cells: The cell records to encode.
+
+    Returns:
+        The group token, e.g. ``ex0,1;2,1``.
+    '''
+    return prefix + ";".join(",".join(str(v) for v in cell) for cell in cells)
+
 
 def validate_settings(values: dict[str, object]) -> BlockSettings:
     '''Validate raw values into BlockSettings, mapping pydantic errors to ours.
@@ -527,6 +554,58 @@ class BlockSettings(BaseModel):
     def describe(self) -> str:
         '''Human-readable form label, e.g. ``2x6``.'''
         return f"{self.cells_x}x{self.cells_y}"
+
+    def recipe_name(self) -> str:
+        '''Compact export-file stem encoding the full geometry recipe.
+
+        The name keeps blocks that would otherwise silently overwrite each
+        other apart (``2x2-studs`` vs ``2x2-studless``): dimensions, top
+        type, tube state, every per-cell feature with its coordinates and
+        sides, and any millimeter dimension deviating from the factory
+        defaults. Tokens that carry no geometry (e.g. the tube bore of a
+        tube-less block) are omitted, so common names stay short:
+
+        - ``2x2-studs`` / ``2x2-studless`` - plain blocks;
+        - ``1x2-studs_sl0,1,+Y,1`` - the top-slope showcase brick;
+        - ``2x4-studs_ex0,1;2,1_h4.5`` - exclusions and a taller block.
+
+        All characters are file-name safe on Windows.
+
+        Returns:
+            The deterministic file stem for this recipe.
+        '''
+        head: list[str] = [
+            self.describe(),
+            "studs" if self.pins_enabled else "studless",
+        ]
+        if not self.tubes_enabled and self.cells_x >= 2 and self.cells_y >= 2:
+            head.append("notubes")
+        tail: list[str] = []
+        for token, field in _RECIPE_MM_FIELDS:
+            default = BlockSettings.model_fields[field].default
+            value = getattr(self, field)
+            if value != default:
+                tail.append(f"{token}{value:g}")
+        if self.has_tubes:
+            tb_default = BlockSettings.model_fields["tube_inner_diameter"].default
+            if self.tube_inner_diameter != tb_default:
+                tail.append(f"tb{self.tube_inner_diameter:g}")
+        if self.excluded_cells:
+            tail.append(_cell_entries("ex", self.excluded_cells))
+        if self.flat_cells:
+            tail.append(_cell_entries("fl", self.flat_cells))
+        if self.stud_cells:
+            tail.append(_cell_entries("st", self.stud_cells))
+        if self.sloped_cells:
+            tail.append(_cell_entries("sl", self.sloped_cells))
+        if self.chamfered_cells:
+            tail.append(_cell_entries("ch", self.chamfered_cells))
+        if self.round_cells:
+            tail.append(_cell_entries("rd", self.round_cells))
+        name = "-".join(head)
+        if tail:
+            name += "_" + "_".join(tail)
+        return name
 
 
 __all__ = ["BlockSettings", "validate_settings", "SlopeSide", "SLOPE_SIDES"]

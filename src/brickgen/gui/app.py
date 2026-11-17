@@ -817,7 +817,7 @@ class MainWindow(QMainWindow):
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export model",
-            f"block_{self._settings.describe()}.{default_format.lower()}",
+            f"{self._settings.recipe_name()}.{default_format.lower()}",
             ";;".join(f"{fmt} (*.{fmt.lower()})" for fmt in formats)
             + ";;All files (*.*)",
             default_filter,
@@ -840,9 +840,16 @@ class MainWindow(QMainWindow):
         self._export_meta[job_id] = path
 
     def _on_save_settings(self) -> None:
-        '''Persist current form values into a JSON preset.'''
+        '''Persist current form values into a JSON preset.
+
+        The default file name is the generated recipe stem, so presets of
+        different blocks do not overwrite each other either.
+        '''
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save settings", "brickgen_settings.json", _SETTINGS_FILETYPES
+            self,
+            "Save settings",
+            f"{self._settings.recipe_name()}.json",
+            _SETTINGS_FILETYPES,
         )
         if not path:
             return

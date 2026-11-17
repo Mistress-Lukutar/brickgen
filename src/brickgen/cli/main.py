@@ -178,7 +178,7 @@ def generate(
         typer.secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     typer.secho(
-        f"Generated {settings.describe()} block -> {written}",
+        f"Generated {settings.recipe_name()} -> {written}",
         fg=typer.colors.GREEN,
     )
 
