@@ -301,13 +301,17 @@ class PreviewWidget(QtInteractor):
         '''Update the preview with a pre-tessellated mesh.
 
         Stores the mesh, resets edge data, enables SSAO, rebuilds actors,
-        refreshes the grid, and positions the camera.  All VTK-side work only —
-        no OCC tessellation is performed here.
+        and refreshes the grid.  All VTK-side work only — no OCC
+        tessellation is performed here.  The user's camera is kept across
+        updates: only the first display frames the scene.  VTK re-tightens
+        the clipping range on every render, so a grown block stays visible
+        from the kept viewpoint.
 
         Args:
             mesh: Pre-tessellated PolyData (e.g. from :func:`build_preview_mesh`).
             settings: BlockSettings used for SSAO radius calculation.
         '''
+        camera_position = None if self._mesh is None else self.camera_position
         self._mesh = mesh
         self._edge_mesh = None
         try:
@@ -316,7 +320,11 @@ class PreviewWidget(QtInteractor):
             logger.warning("SSAO unavailable in this environment", exc_info=True)
         self._rebuild_actors()
         self._update_grid()
-        self.reset_camera()
+        if camera_position is not None:
+            self.camera_position = camera_position
+            self.camera_set = True
+        else:
+            self.reset_camera()
         logger.debug(
             "Preview mesh: %d points / %d cells",
             self._mesh.n_points,
