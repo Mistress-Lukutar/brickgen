@@ -65,9 +65,11 @@ class BlockSettings(BaseModel):
       look outward (neighbor across it excluded or outside the grid). The
       chamfer makes the cell solid, so a sloped+chamfered cell has no
       bottom opening either.
-    - ``round cell`` - the square base is replaced by the inscribed circle
-      (cylinder) with a concentric round bottom hole inset by the wall
-      thickness. Round cells never fuse their hole with neighbors and
+    - ``round cell`` - the square base keeps its straight edges wherever a
+      material neighbor joins (adjacent round cells form the classic
+      stadium profile) and rounds its free corners with the inscribed
+      circle. The bottom hole is concentric and round, inset by the wall
+      thickness, and never fuses with neighboring cavities. A round cell
       cannot carry a slope or a chamfer.
     - ``excluded cell`` - removed from the figure entirely.
 
@@ -99,8 +101,9 @@ class BlockSettings(BaseModel):
         chamfered_cells: ``[ix, iy, side]`` triplets for cells whose bottom
             is chamfered (solid wedge, no cavity opening). A cell may be
             chamfered on several sides; combined freely with any top.
-        round_cells: ``[ix, iy]`` cells whose square base is replaced by the
-            inscribed cylinder with a round bottom hole.
+        round_cells: ``[ix, iy]`` cells whose base keeps straight edges only
+            toward material neighbors (free corners follow the inscribed
+            circle) with a concentric round bottom hole.
     '''
 
     cells_x: int = Field(default=1, ge=1, le=MAX_CELLS)

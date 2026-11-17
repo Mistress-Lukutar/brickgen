@@ -116,10 +116,11 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
     rises from the full height at the inner face to the top edge at the
     outward face. Sloped cells are trapezoid prisms that keep the standard
     cavity: the wedge sits on the shared top slab, so the bottom opening
-    looks the same as on plain cells. Round cells replace the square base
-    with the inscribed cylinder and carry their own concentric round hole;
-    the hole never fuses with neighbors, so square cavities keep a wall
-    strip toward round cells.
+    looks the same as on plain cells. Round cells keep the square base
+    where material neighbors join and round their free corners with the
+    inscribed circle (adjacent round cells form the stadium profile);
+    each carries its own concentric round hole that never fuses with
+    neighboring cavities.
 
     Args:
         settings: Validated parametric block description.
@@ -141,13 +142,13 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
         (int(item[0]), int(item[1])): (str(item[2]), int(item[3]))
         for item in settings.sloped_cells
     }
-    # For cavity-side decisions a chamfered (solid wedge) or round neighbor
-    # counts as boundary: chamfered cells have no cavity of their own, and
-    # a round cell's concentric hole recedes from the shared edge, so a
-    # wall strip is required; otherwise the bottom opening would extend
-    # under/behind them (too wide). Sloped cells keep a normal cavity and
-    # fuse with adjacent ones.
-    cavity_neighbors = material - chamfered - round_cells
+    # For cavity-side decisions only a chamfered neighbor counts as
+    # boundary: it is a solid wedge with no cavity of its own, so a wall
+    # strip is required between the square cavity and its body. Sloped
+    # and round cells keep material right up to their (straight) shared
+    # edges - a round hole merely recedes behind its own t wall - so
+    # square cavities may open toward them like toward plain cells.
+    cavity_neighbors = material - chamfered
 
     cells: list[cq.Workplane] = []
     cavities: list[cq.Workplane] = []
@@ -155,7 +156,7 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
         x0 = ix * unit - half_x
         y0 = iy * unit - half_y
         if (ix, iy) in round_cells:
-            cells.append(_round_cell_solid(settings, ix, iy))
+            cells.append(_round_cell_solid(settings, ix, iy, material))
         elif (ix, iy) in sloped:
             side, rise_units = slope_by_cell[(ix, iy)]
             cells.append(_slope_cell_solid(settings, ix, iy, side, rise_units))
@@ -171,9 +172,9 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
             cavities.append(_round_cell_hole(settings, ix, iy))
             continue
         # Cavity box: inset t only on sides facing the region boundary or a
-        # cell without a fusable cavity (chamfered/round); sides shared with
-        # a normal or sloped material neighbor stay open so the cavities of
-        # adjacent cells fuse into a single contour-shaped cavity.
+        # solid (chamfered) cell; sides shared with a material neighbor that
+        # keeps its cavity (plain, sloped or round) stay open so adjacent
+        # cavities fuse into a single contour-shaped cavity.
         inset_x0 = t if (ix - 1, iy) not in cavity_neighbors else 0.0
         inset_x1 = t if (ix + 1, iy) not in cavity_neighbors else 0.0
         inset_y0 = t if (ix, iy - 1) not in cavity_neighbors else 0.0
@@ -344,35 +345,64 @@ def _cell_center(settings: BlockSettings, ix: int, iy: int) -> tuple[float, floa
     )
 
 
-# Radial bulge of the round cell cylinder over the exact inscribed circle.
-# Adjacent round cells (or a cylinder and a neighboring box) touch the
-# shared cell edge along a single tangent line, which OCC refuses to fuse
-# into one solid; the tiny overlap makes the union robust while staying
-# visually identical to the inscribed circle.
-ROUND_CELL_OVERSHOOT = 0.05
+def _round_cell_solid(
+    settings: BlockSettings, ix: int, iy: int, material: set[tuple[int, int]]
+) -> cq.Workplane:
+    '''Square cell whose free corners are rounded by the inscribed circle.
 
-
-def _round_cell_solid(settings: BlockSettings, ix: int, iy: int) -> cq.Workplane:
-    '''Cylinder replacing the square base of a round cell.
-
-    The cylinder is inscribed in the cell footprint (diameter
-    ``unit_size``) plus :data:`ROUND_CELL_OVERSHOOT` so neighboring cells
-    fuse, and spans the full block height.
+    The base shape is the square cell; a corner is replaced by the
+    inscribed-circle quarter arc (between the midpoints of the adjacent
+    edges) only when BOTH of its edges face no material neighbor. Edges
+    joined to any material cell stay straight and full-length, so adjacent
+    round cells merge with a straight seam (the classic stadium profile)
+    and a round cell next to a square one joins flush.
 
     Args:
         settings: Validated parametric block description.
         ix: Cell index along X.
         iy: Cell index along Y.
+        material: Set of (ix, iy) cells present in the figure.
 
     Returns:
         The round cell solid, centered in the cell footprint.
     '''
+    unit = settings.unit_size
+    height = settings.block_height
+    half = unit / 2.0
     cx, cy = _cell_center(settings, ix, iy)
-    return (
-        cq.Workplane("XY", origin=(cx, cy, 0))
-        .circle(settings.unit_size / 2.0 + ROUND_CELL_OVERSHOOT)
-        .extrude(settings.block_height)
+    shape = cq.Workplane("XY", origin=(cx, cy, 0)).circle(half).extrude(height)
+    connected = {
+        "+X": (ix + 1, iy) in material,
+        "-X": (ix - 1, iy) in material,
+        "+Y": (ix, iy + 1) in material,
+        "-Y": (ix, iy - 1) in material,
+    }
+    # A straight edge contributes a strip from the cell center to the edge;
+    # the union of circle and strips yields square corners exactly at the
+    # joined edges and inscribed-circle arcs elsewhere.
+    strips: list[tuple[float, float, float, float]] = []
+    if connected["+X"]:
+        strips.append((cx + half / 2.0, cy, half, unit))
+    if connected["-X"]:
+        strips.append((cx - half / 2.0, cy, half, unit))
+    if connected["+Y"]:
+        strips.append((cx, cy + half / 2.0, unit, half))
+    if connected["-Y"]:
+        strips.append((cx, cy - half / 2.0, unit, half))
+    if not strips:
+        return shape
+    fused = _fuse_all(
+        _shape_of(shape),
+        [
+            _shape_of(
+                cq.Workplane("XY", origin=(sx, sy, 0)).box(
+                    w, d, height, centered=(True, True, False)
+                )
+            )
+            for sx, sy, w, d in strips
+        ],
     )
+    return cq.Workplane("XY").newObject([fused])
 
 
 def _round_cell_hole(settings: BlockSettings, ix: int, iy: int) -> cq.Workplane:

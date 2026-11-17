@@ -8,10 +8,11 @@ Version: v0.10.0
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 _CELL_PX = 26  # rendered cell size
@@ -73,9 +74,11 @@ class CellGridEditor(QWidget):
     selected cell - exclusion, top stud, top slope, round base, bottom
     chamfer - are edited through :meth:`set_state` by the inspector panel
     in the main window. Cell colors: blue = included, gray = excluded,
-    orange = bottom chamfer. Round cells render as circles. Icons: white
-    dot = stud, dark wedge = slope (full edge marks the raised side),
-    black arrow = chamfer direction.
+    orange = bottom chamfer. Round cells render with inscribed-circle arcs
+    at their free corners and straight edges toward material neighbors
+    (matching the built solid). Icons: white dot = stud, dark wedge =
+    slope (full edge marks the raised side), black arrow = chamfer
+    direction.
     '''
 
     # Emitted after any cell state change.
@@ -198,6 +201,64 @@ class CellGridEditor(QWidget):
             if not inside or neighbor_excluded:
                 result.append(side)
         return result
+
+    def _material_neighbor(self, ix: int, iy: int) -> bool:
+        '''True when the neighbor cell exists and is not excluded.'''
+        if not (0 <= ix < self._cols and 0 <= iy < self._rows):
+            return False
+        return not self._states.get((ix, iy), CellState()).excluded
+
+    def _round_path(self, ix: int, iy: int, rect: QRectF) -> QPainterPath:
+        '''Outline of a round cell: inscribed-circle arcs at free corners,
+        straight edges toward material neighbors (stadium junctions).
+
+        A corner is rounded only when both of its edges face no material
+        neighbor - the same rule the solid builder applies.
+
+        Args:
+            ix: Cell index along X.
+            iy: Cell index along Y.
+            rect: Pixel rect of the cell.
+
+        Returns:
+            Closed painter path of the cell silhouette.
+        '''
+        connected = {
+            "+X": self._material_neighbor(ix + 1, iy),
+            "-X": self._material_neighbor(ix - 1, iy),
+            "+Y": self._material_neighbor(ix, iy + 1),
+            "-Y": self._material_neighbor(ix, iy - 1),
+        }
+        # Corner order walks the outline counter-clockwise: top-right,
+        # top-left, bottom-left, bottom-right (Qt arc angles: 0 deg at 3
+        # o'clock, positive counter-clockwise).
+        spans = [
+            (0.0, not (connected["+X"] or connected["+Y"]),
+             QPointF(rect.right(), rect.top())),
+            (90.0, not (connected["-X"] or connected["+Y"]),
+             QPointF(rect.left(), rect.top())),
+            (180.0, not (connected["-X"] or connected["-Y"]),
+             QPointF(rect.left(), rect.bottom())),
+            (270.0, not (connected["+X"] or connected["-Y"]),
+             QPointF(rect.right(), rect.bottom())),
+        ]
+
+        def _at(angle: float) -> QPointF:
+            rad = math.radians(angle)
+            return QPointF(
+                rect.center().x() + rect.width() / 2.0 * math.cos(rad),
+                rect.center().y() - rect.height() / 2.0 * math.sin(rad),
+            )
+
+        path = QPainterPath()
+        path.moveTo(_at(0.0))
+        for start, rounded, corner_pt in spans:
+            if rounded:
+                path.arcTo(rect, start, 90.0)
+            else:
+                path.lineTo(corner_pt)
+                path.lineTo(_at(start + 90.0))
+        return path
 
     # ------------------------------------------------- model list exporting
     def excluded_cells(self) -> list[list[int]]:
@@ -356,8 +417,9 @@ class CellGridEditor(QWidget):
                         painter.setBrush(_FILL_INCLUDED)
                     painter.setPen(QPen(_EDGE_COLOR, 1))
                     if state.round and not state.excluded:
-                        # round base: the inscribed circle replaces the square
-                        painter.drawEllipse(rect.adjusted(1.0, 1.0, -1.0, -1.0))
+                        # round base: free corners follow the inscribed circle
+                        fill_rect = rect.adjusted(1.0, 1.0, -1.0, -1.0)
+                        painter.drawPath(self._round_path(ix, iy, fill_rect))
                     else:
                         painter.drawRect(rect)
                     if state.excluded:
@@ -369,7 +431,7 @@ class CellGridEditor(QWidget):
                     if state.chamfer is not None:
                         self._draw_arrow(painter, rect, state.chamfer)
                     if self._selected == (ix, iy):
-                        self._draw_selection(painter, rect, state.round)
+                        self._draw_selection(painter, ix, iy, rect, state.round)
         finally:
             painter.end()
 
@@ -421,16 +483,21 @@ class CellGridEditor(QWidget):
         painter.drawPolygon(QPolygonF([tip, left, right]))
 
     def _draw_selection(
-        self, painter: QPainter, rect: QRectF, round_shape: bool
+        self,
+        painter: QPainter,
+        ix: int,
+        iy: int,
+        rect: QRectF,
+        round_shape: bool,
     ) -> None:
         '''Draw the red outline around the selected cell.
 
-        Round cells get a circular outline matching their base shape.
+        Round cells get an outline matching their rounded silhouette.
         '''
         painter.setPen(QPen(_SELECTION_COLOR, 2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         if round_shape:
-            painter.drawEllipse(rect)
+            painter.drawPath(self._round_path(ix, iy, rect))
         else:
             painter.drawRect(rect.adjusted(1.0, 1.0, -1.0, -1.0))
 

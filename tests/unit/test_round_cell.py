@@ -1,9 +1,9 @@
 '''
 File:   test_round_cell.py
-Brief:  Unit tests for round-base cells (inscribed cylinders with round holes).
+Brief:  Unit tests for round-base cells (free corners on the inscribed circle).
 Author: Mistress-Lukutar
 Date:   2026-11-17
-Version: v0.1.0
+Version: v0.2.0
 '''
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import math
 import cadquery as cq
 import pytest
 
-from brickgen.core.builder import ROUND_CELL_OVERSHOOT, build_block
+from brickgen.core.builder import build_block
 from brickgen.core.models import BlockSettings
 
 
@@ -22,30 +22,36 @@ def _material_at(solid: cq.Shape, point: tuple[float, float, float]) -> bool:
     return solid.isInside(cq.Vector(*point))
 
 
-def _round_volumes(settings: BlockSettings) -> tuple[float, float]:
-    '''Outer and hole volumes of one round cell, mm^3.
+def _circle_area(settings: BlockSettings) -> float:
+    '''Area of the inscribed circle of one cell, mm^2.'''
+    return math.pi * (settings.unit_size / 2.0) ** 2
 
-    The outer cylinder carries ROUND_CELL_OVERSHOOT so neighboring cells
-    fuse; the hole is the inscribed circle inset by the wall thickness.
-    '''
-    r_out = settings.unit_size / 2.0 + ROUND_CELL_OVERSHOOT
+
+def _hole_volume(settings: BlockSettings) -> float:
+    '''Volume of one round cell's concentric bottom hole, mm^3.'''
     r_in = settings.unit_size / 2.0 - settings.wall_thickness
-    h = settings.block_height
-    t = settings.wall_thickness
-    return math.pi * r_out**2 * h, math.pi * r_in**2 * (h - t)
+    return math.pi * r_in**2 * (settings.block_height - settings.wall_thickness)
+
+
+def _stud_volume(settings: BlockSettings) -> float:
+    '''Volume of one top stud, mm^3.'''
+    return (
+        math.pi
+        * (settings.pin_diameter / 2.0) ** 2
+        * settings.pin_height
+    )
 
 
 def test_round_cell_volume() -> None:
-    '''A 1x1 round block: cylinder shell minus the round hole plus a stud.'''
+    '''An isolated 1x1 round cell is the plain inscribed cylinder.'''
     settings = BlockSettings(cells_x=1, cells_y=1, round_cells=[[0, 0]])
     solid = build_block(settings).val()
-    outer, hole = _round_volumes(settings)
-    stud = math.pi * (settings.pin_diameter / 2.0) ** 2 * settings.pin_height
-    assert solid.Volume() == pytest.approx(outer - hole + stud, rel=1e-3)
+    expected = _circle_area(settings) * settings.block_height
+    expected -= _hole_volume(settings)
+    expected += _stud_volume(settings)
+    assert solid.Volume() == pytest.approx(expected, rel=1e-3)
     bb = solid.BoundingBox()
-    assert bb.xlen == pytest.approx(
-        settings.unit_size + 2 * ROUND_CELL_OVERSHOOT, abs=1e-3
-    )
+    assert bb.xlen == pytest.approx(settings.unit_size, abs=1e-4)
     assert bb.zmax == pytest.approx(settings.total_height, abs=1e-4)
     assert len(build_block(settings).solids().vals()) == 1
 
@@ -66,36 +72,61 @@ def test_round_cell_hole_is_round() -> None:
     assert _material_at(solid, (0.0, 0.0, settings.block_height - t / 2.0))
 
 
-def test_adjacent_round_cells_keep_own_holes() -> None:
-    '''Round holes never fuse: a wall remains at the shared cell edge.
+def test_two_round_cells_form_stadium() -> None:
+    '''Adjacent round cells keep a straight seam: the classic stadium.
 
-    Tangent cylinders get a tiny radial overlap (ROUND_CELL_OVERSHOOT) so
-    OCC fuses the outer bodies into a single solid.
+    The junction edge stays square on both cells, the free outer corners
+    follow the inscribed circle: silhouette = two half-caps + a rectangle.
     '''
     settings = BlockSettings(cells_x=2, cells_y=1, round_cells=[[0, 0], [1, 0]])
     solid = build_block(settings).val()
     assert len(build_block(settings).solids().vals()) == 1
-    # shared edge midpoint: outside both holes, inside the wall material
+    u = settings.unit_size
+    h = settings.block_height
+    # stadium cross-section: one full circle + the u x u junction rectangle
+    expected = (_circle_area(settings) + u * u) * h
+    expected -= 2 * _hole_volume(settings)
+    expected += 2 * _stud_volume(settings)
+    assert solid.Volume() == pytest.approx(expected, rel=1e-3)
+    # the shared edge midpoint: wall material between the two holes
     assert _material_at(solid, (0.0, 0.0, 0.3))
     # each hole is a void at its own center
     assert not _material_at(solid, (-2.0, 0.0, 0.3))
     assert not _material_at(solid, (2.0, 0.0, 0.3))
-    outer, hole = _round_volumes(settings)
-    stud = math.pi * (settings.pin_diameter / 2.0) ** 2 * settings.pin_height
-    assert solid.Volume() == pytest.approx(2 * (outer - hole) + 2 * stud, rel=1e-2)
+    # straight side beyond the circle radius (the junction strips)
+    assert _material_at(solid, (-1.0, 1.9, 0.3))
+    assert _material_at(solid, (1.0, -1.9, 0.3))
+    # free outer corners are rounded away
+    assert not _material_at(solid, (-3.9, -1.9, 0.3))
+    assert not _material_at(solid, (3.9, 1.9, 0.3))
 
 
 def test_round_cell_next_to_square_cell() -> None:
-    '''A square neighbor keeps a wall strip toward the round cell's recess.'''
+    '''A round cell joins a square neighbor flush (flat junction side).'''
     settings = BlockSettings(cells_x=2, cells_y=1, round_cells=[[0, 0]])
     solid = build_block(settings).val()
     assert len(build_block(settings).solids().vals()) == 1
-    # square cell cavity is inset t on the side facing the round cell
-    assert _material_at(solid, (0.4, 0.0, 0.3))
-    # and the square cavity is open toward the far (boundary) wall
-    assert not _material_at(solid, (2.0, 0.0, 0.3))
-    # the round cell hole is void at its center
+    u = settings.unit_size
+    h = settings.block_height
+    t = settings.wall_thickness
+    # round cell silhouette: "D" = circle + strip toward the square neighbor
+    d_area = _circle_area(settings) / 2.0 + u * u / 2.0
+    # the square cell's cavity opens toward the round cell: inset only on
+    # its boundary sides (x1, y0, y1)
+    square_cavity = (u - t) * (u - 2 * t) * (h - t)
+    expected = d_area * h
+    expected -= _hole_volume(settings)
+    expected += u * u * h - square_cavity
+    expected += 2 * _stud_volume(settings)
+    assert solid.Volume() == pytest.approx(expected, rel=1e-3)
+    # wall between the square cavity and the round hole (round cell side)
+    assert _material_at(solid, (-0.4, 0.0, 0.3))
+    # the square cavity reaches the shared plane (open side)
+    assert not _material_at(solid, (0.4, 0.0, 0.3))
+    # the round cell hole is a void at its center
     assert not _material_at(solid, (-2.0, 0.0, 0.3))
+    # the straight junction side extends beyond the circle (the strip)
+    assert _material_at(solid, (-1.0, 1.9, 0.3))
 
 
 def test_round_cells_do_not_generate_ribs() -> None:
