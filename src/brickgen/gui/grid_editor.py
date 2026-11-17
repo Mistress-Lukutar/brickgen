@@ -318,10 +318,14 @@ class CellGridEditor(QWidget):
         return QRectF(x, y, _CELL_PX, _CELL_PX)
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        '''Draw the grid cells with their feature states.'''
+        '''Draw the grid cells with their feature states.
+
+        Pen and brush are set explicitly for every cell: the icon and
+        selection helpers below switch them, and leaked painter state
+        would tint the borders of every cell drawn after the changed one.
+        '''
         painter = QPainter(self)
         try:
-            painter.setPen(QPen(_EDGE_COLOR, 1))
             for iy in range(self._rows):
                 for ix in range(self._cols):
                     state = self._states.get((ix, iy), CellState())
@@ -332,6 +336,7 @@ class CellGridEditor(QWidget):
                         painter.setBrush(_FILL_CHAMFERED)
                     else:
                         painter.setBrush(_FILL_INCLUDED)
+                    painter.setPen(QPen(_EDGE_COLOR, 1))
                     painter.drawRect(rect)
                     if state.excluded:
                         continue
