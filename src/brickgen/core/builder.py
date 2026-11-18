@@ -106,10 +106,11 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
 
     The figure variant follows the reference parts: the cavity is one piece
     shaped like the included region (perimeter walls step around excluded
-    cells, no internal partition walls), and every concave corner of the
-    region carries an inward quarter-round rib instead of a tube. Tubes do
-    not apply in this variant; studs sit only on cells whose effective top
-    is ``stud`` (see :meth:`BlockSettings.cell_top`).
+    cells, no internal partition walls). Every concave corner of the region
+    carries an inward quarter-round rib; lattice vertices whose four cells
+    all keep a cavity carry a reinforcement tube when ``has_tubes``. Studs
+    sit only on cells whose effective top is ``stud`` (see
+    :meth:`BlockSettings.cell_top`).
 
     Chamfered cells are solid wedges: their cavity box is omitted and a
     triangular prism is cut away below the sloped underside plane, which
@@ -118,9 +119,10 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
     cavity: the wedge sits on the shared top slab, so the bottom opening
     looks the same as on plain cells. Round cells keep the square base
     where material neighbors join and round their free corners with the
-    inscribed circle (adjacent round cells form the stadium profile);
-    each carries its own concentric round hole that never fuses with
-    neighboring cavities.
+    inscribed circle (adjacent round cells form the stadium profile); the
+    bottom cavity is the concentric inscribed bore, joined by strips to
+    every neighboring cavity so round and square voids merge into one
+    contour-shaped cavity without partition walls.
 
     Args:
         settings: Validated parametric block description.
@@ -146,8 +148,9 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
     # boundary: it is a solid wedge with no cavity of its own, so a wall
     # strip is required between the square cavity and its body. Sloped
     # and round cells keep material right up to their (straight) shared
-    # edges - a round hole merely recedes behind its own t wall - so
-    # square cavities may open toward them like toward plain cells.
+    # edges, and a round hole opens toward cavity neighbors through a
+    # fused strip, so square cavities may open toward them like toward
+    # plain cells.
     cavity_neighbors = material - chamfered
 
     cells: list[cq.Workplane] = []
@@ -169,7 +172,7 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
         if (ix, iy) in chamfered:
             continue  # solid wedge: no cavity opening in chamfered cells
         if (ix, iy) in round_cells:
-            cavities.append(_round_cell_hole(settings, ix, iy))
+            cavities.append(_round_cell_hole(settings, ix, iy, cavity_neighbors))
             continue
         # Cavity box: inset t only on sides facing the region boundary or a
         # solid (chamfered) cell; sides shared with a material neighbor that
@@ -191,6 +194,11 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
         )
         cavities.append(cell_cavity)
 
+    # Fill boxes open the cavity across lattice vertices where four
+    # cavity-keeping cells meet (round holes and strips stop short of
+    # the vertex and would leave a material pillar inside the void).
+    cavities.extend(_round_vertex_cavities(settings, cavity_neighbors))
+
     # Fuse all cells into one outer shape in a single boolean operation.
     if len(cells) == 1:
         outer_shape = _shape_of(cells[0])
@@ -208,6 +216,11 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
     if ribs:
         fused = _fuse_all(_shape_of(solid), [_shape_of(rib) for rib in ribs])
         solid = cq.Workplane("XY").newObject([_as_single_solid(fused)])
+
+    # Reinforcement tubes at lattice vertices whose four cells all keep a
+    # cavity (the flat-variant rule, restricted to the cavity region).
+    if settings.has_tubes:
+        solid = _fuse_tubes(solid, settings, _tube_centers(settings, cavity_neighbors))
 
     solid = _fuse_pins(solid, settings)
 
@@ -405,39 +418,133 @@ def _round_cell_solid(
     return cq.Workplane("XY").newObject([fused])
 
 
-def _round_cell_hole(settings: BlockSettings, ix: int, iy: int) -> cq.Workplane:
-    '''Concentric round bottom hole of a round cell.
+def _round_cell_hole(
+    settings: BlockSettings,
+    ix: int,
+    iy: int,
+    cavity_neighbors: set[tuple[int, int]],
+) -> cq.Workplane:
+    '''Round bottom cavity of a round cell, fused with neighboring cavities.
 
-    The bore diameter is ``unit_size - 2 x wall_thickness`` (the inscribed
-    circle inset by the wall thickness) and the ceiling sits at
-    ``block_height - wall_thickness``, open from below.
+    The bore is the inscribed circle inset by the wall thickness (radius
+    ``unit_size / 2 - wall_thickness``); toward every neighbor that keeps a
+    cavity (round bore or square cell cavity) a strip of the same width
+    runs from the cell center to the shared edge, so adjacent voids merge
+    into one contour-shaped cavity without partition walls. The ceiling
+    sits at ``block_height - wall_thickness``, open from below.
 
     Args:
         settings: Validated parametric block description.
         ix: Cell index along X.
         iy: Cell index along Y.
+        cavity_neighbors: Material cells that keep a bottom cavity.
 
     Returns:
         The hole cutter solid, spanning the cell height minus the top slab.
     '''
+    half = settings.unit_size / 2.0
+    width = settings.unit_size - 2.0 * settings.wall_thickness
+    depth = settings.block_height - settings.wall_thickness + CUT_OVERSHOOT
     cx, cy = _cell_center(settings, ix, iy)
-    return (
+    shape = (
         cq.Workplane("XY", origin=(cx, cy, 0))
-        .circle(settings.unit_size / 2.0 - settings.wall_thickness)
-        .extrude(settings.block_height - settings.wall_thickness + CUT_OVERSHOOT)
-        .translate((0, 0, -CUT_OVERSHOOT))
+        .circle(half - settings.wall_thickness)
+        .extrude(depth)
     )
+    connected = {
+        "+X": (ix + 1, iy) in cavity_neighbors,
+        "-X": (ix - 1, iy) in cavity_neighbors,
+        "+Y": (ix, iy + 1) in cavity_neighbors,
+        "-Y": (ix, iy - 1) in cavity_neighbors,
+    }
+    # A strip runs from the cell center to the shared edge, inset by the
+    # wall thickness on both sides; the union of bore and strips opens the
+    # cavity toward every cavity-keeping neighbor.
+    strips: list[tuple[float, float, float, float]] = []
+    if connected["+X"]:
+        strips.append((cx + half / 2.0, cy, half, width))
+    if connected["-X"]:
+        strips.append((cx - half / 2.0, cy, half, width))
+    if connected["+Y"]:
+        strips.append((cx, cy + half / 2.0, width, half))
+    if connected["-Y"]:
+        strips.append((cx, cy - half / 2.0, width, half))
+    if not strips:
+        return shape.translate((0, 0, -CUT_OVERSHOOT))
+    fused = _fuse_all(
+        _shape_of(shape),
+        [
+            _shape_of(
+                cq.Workplane("XY", origin=(sx, sy, 0)).box(
+                    w, d, depth, centered=(True, True, False)
+                )
+            )
+            for sx, sy, w, d in strips
+        ],
+    )
+    return cq.Workplane("XY").newObject([fused]).translate((0, 0, -CUT_OVERSHOOT))
+
+
+def _round_vertex_cavities(
+    settings: BlockSettings, cavity_neighbors: set[tuple[int, int]]
+) -> list[cq.Workplane]:
+    '''Fill boxes that open the cavity across fully surrounded lattice vertices.
+
+    Round bores and their strips are per-cell cutters; where four
+    cavity-keeping cells meet, the strips run along the cell center lines
+    and stop short of the vertex, leaving a small material pillar inside
+    the merged cavity. One square fill box (``unit_size - 2 x
+    wall_thickness`` per side) per such vertex removes it. Vertices with
+    fewer cavity cells keep their walls: they sit on the region boundary,
+    next to an excluded cell, or at a chamfered cell (which carries a rib).
+
+    Args:
+        settings: Validated parametric block description.
+        cavity_neighbors: Material cells that keep a bottom cavity.
+
+    Returns:
+        Fill box cutter solids spanning the cavity height.
+    '''
+    unit = settings.unit_size
+    width = unit - 2.0 * settings.wall_thickness
+    depth = settings.block_height - settings.wall_thickness + CUT_OVERSHOOT
+    half_x = settings.outer_length_x / 2.0
+    half_y = settings.outer_length_y / 2.0
+    round_cells = settings.round_cell_set()
+    boxes: list[cq.Workplane] = []
+    for ix in range(1, settings.cells_x):
+        for iy in range(1, settings.cells_y):
+            quadrants = [
+                (ix - 1, iy - 1),
+                (ix, iy - 1),
+                (ix - 1, iy),
+                (ix, iy),
+            ]
+            if not all(cell in cavity_neighbors for cell in quadrants):
+                continue
+            if not any(cell in round_cells for cell in quadrants):
+                continue  # square cavity boxes already tile such vertices
+            boxes.append(
+                cq.Workplane(
+                    "XY",
+                    origin=(ix * unit - half_x, iy * unit - half_y, 0),
+                )
+                .box(width, width, depth, centered=(True, True, False))
+                .translate((0, 0, -CUT_OVERSHOOT))
+            )
+    return boxes
 
 
 def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
     '''Quarter-round inward ribs at every concave corner of the figure.
 
     A concave corner is a lattice vertex where exactly 3 of the 4 adjacent
-    cells have cavities (the missing cell creates the inner angle). Chamfered
-    cells are solid (no cavity) and round cells keep a hole that recedes
-    from the lattice vertex, so neither contributes to such corners. The
-    rib fills that corner with a quarter-round fillet (instead of a tube),
-    spans the full cavity height and overshoots into the top face.
+    cells have cavities (the missing cell creates the inner angle).
+    Chamfered cells are solid (no cavity) and round cells open their
+    cavity through a fill box, so neither contributes to such corners: a
+    rib there would stand inside the merged void. The rib fills the corner
+    with a quarter-round fillet (instead of a tube), spans the full cavity
+    height and overshoots into the top face.
 
     Args:
         settings: Validated parametric block description.
@@ -468,6 +575,8 @@ def _figure_corner_ribs(settings: BlockSettings) -> list[cq.Workplane]:
             ]
             if len(missing) != 1:
                 continue  # concave corner needs exactly 3 cells with cavities
+            if quadrants[missing[0]] in settings.round_cell_set():
+                continue  # round cavity opens through a fill box here
             mx, my = missing[0]
             vx = i * unit - half_x
             vy = j * unit - half_y
@@ -524,15 +633,22 @@ def _build_flat_block(settings: BlockSettings) -> cq.Workplane:
     return outer
 
 
-def _tube_centers(settings: BlockSettings) -> list[tuple[float, float]]:
+def _tube_centers(
+    settings: BlockSettings,
+    cavity_neighbors: set[tuple[int, int]] | None = None,
+) -> list[tuple[float, float]]:
     '''Compute inner tube centers: mid-lines between stud rows/columns.
 
     One tube per sliding 2x2 cell group, i.e. at every intersection of the
     mid-lines between adjacent stud columns (X) and rows (Y). A 2x2 block
     gets a single central tube; a 3x2 block gets two tubes along its length.
+    With ``cavity_neighbors`` the centers are restricted to vertices whose
+    four surrounding cells all keep a cavity (figure variant: vertices next
+    to excluded or chamfered cells carry a rib instead of a tube).
 
     Args:
         settings: Validated parametric block description.
+        cavity_neighbors: Optional cavity-keeping cell set to filter by.
 
     Returns:
         List of (x, y) centers in block coordinates (block centered at origin).
@@ -543,10 +659,18 @@ def _tube_centers(settings: BlockSettings) -> list[tuple[float, float]]:
         (ix * settings.unit_size - half_x, iy * settings.unit_size - half_y)
         for ix in range(1, settings.cells_x)
         for iy in range(1, settings.cells_y)
+        if cavity_neighbors is None
+        or all(
+            (ix + dx, iy + dy) in cavity_neighbors for dx in (-1, 0) for dy in (-1, 0)
+        )
     ]
 
 
-def _fuse_tubes(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
+def _fuse_tubes(
+    shell: cq.Workplane,
+    settings: BlockSettings,
+    centers: list[tuple[float, float]] | None = None,
+) -> cq.Workplane:
     '''Fuse hollow reinforcement tubes under the inner top face.
 
     Each tube is an annulus (bore ``tube_inner_diameter``, wall equal to
@@ -557,6 +681,7 @@ def _fuse_tubes(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
     Args:
         shell: Hollow shell to attach tubes to.
         settings: Validated parametric block description.
+        centers: Explicit tube centers; defaults to all sliding 2x2 centers.
 
     Returns:
         The shell with all tubes fused into a single solid.
@@ -564,7 +689,7 @@ def _fuse_tubes(shell: cq.Workplane, settings: BlockSettings) -> cq.Workplane:
     r_out = settings.tube_outer_diameter / 2.0
     r_in = settings.tube_inner_diameter / 2.0
     tubes: list[cq.Workplane] = []
-    for cx, cy in _tube_centers(settings):
+    for cx, cy in centers if centers is not None else _tube_centers(settings):
         tube = (
             cq.Workplane("XY", origin=(cx, cy, 0))
             .circle(r_out)
