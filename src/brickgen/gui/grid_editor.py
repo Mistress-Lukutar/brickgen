@@ -2,7 +2,7 @@
 File:   grid_editor.py
 Brief:  Top-view cell grid editor: selection and per-cell feature states.
 Author: Mistress-Lukutar
-Date:   2026-11-17
+Date:   2026-11-18
 Version: v0.10.0
 '''
 
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QWidget
 
 _CELL_PX = 26  # rendered cell size
 _CELL_GAP = 2  # gap between cells
+_BAND_MIN_DRAG = 4.0  # px of movement before a press becomes a band drag
 
 _FILL_INCLUDED = QColor("#3f7fbf")
 _FILL_EXCLUDED = QColor("#e8e8e8")
@@ -27,6 +28,8 @@ _WEDGE_COLOR = QColor("#1c2f45")
 _STUD_COLOR = QColor("#f5f7fa")
 _STUD_RIM_COLOR = QColor("#20415f")
 _SELECTION_COLOR = QColor("#d64545")
+_SELECTION_SECONDARY_COLOR = QColor("#e88a8a")
+_BAND_FILL = QColor(214, 69, 69, 40)
 
 _SIDE_OFFSETS = {"+X": (1, 0), "-X": (-1, 0), "+Y": (0, 1), "-Y": (0, -1)}
 
@@ -70,15 +73,21 @@ class CellState:
 class CellGridEditor(QWidget):
     '''Schematic top view of the cell grid (X right, Y up).
 
-    Left-clicking a cell selects it (red outline); the features of the
-    selected cell - exclusion, top stud, top slope, round base, bottom
-    chamfer - are edited through :meth:`set_state` by the inspector panel
-    in the main window. Cell colors: blue = included, gray = excluded,
-    orange = bottom chamfer. Round cells render with inscribed-circle arcs
-    at their free corners and straight edges toward material neighbors
-    (matching the built solid). Icons: white dot = stud, dark wedge =
-    slope (full edge marks the raised side), black arrow = chamfer
-    direction.
+    Left-clicking a cell selects it; Ctrl+click toggles a cell in the
+    selection, dragging with the left button frames a rectangular area
+    (plain drag replaces the selection, Ctrl+drag extends it), clicking
+    the background clears it and Escape clears it too. Selected cells
+    are framed red around their silhouette - bright for the primary
+    (last clicked, the inspector target), lighter for the rest. The
+    features of the selected cells - exclusion, top stud, top slope,
+    round base, bottom chamfer - are edited through :meth:`set_state` by
+    the inspector panel in the main window, which applies changes to all
+    selected cells. Cell colors: blue = included, gray = excluded,
+    orange = bottom chamfer. Round cells render with inscribed-circle
+    arcs at their free corners and straight edges toward material
+    neighbors (matching the built solid). Icons: white dot = stud, dark
+    wedge = slope (full edge marks the raised side), black arrow =
+    chamfer direction.
     '''
 
     # Emitted after any cell state change.
@@ -96,8 +105,15 @@ class CellGridEditor(QWidget):
         self._cols = 1
         self._rows = 1
         self._states: dict[tuple[int, int], CellState] = {}
-        self._selected: tuple[int, int] | None = None
+        self._selected: set[tuple[int, int]] = set()
+        self._primary: tuple[int, int] | None = None
+        self._press_cell: tuple[int, int] | None = None
+        self._band_origin: QPointF | None = None
+        self._band_rect: QRectF | None = None
+        self._band_active = False
+        self._band_cells: set[tuple[int, int]] = set()
         self._default_studs = True
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._update_size()
 
     # ------------------------------------------------------------------ API
@@ -112,8 +128,14 @@ class CellGridEditor(QWidget):
         self._rows = max(1, rows)
         keep = lambda c: 0 <= c[0] < self._cols and 0 <= c[1] < self._rows  # noqa: E731
         self._states = {c: s for c, s in self._states.items() if keep(c)}
-        if self._selected is not None and not keep(self._selected):
-            self._selected = None
+        new_selection = {c for c in self._selected if keep(c)}
+        selection_dropped = new_selection != self._selected or (
+            self._primary is not None and not keep(self._primary)
+        )
+        self._selected = new_selection
+        if self._primary is not None and not keep(self._primary):
+            self._primary = None
+        if selection_dropped:
             self.selection_changed.emit()
         self._update_size()
         self.update()
@@ -128,15 +150,32 @@ class CellGridEditor(QWidget):
         self.update()
 
     def selected_cell(self) -> tuple[int, int] | None:
-        '''Currently selected (ix, iy) cell, or None.'''
-        return self._selected
+        '''Primary (last clicked) selected (ix, iy) cell, or None.'''
+        return self._primary
+
+    def selected_cells(self) -> list[tuple[int, int]]:
+        '''All selected cells in sorted (ix, iy) order.'''
+        return sorted(self._selected)
 
     def clear_selection(self) -> None:
         '''Drop the current selection, if any.'''
-        if self._selected is not None:
-            self._selected = None
-            self.update()
-            self.selection_changed.emit()
+        self._apply_selection(set(), None)
+
+    def _apply_selection(
+        self, cells: set[tuple[int, int]], primary: tuple[int, int] | None
+    ) -> None:
+        '''Replace the selection, repaint and notify on actual change.
+
+        Args:
+            cells: New selected-cell set.
+            primary: New primary cell; must be None or a member of cells.
+        '''
+        if cells == self._selected and primary == self._primary:
+            return
+        self._selected = set(cells)
+        self._primary = primary
+        self.update()
+        self.selection_changed.emit()
 
     def state(self, ix: int, iy: int) -> CellState:
         '''Feature state of cell (ix, iy); default state when untouched.'''
@@ -233,14 +272,26 @@ class CellGridEditor(QWidget):
         # top-left, bottom-left, bottom-right (Qt arc angles: 0 deg at 3
         # o'clock, positive counter-clockwise).
         spans = [
-            (0.0, not (connected["+X"] or connected["+Y"]),
-             QPointF(rect.right(), rect.top())),
-            (90.0, not (connected["-X"] or connected["+Y"]),
-             QPointF(rect.left(), rect.top())),
-            (180.0, not (connected["-X"] or connected["-Y"]),
-             QPointF(rect.left(), rect.bottom())),
-            (270.0, not (connected["+X"] or connected["-Y"]),
-             QPointF(rect.right(), rect.bottom())),
+            (
+                0.0,
+                not (connected["+X"] or connected["+Y"]),
+                QPointF(rect.right(), rect.top()),
+            ),
+            (
+                90.0,
+                not (connected["-X"] or connected["+Y"]),
+                QPointF(rect.left(), rect.top()),
+            ),
+            (
+                180.0,
+                not (connected["-X"] or connected["-Y"]),
+                QPointF(rect.left(), rect.bottom()),
+            ),
+            (
+                270.0,
+                not (connected["+X"] or connected["-Y"]),
+                QPointF(rect.right(), rect.bottom()),
+            ),
         ]
 
         def _at(angle: float) -> QPointF:
@@ -263,9 +314,7 @@ class CellGridEditor(QWidget):
     # ------------------------------------------------- model list exporting
     def excluded_cells(self) -> list[list[int]]:
         '''Current exclusion mask as sorted [ix, iy] pairs.'''
-        return sorted(
-            [ix, iy] for (ix, iy), st in self._states.items() if st.excluded
-        )
+        return sorted([ix, iy] for (ix, iy), st in self._states.items() if st.excluded)
 
     def flat_cells(self) -> list[list[int]]:
         '''Explicit no-stud cells as sorted [ix, iy] pairs.'''
@@ -295,9 +344,7 @@ class CellGridEditor(QWidget):
 
     def round_cells(self) -> list[list[int]]:
         '''Round-base cells as sorted [ix, iy] pairs.'''
-        return sorted(
-            [ix, iy] for (ix, iy), st in self._states.items() if st.round
-        )
+        return sorted([ix, iy] for (ix, iy), st in self._states.items() if st.round)
 
     def chamfered_cells(self) -> list[list]:
         '''Bottom-chamfer list as sorted [ix, iy, side] triplets.'''
@@ -430,8 +477,22 @@ class CellGridEditor(QWidget):
                         self._draw_stud(painter, rect)
                     if state.chamfer is not None:
                         self._draw_arrow(painter, rect, state.chamfer)
-                    if self._selected == (ix, iy):
-                        self._draw_selection(painter, ix, iy, rect, state.round)
+            for ix, iy in self._band_cells:
+                self._paint_frame(painter, ix, iy, _SELECTION_SECONDARY_COLOR)
+            ordered = [c for c in sorted(self._selected) if c != self._primary]
+            if self._primary is not None:
+                ordered.append(self._primary)
+            for ix, iy in ordered:
+                color = (
+                    _SELECTION_COLOR
+                    if (ix, iy) == self._primary
+                    else _SELECTION_SECONDARY_COLOR
+                )
+                self._paint_frame(painter, ix, iy, color)
+            if self._band_active and self._band_rect is not None:
+                painter.setPen(QPen(_SELECTION_COLOR, 1, Qt.PenStyle.DashLine))
+                painter.setBrush(_BAND_FILL)
+                painter.drawRect(self._band_rect)
         finally:
             painter.end()
 
@@ -482,34 +543,151 @@ class CellGridEditor(QWidget):
         )
         painter.drawPolygon(QPolygonF([tip, left, right]))
 
-    def _draw_selection(
-        self,
-        painter: QPainter,
-        ix: int,
-        iy: int,
-        rect: QRectF,
-        round_shape: bool,
-    ) -> None:
-        '''Draw the red outline around the selected cell.
+    def _paint_frame(self, painter: QPainter, ix: int, iy: int, color: QColor) -> None:
+        '''Draw a selection frame around cell (ix, iy).
 
-        Round cells get an outline matching their rounded silhouette.
+        The 2 px frame sits in the 2 px gap around the cell, so adjacent
+        selections touch without covering cell fills. Round cells get a
+        frame matching their rounded silhouette.
+
+        Args:
+            painter: Active painter.
+            ix: Cell index along X.
+            iy: Cell index along Y.
+            color: Frame color (bright for the primary selection).
         '''
-        painter.setPen(QPen(_SELECTION_COLOR, 2))
+        state = self._states.get((ix, iy), CellState())
+        rect = self._cell_rect(ix, iy).adjusted(-1.0, -1.0, 1.0, 1.0)
+        painter.setPen(QPen(color, 2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        if round_shape:
+        if state.round and not state.excluded:
             painter.drawPath(self._round_path(ix, iy, rect))
         else:
-            painter.drawRect(rect.adjusted(1.0, 1.0, -1.0, -1.0))
+            painter.drawRect(rect)
 
     # ------------------------------------------------------------- input
-    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        '''Select the cell under the cursor.'''
-        pos: QPointF = event.position()
+    def _cell_at(self, pos: QPointF) -> tuple[int, int] | None:
+        '''Cell (ix, iy) under a widget position, or None outside cells.
+
+        Args:
+            pos: Position in widget coordinates.
+
+        Returns:
+            The cell hit test result; gap pixels resolve to the preceding
+            cell, margins and beyond resolve to None.
+        '''
         ix = int((pos.x() - _CELL_GAP) // (_CELL_PX + _CELL_GAP))
         row = int((pos.y() - _CELL_GAP) // (_CELL_PX + _CELL_GAP))
         iy = self._rows - 1 - row
         if 0 <= ix < self._cols and 0 <= iy < self._rows:
-            self._selected = (ix, iy)
-            self.update()
-            self.selection_changed.emit()
+            return (ix, iy)
+        return None
+
+    def _cells_in_rect(self, rect: QRectF) -> set[tuple[int, int]]:
+        '''Set of cells intersecting a widget-coordinate rectangle.
+
+        Args:
+            rect: Rubber band rectangle.
+
+        Returns:
+            All cells whose pixel rect intersects rect.
+        '''
+        return {
+            (ix, iy)
+            for iy in range(self._rows)
+            for ix in range(self._cols)
+            if self._cell_rect(ix, iy).intersects(rect)
+        }
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        '''Apply the selection click semantics and arm the rubber band.
+
+        Plain click selects the cell under the cursor (or clears on the
+        background). Ctrl+click defers its toggle to the release, which
+        commits either the band cells (a drag) or the pressed-cell toggle
+        (a click) - so a Ctrl+drag never toggles the starting cell.
+        '''
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos: QPointF = event.position()
+            self._band_origin = pos
+            self._band_rect = None
+            self._band_active = False
+            self._band_cells = set()
+            ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            cell = self._cell_at(pos)
+            if ctrl:
+                self._press_cell = cell
+            else:
+                self._press_cell = None
+                if cell is None:
+                    self._apply_selection(set(), None)
+                else:
+                    self._apply_selection({cell}, cell)
+            self.setFocus()
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        '''Track the rubber band rectangle and its live cell highlight.'''
+        if self._band_origin is not None:
+            pos: QPointF = event.position()
+            rect = QRectF(self._band_origin, pos).normalized()
+            self._band_active = (
+                rect.width() > _BAND_MIN_DRAG or rect.height() > _BAND_MIN_DRAG
+            )
+            self._band_rect = rect
+            self._band_cells = self._cells_in_rect(rect) if self._band_active else set()
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        '''Commit the rubber band area or the deferred Ctrl toggle.
+
+        Plain drag replaces the selection with the band cells (primary
+        falls to the last band cell); Ctrl+drag extends the selection,
+        keeping the primary; a plain drag over empty background clears.
+        Without a drag, a Ctrl+release toggles the pressed cell (the
+        added cell becomes primary). A sub-threshold movement keeps the
+        press behavior, so simple clicks stay simple.
+        '''
+        if (
+            self._band_origin is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            if self._band_active and self._band_rect is not None:
+                band = self._cells_in_rect(self._band_rect)
+                if ctrl:
+                    cells = self._selected | band
+                    primary = (
+                        self._primary
+                        if self._primary in cells
+                        else (max(band) if band else None)
+                    )
+                else:
+                    cells = band
+                    primary = max(band) if band else None
+                self._apply_selection(cells, primary)
+            elif ctrl and self._press_cell is not None:
+                cell = self._press_cell
+                if cell in self._selected:
+                    remaining = self._selected - {cell}
+                    self._apply_selection(
+                        remaining, max(remaining) if remaining else None
+                    )
+                else:
+                    self._apply_selection(self._selected | {cell}, cell)
+            self._press_cell = None
+            self._band_origin = None
+            self._band_rect = None
+            self._band_active = False
+            self._band_cells = set()
+            self.update()
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        '''Clear the selection on Escape.'''
+        if event.key() == Qt.Key.Key_Escape:
+            self.clear_selection()
+            event.accept()
+            return
+        super().keyPressEvent(event)

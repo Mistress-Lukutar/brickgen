@@ -2,7 +2,7 @@
 File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
-Date:   2026-11-17
+Date:   2026-11-18
 Version: v0.10.0
 '''
 
@@ -224,7 +224,7 @@ class MainWindow(QMainWindow):
 
     def _build_layout_group(self) -> QGroupBox:
         '''Create the top-view cell grid editor group.'''
-        group = QGroupBox("Layout (top view: click selects a cell)")
+        group = QGroupBox("Layout (top view: click selects, Ctrl adds, drag frames)")
         layout = QVBoxLayout(group)
         self._cell_grid = CellGridEditor()
         self._cell_grid.changed.connect(self._schedule_rebuild)
@@ -272,13 +272,14 @@ class MainWindow(QMainWindow):
         self._set_status("Preferences saved.")
 
     def _build_cell_group(self) -> QGroupBox:
-        '''Create the inspector of the cell selected in the layout.
+        '''Create the inspector of the cells selected in the layout.
 
-        A checklist of the actions available for the selected cell; checking
-        an item reveals its parameter pairs indented below it. Slope and
-        stud are mutually exclusive (a wedge top cannot carry a stud), the
-        round base conflicts with the slope and chamfer wedges, exclusion
-        hides everything else.
+        A checklist of the actions available for the selected cells; checking
+        an item reveals its parameter pairs indented below it and applies
+        to every selected cell. The widgets mirror the primary (last
+        clicked) cell. Slope and stud are mutually exclusive (a wedge top
+        cannot carry a stud), the round base conflicts with the slope and
+        chamfer wedges, exclusion hides everything else.
         '''
         self._cell_group = QGroupBox("Cell (click the layout to select)")
         outer = QVBoxLayout(self._cell_group)
@@ -445,8 +446,13 @@ class MainWindow(QMainWindow):
         editor state, they do not drive it. Checking a box reveals its
         parameter block indented below; an excluded cell disables the other
         actions (their hidden state is kept and restored on un-excluding).
+        With several cells selected the widgets mirror the primary (last
+        clicked) cell and edits apply to the whole selection.
         '''
+        cells = self._cell_grid.selected_cells()
         cell = self._cell_grid.selected_cell()
+        if cell is None and cells:
+            cell = cells[0]
         boxes = (
             self._cb_exclude,
             self._cb_stud,
@@ -467,7 +473,11 @@ class MainWindow(QMainWindow):
             ix, iy = cell
             state = self._cell_grid.state(ix, iy)
             sides = self._cell_grid.available_chamfer_sides(ix, iy)
-            self._cell_group.setTitle(f"Cell [{ix}, {iy}]")
+            extra = len(cells) - 1
+            title = f"Cell [{ix}, {iy}]"
+            if extra > 0:
+                title = f"{title} +{extra} more"
+            self._cell_group.setTitle(title)
             self._cb_exclude.setEnabled(True)
             self._cb_exclude.setChecked(state.excluded)
             self._cb_stud.setEnabled(not state.excluded)
@@ -518,24 +528,48 @@ class MainWindow(QMainWindow):
         finally:
             self._chamfer_edge.blockSignals(False)
 
-    def _edit_selected(self, mutate) -> None:
-        '''Apply a mutation to the selected cell state, then re-sync.
+    def _edit_selected_cells(
+        self,
+        mutate,
+        *,
+        skip_excluded: bool = True,
+        chamfer_side: str | None = None,
+    ) -> None:
+        '''Apply a mutation to every selected cell state, then re-sync.
+
+        Feature mutations skip excluded cells: their hidden state is kept
+        and restored on un-excluding. A chamfer direction is applied only
+        to the cells where that side is actually outward-facing.
 
         Args:
             mutate: Callable receiving the (mutable) CellState.
+            skip_excluded: False when the mutation targets exclusion itself.
+            chamfer_side: Side being applied; cells without that outward
+                side are skipped. None skips nothing (chamfer removal).
         '''
-        cell = self._cell_grid.selected_cell()
-        if cell is None:
+        grid = self._cell_grid
+        cells = grid.selected_cells()
+        if not cells:
             return
-        ix, iy = cell
-        state = self._cell_grid.state(ix, iy)
-        mutate(state)
-        self._cell_grid.set_state(ix, iy, state)
+        for ix, iy in cells:
+            state = grid.state(ix, iy)
+            if skip_excluded and state.excluded:
+                continue
+            if (
+                chamfer_side is not None
+                and chamfer_side not in grid.available_chamfer_sides(ix, iy)
+            ):
+                continue
+            mutate(state)
+            grid.set_state(ix, iy, state)
         self._sync_inspector()
 
     def _on_inspector_exclude(self, checked: bool) -> None:
-        '''Exclude or restore the selected cell (features are preserved).'''
-        self._edit_selected(lambda state: setattr(state, "excluded", checked))
+        '''Exclude or restore the selected cells (features are preserved).'''
+        self._edit_selected_cells(
+            lambda state: setattr(state, "excluded", checked),
+            skip_excluded=False,
+        )
 
     def _on_inspector_stud(self, checked: bool) -> None:
         '''Toggle the stud top; a stud replaces a slope (conflict).'''
@@ -545,7 +579,7 @@ class MainWindow(QMainWindow):
             if checked:
                 state.slope = None
 
-        self._edit_selected(mutate)
+        self._edit_selected_cells(mutate)
 
     def _on_inspector_slope(self, checked: bool) -> None:
         '''Toggle the top slope; it replaces the stud and round base.'''
@@ -560,7 +594,7 @@ class MainWindow(QMainWindow):
                 state.stud = None  # the wedge top replaces the stud
                 state.round = False  # a wedge needs a square base
 
-        self._edit_selected(mutate)
+        self._edit_selected_cells(mutate)
 
     def _on_inspector_round(self, checked: bool) -> None:
         '''Toggle the round base; it clears the wedge features (conflict).'''
@@ -571,33 +605,38 @@ class MainWindow(QMainWindow):
                 state.slope = None
                 state.chamfer = None
 
-        self._edit_selected(mutate)
+        self._edit_selected_cells(mutate)
 
     def _on_inspector_chamfer(self, checked: bool) -> None:
-        '''Toggle the bottom chamfer of the selected cell.'''
+        '''Toggle the bottom chamfer of the selected cells.'''
 
         def mutate(state: CellState) -> None:
-            state.chamfer = (
-                self._chamfer_edge.currentText() if checked else None
-            )
+            state.chamfer = self._chamfer_edge.currentText() if checked else None
             if checked:
                 state.round = False  # a chamfer needs a square base
 
-        self._edit_selected(mutate)
+        if checked:
+            self._edit_selected_cells(
+                mutate, chamfer_side=self._chamfer_edge.currentText()
+            )
+        else:
+            self._edit_selected_cells(mutate)
 
     def _on_slope_params_changed(self) -> None:
-        '''Apply edited slope parameters to the selected cell.'''
+        '''Apply edited slope parameters to the selected cells.'''
         if not self._cb_slope.isChecked():
             return
         slope = (self._slope_edge.currentText(), self._slope_rise.value())
-        self._edit_selected(lambda state: setattr(state, "slope", slope))
+        self._edit_selected_cells(lambda state: setattr(state, "slope", slope))
 
     def _on_chamfer_param_changed(self) -> None:
-        '''Apply the edited chamfer direction to the selected cell.'''
+        '''Apply the edited chamfer direction to the selected cells.'''
         if not self._cb_chamfer.isChecked():
             return
         side = self._chamfer_edge.currentText()
-        self._edit_selected(lambda state: setattr(state, "chamfer", side))
+        self._edit_selected_cells(
+            lambda state: setattr(state, "chamfer", side), chamfer_side=side
+        )
 
     # ----------------------------------------------------------------- actions
     def _collect_settings(self) -> BlockSettings:
@@ -762,9 +801,7 @@ class MainWindow(QMainWindow):
         self._applied_cache_key = result.get('cache_key', cache_key)
 
         slope_note = (
-            f" | {len(settings.sloped_cells)} sloped"
-            if settings.sloped_cells
-            else ""
+            f" | {len(settings.sloped_cells)} sloped" if settings.sloped_cells else ""
         )
         figure_note = (
             f" | figure {settings.included_count} cells"
@@ -777,9 +814,7 @@ class MainWindow(QMainWindow):
             else ""
         )
         round_note = (
-            f" | {len(settings.round_cells)} round"
-            if settings.round_cells
-            else ""
+            f" | {len(settings.round_cells)} round" if settings.round_cells else ""
         )
         self._status_style(False)
         self._status.setText(
