@@ -29,11 +29,7 @@ def _circle_area(settings: BlockSettings) -> float:
 
 def _stud_volume(settings: BlockSettings) -> float:
     '''Volume of one top stud, mm^3.'''
-    return (
-        math.pi
-        * (settings.pin_diameter / 2.0) ** 2
-        * settings.pin_height
-    )
+    return math.pi * (settings.pin_diameter / 2.0) ** 2 * settings.pin_height
 
 
 def test_round_cell_volume() -> None:

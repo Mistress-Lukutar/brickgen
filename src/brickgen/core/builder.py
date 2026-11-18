@@ -165,9 +165,9 @@ def _build_figure_block(settings: BlockSettings) -> cq.Workplane:
             cells.append(_slope_cell_solid(settings, ix, iy, side, rise_units))
         else:
             cells.append(
-                cq.Workplane(
-                    "XY", origin=(x0 + unit / 2.0, y0 + unit / 2.0, 0)
-                ).box(unit, unit, height, centered=(True, True, False))
+                cq.Workplane("XY", origin=(x0 + unit / 2.0, y0 + unit / 2.0, 0)).box(
+                    unit, unit, height, centered=(True, True, False)
+                )
             )
         if (ix, iy) in chamfered:
             continue  # solid wedge: no cavity opening in chamfered cells

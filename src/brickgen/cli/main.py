@@ -125,8 +125,7 @@ def generate(
     chamfer_cells: str = typer.Option(
         "",
         "--chamfer-cells",
-        help="Bottom-chamfered cells 'ix,iy,side;...', side "
-        f"{'/'.join(SLOPE_SIDES)}.",
+        help=f"Bottom-chamfered cells 'ix,iy,side;...', side {'/'.join(SLOPE_SIDES)}.",
     ),
     round_cells: str = typer.Option(
         "",

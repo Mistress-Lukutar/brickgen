@@ -231,8 +231,7 @@ class BlockSettings(BaseModel):
                 ) from exc
             if side not in SLOPE_SIDES:
                 raise SettingsValidationError(
-                    f"sloped cell side '{side}' must be one of "
-                    f"{', '.join(SLOPE_SIDES)}"
+                    f"sloped cell side '{side}' must be one of {', '.join(SLOPE_SIDES)}"
                 )
             if not 1 <= rise <= MAX_SLOPE_RISE:
                 raise SettingsValidationError(
@@ -313,9 +312,7 @@ class BlockSettings(BaseModel):
                     f"{label} {item!r} must be an [ix, iy] pair"
                 ) from exc
             if (ix, iy) in seen:
-                raise SettingsValidationError(
-                    f"{label} [{ix}, {iy}] is listed twice"
-                )
+                raise SettingsValidationError(f"{label} [{ix}, {iy}] is listed twice")
             seen.add((ix, iy))
             result.append([ix, iy])
         return sorted(result)
@@ -523,9 +520,7 @@ class BlockSettings(BaseModel):
             raise SettingsValidationError("at least one cell must remain in the figure")
         return self
 
-    def _check_cell_bounds(
-        self, cells: set[tuple[int, int]], label: str
-    ) -> None:
+    def _check_cell_bounds(self, cells: set[tuple[int, int]], label: str) -> None:
         '''Raise when an override cell sits outside the grid.'''
         for ix, iy in cells:
             if not (0 <= ix < self.cells_x and 0 <= iy < self.cells_y):

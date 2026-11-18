@@ -180,9 +180,7 @@ def test_top_conflicts_rejected() -> None:
 
 def test_slope_inside_figure_is_allowed() -> None:
     '''Unlike chamfers, slope directions need not look outward.'''
-    settings = BlockSettings(
-        cells_x=3, cells_y=1, sloped_cells=[[1, 0, "+Y", 1]]
-    )
+    settings = BlockSettings(cells_x=3, cells_y=1, sloped_cells=[[1, 0, "+Y", 1]])
     assert settings.sloped_cells == [[1, 0, "+Y", 1]]
     assert not settings.is_rectangular
 
@@ -285,9 +283,7 @@ def test_recipe_name_encodes_cell_features() -> None:
     )
     assert combo.recipe_name() == "1x2-studs_sl0,0,+Y,1_ch0,0,-Y"
 
-    excl = BlockSettings(
-        cells_x=2, cells_y=2, excluded_cells=[[1, 1], [0, 0]]
-    )
+    excl = BlockSettings(cells_x=2, cells_y=2, excluded_cells=[[1, 1], [0, 0]])
     assert excl.recipe_name() == "2x2-studs_ex0,0;1,1"
 
     round_cell = BlockSettings(cells_x=1, cells_y=1, round_cells=[[0, 0]])
