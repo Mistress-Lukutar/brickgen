@@ -3,7 +3,7 @@ File:   main.py
 Brief:  Typer CLI entry point for headless block generation and export.
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations
@@ -97,12 +97,20 @@ def generate(
     clearance_xy: float = typer.Option(
         0.2,
         "--clearance-xy",
-        help="Fit clearance X/Y, mm: stud diameter shrink from the cell socket.",
+        help=(
+            "Fit clearance X/Y, mm: positive shrinks the stud for a sliding "
+            "fit, negative enlarges it to compensate print shrinkage (block "
+            "size unchanged)."
+        ),
     ),
     clearance_z: float = typer.Option(
         0.2,
         "--clearance-z",
-        help="Fit clearance Z, mm: stud height shrink from the cavity depth.",
+        help=(
+            "Fit clearance Z, mm: positive shrinks the stud height so it "
+            "never bottoms out, negative enlarges it to compensate print "
+            "shrinkage (block size unchanged)."
+        ),
     ),
     no_pins: bool = typer.Option(
         False,

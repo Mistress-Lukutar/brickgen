@@ -19,8 +19,8 @@ solid top wall, and one cylindrical stud per 1×1 cell:
 | `unit_size` | 4.0 mm | 1×1 cell footprint (4×4 mm square) |
 | `wall_thickness` | 0.8 mm | Wall, top-wall and tube thickness |
 | `block_height` | 3.0 mm | Shell height from bottom rim to top face |
-| `clearance_xy` | 0.2 mm | Lateral fit clearance per stud side (≥ 0) |
-| `clearance_z` | 0.2 mm | Vertical fit clearance above stud tip (≥ 0) |
+| `clearance_xy` | 0.2 mm | Lateral fit: positive = sliding play, negative = stud oversize (shrinkage comp.) |
+| `clearance_z` | 0.2 mm | Vertical fit: positive = play above stud tip, negative = stud oversize |
 | `pins_enabled` | true | Top studs on/off |
 | `tubes_enabled` | true | Inner tubes on/off |
 | `excluded_cells` | — | `[ix, iy]` cells removed from the figure |
@@ -38,9 +38,16 @@ solid top wall, and one cylindrical stud per 1×1 cell:
   keeping `clearance_xy/2` to each stud surface — clearance cancels out of the
   formula); tube bore = outer − 2·wall (plastic-saving only, solid rod when
   bore ≤ 0).
-
-- Footprint: `cells_x × unit_size` by `cells_y × unit_size`; Z=0 is the bottom
-  plane; the cavity depth is `block_height − wall_thickness`.
+- **Negative clearance = stud oversize**: printed plastic shrinks, so a
+  stud that matches the socket exactly slides in too loosely. A negative
+  `clearance_xy` models the stud fatter than its socket by `|clearance_xy|`
+  and a negative `clearance_z` taller than the cavity depth — an
+  interference fit that shrinks down to a tight fit on the printed part.
+  The block dimensions stay nominal in both cases. Valid range:
+  `-2·wall < clearance_xy < unit − 2·wall` (an oversized stud must not
+  overlap its neighbors) and `|clearance_z| < block_height − wall`.
+- Footprint: `cells_x × unit_size` by `cells_y × unit_size`; Z=0 is the
+  bottom plane; the cavity depth is `block_height − wall_thickness`.
 - **Inner tubes** (2×2 and larger): hollow cylinders at the mid-line
   intersections between stud rows/columns — one tube per sliding 2×2 cell
   group (2×2 → 1 center tube; 3×2 → 2 tubes along the length). They span the
@@ -159,9 +166,10 @@ case-insensitive).
 The `schema` block is optional on load and always written on save. Unknown
 keys (`extra: forbid`) and out-of-range values are rejected by validation,
 e.g. `2·wall < unit` (cavity exists), `block_height > wall` (top face),
-`clearance_xy < unit − 2·wall` and `clearance_z < block_height − wall`
-(positive stud size); old presets with v1 diameter/height/bore keys load
-silently — legacy keys are dropped.
+`-2·wall < clearance_xy < unit − 2·wall` and
+`|clearance_z| < block_height − wall` (positive, non-overlapping studs);
+old presets with v1 diameter/height/bore keys load silently — legacy keys
+are dropped.
 
 ## Project Layout (src-layout)
 

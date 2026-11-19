@@ -3,7 +3,7 @@ File:   test_preview.py
 Brief:  Unit tests for the pyvista mesh conversion used by the preview.
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations
@@ -107,6 +107,15 @@ def classified_slope_mesh():
     return solid_to_mesh(solid, face_part=classifier), settings
 
 
+@pytest.fixture
+def classified_negative_clearance_mesh():
+    '''Classified preview mesh of a block with oversized studs.'''
+    settings = BlockSettings(cells_x=2, cells_y=2, clearance_xy=-0.5, clearance_z=-0.5)
+    solid = build_block(settings).val()
+    classifier = make_face_classifier(settings)
+    return solid_to_mesh(solid, face_part=classifier), settings
+
+
 # ------------------------------------------------------------------ helpers
 def _get_centroids(mesh: pv.PolyData) -> np.ndarray:
     '''Return triangle-centroid array from a PyVista PolyData mesh.
@@ -200,6 +209,27 @@ def test_classifier_slope_block(classified_slope_mesh) -> None:
     assert counts[PART_STUD] == 0
     assert counts[PART_TUBE] == 0
     assert counts[PART_BODY] > 0
+
+
+def test_parts_present_negative_clearance(classified_negative_clearance_mesh) -> None:
+    '''A block with oversized studs still shows all four part ids.'''
+    mesh, _ = classified_negative_clearance_mesh
+    parts = np.asarray(mesh.cell_data["part"])
+    counts = np.bincount(parts)
+    for pid in (PART_BODY, PART_STUD, PART_TUBE, PART_BOTTOM):
+        assert counts[pid] > 0
+
+
+def test_stud_triangles_above_top_plane_negative_clearance(
+    classified_negative_clearance_mesh,
+) -> None:
+    '''Oversized stud triangles sit above the nominal top plane.'''
+    mesh, settings = classified_negative_clearance_mesh
+    parts = np.asarray(mesh.cell_data["part"])
+    centroids = _get_centroids(mesh)
+    stud_mask = parts == PART_STUD
+    assert stud_mask.any()
+    assert all(centroids[stud_mask, 2] > settings.block_height + 1e-6)
 
 
 def test_semantic_edges_deterministic(classified_4x2_mesh) -> None:

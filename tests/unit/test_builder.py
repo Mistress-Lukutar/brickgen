@@ -3,7 +3,7 @@ File:   test_builder.py
 Brief:  Unit tests for the CadQuery block builder geometry.
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations
@@ -62,6 +62,58 @@ def test_1x1_volume_matches_analytic(default_settings: BlockSettings) -> None:
     '''Solid volume must equal shell + studs analytic value.'''
     solid = build_block(default_settings).val()
     assert solid.Volume() == pytest.approx(_expected_volume(default_settings), rel=1e-3)
+
+
+def test_negative_clearance_keeps_block_size() -> None:
+    '''Negative clearance fattens the stud only; the block stays 8x8 nominal.'''
+    settings = BlockSettings(
+        cells_x=2,
+        cells_y=2,
+        unit_size=4.0,
+        wall_thickness=0.8,
+        clearance_xy=-0.5,
+        clearance_z=-0.5,
+    )
+    solid = build_block(settings).val()
+    bb = solid.BoundingBox()
+    # Footprint unchanged (no grid expansion)...
+    assert bb.xlen == pytest.approx(8.0, abs=1e-4)
+    assert bb.ylen == pytest.approx(8.0, abs=1e-4)
+    assert bb.zmin == pytest.approx(0.0, abs=1e-4)
+    # ...only the stud grows: 3.0 shell + 2.7 oversized stud.
+    assert bb.zlen == pytest.approx(5.7, abs=1e-4)
+    assert bb.zlen == pytest.approx(settings.total_height, abs=1e-4)
+
+
+def test_negative_clearance_volume_matches_analytic() -> None:
+    '''The oversized studs add exactly their cylinder volume (block nominal).'''
+    settings = BlockSettings(
+        cells_x=2,
+        cells_y=2,
+        unit_size=4.0,
+        wall_thickness=0.8,
+        clearance_xy=-0.5,
+        clearance_z=-0.5,
+    )
+    solid = build_block(settings).val()
+    assert solid.Volume() == pytest.approx(_expected_volume(settings), rel=1e-6)
+
+
+def test_negative_clearance_figure_variant_builds() -> None:
+    '''Exclusions, slopes and round cells survive oversized studs.'''
+    settings = BlockSettings(
+        cells_x=3,
+        cells_y=2,
+        wall_thickness=0.8,
+        clearance_xy=-0.3,
+        clearance_z=-0.2,
+        excluded_cells=[[2, 1]],
+        sloped_cells=[[0, 0, "+X", 1]],
+        round_cells=[[2, 0]],
+    )
+    solid = build_block(settings).val()
+    assert len(solid.Solids()) == 1
+    assert solid.Volume() > 0.0
 
 
 def test_2x6_volume_matches_analytic(settings_2x6: BlockSettings) -> None:

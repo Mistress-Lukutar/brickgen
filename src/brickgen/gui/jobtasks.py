@@ -3,7 +3,7 @@ File:   jobtasks.py
 Brief:  Child-process task handlers for the process-based JobQueue.
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 
 Each handler is invoked inside a child process; heavy modules (cadquery, pyvista,
 OCC) are imported lazily inside the handler so the first job pays the import cost.

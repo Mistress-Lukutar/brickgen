@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations
@@ -194,8 +194,8 @@ class MainWindow(QMainWindow):
             ("Unit size, mm", "unit_size", 0.05, 100.0),
             ("Wall thickness, mm", "wall_thickness", 0.05, 20.0),
             ("Block height, mm", "block_height", 0.05, 200.0),
-            ("Clearance X/Y, mm", "clearance_xy", 0.0, 10.0),
-            ("Clearance Z, mm", "clearance_z", 0.0, 10.0),
+            ("Clearance X/Y, mm", "clearance_xy", -10.0, 10.0),
+            ("Clearance Z, mm", "clearance_z", -10.0, 10.0),
         ]:
             spin = QDoubleSpinBox()
             spin.setRange(minimum, maximum)

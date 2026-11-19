@@ -3,7 +3,7 @@ File:   test_export_service.py
 Brief:  Unit tests for model export to 3D formats.
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations

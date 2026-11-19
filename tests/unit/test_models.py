@@ -3,7 +3,7 @@ File:   test_models.py
 Brief:  Unit tests for BlockSettings validation and derived properties.
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations
@@ -62,15 +62,44 @@ def test_rejects_non_positive_dimensions(field: str, value: float) -> None:
         validate_settings({field: value})
 
 
+def test_negative_clearance_xy_enlarges_stud_only() -> None:
+    '''Negative clearance_xy fattens the stud; the block size stays nominal.'''
+    settings = BlockSettings(
+        cells_x=2, cells_y=3, unit_size=4.0, wall_thickness=0.8, clearance_xy=-0.5
+    )
+    assert settings.outer_length_x == pytest.approx(8.0, abs=1e-9)
+    assert settings.outer_length_y == pytest.approx(12.0, abs=1e-9)
+    # Socket 2.4: the stud is modeled 0.5 fatter (shrinkage interference).
+    assert settings.pin_diameter == pytest.approx(2.9, abs=1e-9)
+    tube_od = (math.sqrt(2.0) - 1.0) * 4.0 + 2.0 * 0.8
+    assert settings.tube_outer_diameter == pytest.approx(tube_od, abs=1e-9)
+    # Just inside the -2*wall bound the stud still fits its cell footprint.
+    loose = BlockSettings(unit_size=4.0, wall_thickness=0.8, clearance_xy=-1.5)
+    assert loose.pin_diameter == pytest.approx(3.9, abs=1e-9)
+
+
+def test_negative_clearance_z_enlarges_stud_only() -> None:
+    '''Negative clearance_z makes the stud taller; the shell stays nominal.'''
+    settings = BlockSettings(clearance_z=-0.5)
+    assert settings.cavity_depth == pytest.approx(2.2, abs=1e-9)
+    assert settings.pin_height == pytest.approx(2.7, abs=1e-9)
+    assert settings.total_height == pytest.approx(5.7, abs=1e-9)
+    sloped = BlockSettings(sloped_cells=[[0, 0, "+Y", 2]], clearance_z=-0.5)
+    assert sloped.slope_rise == pytest.approx(6.0, abs=1e-9)
+
+
 @pytest.mark.parametrize(
     "field, value",
     [
-        ("clearance_xy", -0.1),
-        ("clearance_z", -0.5),
+        ("clearance_xy", -1.6),
+        ("clearance_xy", -3.0),
+        ("clearance_z", -2.2),
+        ("clearance_z", -3.0),
     ],
 )
-def test_rejects_negative_clearances(field: str, value: float) -> None:
-    '''Negative values must fail for ge=0 clearance fields; zero is legal.'''
+def test_rejects_over_sized_studs(field: str, value: float) -> None:
+    '''clearance_xy <= -2*wall would overlap neighboring studs (defaults:
+    -1.6); clearance_z <= -cavity depth fails the sanity bound (-2.2).'''
     with pytest.raises(SettingsValidationError):
         validate_settings({field: value})
 
@@ -308,6 +337,14 @@ def test_recipe_name_distinct_stud_modes() -> None:
         BlockSettings(cells_x=2, cells_y=2, pins_enabled=False).recipe_name()
         == "2x2-studless"
     )
+
+
+def test_recipe_name_encodes_negative_clearance() -> None:
+    '''Negative mm deltas encode with a minus sign and stay file-name safe.'''
+    settings = BlockSettings(clearance_xy=-0.5, clearance_z=-0.25)
+    name = settings.recipe_name()
+    assert "cx-0.5" in name
+    assert "cz-0.25" in name
 
 
 def test_recipe_name_encodes_cell_features() -> None:

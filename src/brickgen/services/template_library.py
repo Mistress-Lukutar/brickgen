@@ -3,7 +3,7 @@ File:   template_library.py
 Brief:  Template library: named settings presets from builtin and user dirs.
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations

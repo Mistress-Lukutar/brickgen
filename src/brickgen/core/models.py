@@ -3,7 +3,7 @@ File:   models.py
 Brief:  Pydantic settings model describing the parametric block geometry.
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations
@@ -119,12 +119,18 @@ class BlockSettings(BaseModel):
         unit_size: Footprint of a single 1x1 cell in mm.
         wall_thickness: Shell wall thickness in mm (also used for tubes).
         block_height: Height of the shell from bottom rim to top face, mm.
-        clearance_xy: Fit clearance in the X/Y plane, mm. The stud diameter
-            shrinks by this value relative to the cell socket
+        clearance_xy: Fit clearance in the X/Y plane, mm. Positive: the stud
+            diameter shrinks by this value relative to the cell socket
             (``unit_size - 2*wall_thickness``) so stacked blocks slide together.
-        clearance_z: Vertical fit clearance, mm. The stud height shrinks by
-            this value relative to the cavity depth
+            Negative: the stud is modeled fatter than the socket by
+            ``|clearance_xy|`` - an interference fit compensating print
+            shrinkage; the block dimensions stay nominal.
+        clearance_z: Vertical fit clearance, mm. Positive: the stud height
+            shrinks by this value relative to the cavity depth
             (``block_height - wall_thickness``) so studs never bottom out.
+            Negative: the stud is modeled taller than the cavity depth by
+            ``|clearance_z|`` (shrinkage compensation); the block dimensions
+            stay nominal.
         pins_enabled: Default top for plain cells: studs. Cells listed in
             ``flat_cells``/``stud_cells`` override this per cell; sloped and
             excluded cells ignore it.
@@ -150,8 +156,8 @@ class BlockSettings(BaseModel):
     unit_size: float = Field(default=4.0, gt=0)
     wall_thickness: float = Field(default=0.8, gt=0)
     block_height: float = Field(default=3.0, gt=0)
-    clearance_xy: float = Field(default=0.2, ge=0)
-    clearance_z: float = Field(default=0.2, ge=0)
+    clearance_xy: float = Field(default=0.2)
+    clearance_z: float = Field(default=0.2)
     pins_enabled: bool = True
     tubes_enabled: bool = True
     excluded_cells: list[list[int]] = Field(default_factory=list)
@@ -226,9 +232,9 @@ class BlockSettings(BaseModel):
     )
     @classmethod
     def _validate_finite(cls, value: float) -> float:
-        '''Reject non-finite values (NaN/inf slip past ``gt=0`` / ``ge=0``).'''
+        '''Reject non-finite values (NaN/inf slip past the Field bounds).'''
         if not value < float("inf") or value != value:
-            raise SettingsValidationError("dimension must be a finite positive number")
+            raise SettingsValidationError("dimension must be a finite number")
         return value
 
     @field_validator("sloped_cells")
@@ -344,8 +350,10 @@ class BlockSettings(BaseModel):
         '''Derived stud diameter: cell socket minus the X/Y clearance, mm.
 
         The socket a stud enters is ``unit_size - 2*wall_thickness`` wide (the
-        same hole a round cell gets), so the stud slides in with
-        ``clearance_xy`` of diametral play.
+        same hole a round cell gets); positive ``clearance_xy`` leaves that
+        much diametral play. A negative clearance models the stud fatter than
+        the socket - an interference fit compensating print shrinkage; the
+        block dimensions stay nominal.
         '''
         return self.unit_size - 2.0 * self.wall_thickness - self.clearance_xy
 
@@ -355,7 +363,8 @@ class BlockSettings(BaseModel):
 
         When a block is stacked onto the studs, its rim rests on the host top
         face while each stud top stays ``clearance_z`` below the cavity
-        ceiling.
+        ceiling. A negative clearance models the stud taller than the cavity
+        depth (shrinkage compensation); the block dimensions stay nominal.
         '''
         return self.cavity_depth - self.clearance_z
 
@@ -366,7 +375,9 @@ class BlockSettings(BaseModel):
         The tube presses the four surrounding studs toward the cavity walls:
         its surface keeps ``clearance_xy / 2`` to each stud surface along the
         stud-tube center line, so the clearance cancels out of the formula and
-        the diameter depends only on the unit and wall thickness.
+        the diameter depends only on the unit and wall thickness. Under a
+        negative clearance the gap turns into an interference that the shrunk
+        printed stud takes up.
         '''
         return _TUBE_PRESS_RATIO * self.unit_size + 2.0 * self.wall_thickness
 
@@ -491,15 +502,17 @@ class BlockSettings(BaseModel):
                 "block_height must exceed wall_thickness "
                 "(top face keeps wall thickness)"
             )
-        if self.clearance_xy >= self.unit_size - 2.0 * self.wall_thickness:
+        socket = self.unit_size - 2.0 * self.wall_thickness
+        if not -2.0 * self.wall_thickness < self.clearance_xy < socket:
             raise SettingsValidationError(
-                "clearance_xy must stay below the cell socket width "
-                "(unit_size - 2*wall_thickness) to keep a positive stud diameter"
+                "clearance_xy must stay within (-2*wall, unit_size - 2*wall) "
+                "so the stud stays positive and neighboring studs do not overlap"
             )
-        if self.clearance_z >= self.block_height - self.wall_thickness:
+        depth = self.block_height - self.wall_thickness
+        if not -depth < self.clearance_z < depth:
             raise SettingsValidationError(
-                "clearance_z must stay below the cavity depth "
-                "(block_height - wall_thickness) to keep a positive stud height"
+                "|clearance_z| must stay below the cavity depth "
+                "(block_height - wall_thickness)"
             )
         if self.has_tubes:
             cavity_min = (

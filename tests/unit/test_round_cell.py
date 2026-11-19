@@ -3,7 +3,7 @@ File:   test_round_cell.py
 Brief:  Unit tests for round-base cells (stadium silhouette, fused cavities).
 Author: Mistress-Lukutar
 Date:   2026-11-19
-Version: v0.11.0
+Version: v0.12.0
 '''
 
 from __future__ import annotations
