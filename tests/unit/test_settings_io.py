@@ -2,8 +2,8 @@
 File:   test_settings_io.py
 Brief:  Unit tests for JSON settings persistence.
 Author: Mistress-Lukutar
-Date:   2026-11-17
-Version: v0.10.0
+Date:   2026-11-19
+Version: v0.11.0
 '''
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def test_saved_file_has_schema_marker(tmp_path: Path) -> None:
     path = save_settings(BlockSettings(), tmp_path / "preset.json")
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema"]["name"] == "brickgen-settings"
-    assert payload["schema"]["version"] == 2
+    assert payload["schema"]["version"] == 3
 
 
 def test_load_missing_file(tmp_path: Path) -> None:

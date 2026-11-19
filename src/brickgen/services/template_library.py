@@ -2,8 +2,8 @@
 File:   template_library.py
 Brief:  Template library: named settings presets from builtin and user dirs.
 Author: Mistress-Lukutar
-Date:   2026-11-17
-Version: v0.10.0
+Date:   2026-11-19
+Version: v0.11.0
 '''
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 SCHEMA_KEY = "schema"
 TEMPLATE_NAME_KEY = "template_name"
 SETTINGS_SCHEMA_NAME = "brickgen-settings"
-SETTINGS_SCHEMA_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 3
 
 # Read-only templates shipped with the application.
 BUILTIN_DIR = Path(__file__).resolve().parent.parent / "data" / "templates"

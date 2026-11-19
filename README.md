@@ -19,15 +19,25 @@ solid top wall, and one cylindrical stud per 1×1 cell:
 | `unit_size` | 4.0 mm | 1×1 cell footprint (4×4 mm square) |
 | `wall_thickness` | 0.8 mm | Wall, top-wall and tube thickness |
 | `block_height` | 3.0 mm | Shell height from bottom rim to top face |
-| `pin_diameter` | 2.6 mm | Stud diameter |
-| `pin_height` | 2.0 mm | Stud height above the top face |
-| `tube_inner_diameter` | 1.2 mm | Inner tube bore diameter |
+| `clearance_xy` | 0.2 mm | Lateral fit clearance per stud side (≥ 0) |
+| `clearance_z` | 0.2 mm | Vertical fit clearance above stud tip (≥ 0) |
 | `pins_enabled` | true | Top studs on/off |
 | `tubes_enabled` | true | Inner tubes on/off |
-| `slope_rise_units` | 0 | Slope rise in unit heights (stud-less blocks only) |
-| `slope_side` | `+X` | Raised slope edge: `+X`/`-X`/`+Y`/`-Y` |
-| `excluded_cells` | — | 0-based `[ix, iy]` cells removed from the figure |
-| `sloped_cells` | — | `[ix, iy, side]` cells with a chamfered (wedge) bottom |
+| `excluded_cells` | — | `[ix, iy]` cells removed from the figure |
+| `flat_cells` | — | `[ix, iy]` cells explicitly without a stud (plain top) |
+| `stud_cells` | — | `[ix, iy]` cells explicitly with a stud (used when `pins_enabled` is false) |
+| `sloped_cells` | — | `[ix, iy, side, rise]` cells whose top is a wedge rising by `rise × block_height` toward `side` |
+| `chamfered_cells` | — | `[ix, iy, side]` cells with a chamfered (solid wedge) bottom |
+| `round_cells` | — | `[ix, iy]` cells with a round/stadium base and concentric round bottom hole |
+
+- **Derived dimensions** (computed from parameters): cell socket =
+  `unit_size − 2·wall_thickness`; stud diameter = socket − `clearance_xy`;
+  stud height = (`block_height − wall_thickness`) − `clearance_z` (stud never
+  bottoms out in the cavity); tube outer diameter = `(√2−1)·unit_size +
+  2·wall_thickness` (tube presses four surrounding studs toward cavity walls,
+  keeping `clearance_xy/2` to each stud surface — clearance cancels out of the
+  formula); tube bore = outer − 2·wall (plastic-saving only, solid rod when
+  bore ≤ 0).
 
 - Footprint: `cells_x × unit_size` by `cells_y × unit_size`; Z=0 is the bottom
   plane; the cavity depth is `block_height − wall_thickness`.
@@ -40,17 +50,15 @@ solid top wall, and one cylindrical stud per 1×1 cell:
   shape; concave corners get inward quarter-round ribs (radius = 2 × wall
   thickness) instead of tubes. Studs remain on every cell that still has
   material.
-- **Bottom chamfers** (`sloped_cells`): the cell's bottom becomes a solid
+- **Bottom chamfers** (`chamfered_cells`): the cell's bottom becomes a solid
   wedge tapering from zero thickness at the outward face to full height —
   the cell has no cavity opening there. Allowed only on faces that look
   outward (the neighbor across the face is excluded or outside the grid);
   a corner cell may be chamfered on two sides. Chamfers switch the builder
   to the figure variant; tubes do not apply.
-- **Sloped top** (stud-less blocks only): one top edge rises by
-  `slope_rise_units × block_height` and the top face slopes down to the
-  opposite edge, forming a wedge. The cavity ceiling keeps a constant
-  vertical top-wall thickness at any rise, so it never breaks through the
-  slope (regression-tested). Studs and tubes do not apply.
+- **Sloped top** (per-cell): each `sloped_cells` entry specifies a wedge whose
+  raised edge is at `side`; the rise is `rise × block_height` in unit heights.
+  A sloped cell keeps its normal hollow bottom unless also chamfered.
 
 ## Quick Start (Windows)
 
@@ -81,12 +89,12 @@ Features:
 
 - Parameter form; the model rebuilds **automatically** after any change
   (250 ms debounce) — there is no Generate button.
-- **Layout (top view)** grid editor: click a cell to cycle
-  included → excluded → bottom-chamfered (arrow marks the outward chamfer
-  side; extra clicks add a second outward side on corner cells);
+- **Layout (top view)** grid editor: click to select a cell, drag to frame a
+  rectangular area (plain drag replaces the selection, Ctrl+drag extends it);
   *Include all cells* resets the grid.
-- **Slope group** for stud-less blocks: rise in unit heights and the raised
-  edge side (`+X/-X/+Y/-Y`).
+- **Cell inspector** for the selected cells: exclude, stud, slope (raised edge
+  `+X/-X/+Y/-Y`, rise in unit heights), round base, bottom chamfer with its
+  outward side.
 - **Template library** on the right: cards with rendered previews; click
   applies a template, *Save as template…* stores the current parameters.
   Built-in templates ship with the package
@@ -117,15 +125,17 @@ All heavy work (model build, meshing) runs in a **worker process**
 python -m brickgen.cli.main generate -x 2 -y 6 block_2x6.step
 python -m brickgen.cli.main generate --settings preset.json block_1x4.stl
 python -m brickgen.cli.main generate -x 3 -y 2 --exclude "1,1" corner.step
-python -m brickgen.cli.main generate -x 2 -y 2 --no-pins --slope-rise 2 --slope-side +X wedge.step
-python -m brickgen.cli.main generate -x 2 -y 2 --slope-cells "1,0,+X;0,1,+Y" chamfers.step
+python -m brickgen.cli.main generate -x 2 -y 2 --no-pins --slope-cells "0,0,+X,1;1,0,+X,1;0,1,+X,1;1,1,+X,1" wedge.step
+python -m brickgen.cli.main generate -x 2 -y 2 --slope-cells "1,0,+X,1;0,1,+Y,1" chamfers.step
 python -m brickgen.cli.main formats          # list supported formats
 ```
 
 Options: `--cells-x/-x`, `--cells-y/-y`, `--unit-size`, `--wall`, `--height`,
-`--pin-diameter`, `--pin-height`, `--no-pins`, `--no-tubes`, `--tube-bore`,
-`--slope-rise`, `--slope-side`, `--exclude "ix,iy;..."`,
-`--slope-cells "ix,iy,side;..."`, `--settings/-s preset.json` (explicit CLI
+`--clearance-xy`, `--clearance-z`, `--no-pins`, `--no-tubes`,
+`--exclude "ix,iy;..."`, `--flat-cells "ix,iy;..."`,
+`--stud-cells "ix,iy;..."`, `--slope-cells "ix,iy,side,rise;..."`,
+`--chamfer-cells "ix,iy,side;..."`, `--round-cells "ix,iy;..."`,
+`--settings/-s preset.json` (explicit CLI
 options always win over preset values). The export format is derived from the
 output extension (`step`, `stl`, `amf`, `3mf`, `svg`, `vrml`, `brep` —
 case-insensitive).
@@ -134,22 +144,24 @@ case-insensitive).
 
 ```json
 {
-  "schema": {"name": "brickgen-settings", "version": 1},
+  "schema": {"name": "brickgen-settings", "version": 3},
   "cells_x": 2,
   "cells_y": 6,
   "unit_size": 4.0,
   "wall_thickness": 0.7,
   "block_height": 8.0,
-  "pin_diameter": 2.6,
-  "pin_height": 2.0,
+  "clearance_xy": 0.2,
+  "clearance_z": 0.2,
   "pins_enabled": true
 }
 ```
 
 The `schema` block is optional on load and always written on save. Unknown
 keys (`extra: forbid`) and out-of-range values are rejected by validation,
-e.g. `wall_thickness * 2 < unit_size`, `pin_diameter < unit_size`,
-`block_height > wall_thickness`, tube must fit the cavity.
+e.g. `2·wall < unit` (cavity exists), `block_height > wall` (top face),
+`clearance_xy < unit − 2·wall` and `clearance_z < block_height − wall`
+(positive stud size); old presets with v1 diameter/height/bore keys load
+silently — legacy keys are dropped.
 
 ## Project Layout (src-layout)
 

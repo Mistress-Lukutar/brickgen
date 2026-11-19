@@ -2,8 +2,8 @@
 File:   test_round_cell.py
 Brief:  Unit tests for round-base cells (stadium silhouette, fused cavities).
 Author: Mistress-Lukutar
-Date:   2026-11-18
-Version: v0.2.0
+Date:   2026-11-19
+Version: v0.11.0
 '''
 
 from __future__ import annotations
@@ -138,8 +138,11 @@ def test_round_cell_next_to_square_cell() -> None:
     assert _material_at(solid, (-1.0, 1.9, 0.3))
 
 
-def test_all_round_2x2_fused_cavity_with_tube() -> None:
-    '''A 2x2 all-round block: one merged cavity, no walls, central tube.'''
+def test_all_round_2x2_fused_cavity_without_tube() -> None:
+    '''A 2x2 all-round block: one merged cavity, no tubes.
+
+    Every vertex touches round cells so tubes are skipped.
+    '''
     settings = BlockSettings(
         cells_x=2, cells_y=2, round_cells=[[0, 0], [1, 0], [0, 1], [1, 1]]
     )
@@ -151,11 +154,9 @@ def test_all_round_2x2_fused_cavity_with_tube() -> None:
     t = settings.wall_thickness
     outer_area = 4.0 * u * u - (4.0 - math.pi) * (u / 2.0) ** 2
     cavity_area = 4.0 * (u - t) ** 2 - (4.0 - math.pi) * (u / 2.0 - t) ** 2
-    r_out = settings.tube_inner_diameter / 2.0 + t
-    r_in = settings.tube_inner_diameter / 2.0
-    tube_volume = math.pi * (r_out**2 - r_in**2) * (h - t)
+    # No tubes: every vertex has all four quadrants as round cells → skipped
     expected = outer_area * h - cavity_area * (h - t)
-    expected += tube_volume + 4 * _stud_volume(settings)
+    expected += 4 * _stud_volume(settings)
     assert solid.Volume() == pytest.approx(expected, rel=1e-3)
     # each round cell keeps a void at its center
     for cx, cy in ((-2.0, -2.0), (2.0, -2.0), (-2.0, 2.0), (2.0, 2.0)):
@@ -165,9 +166,8 @@ def test_all_round_2x2_fused_cavity_with_tube() -> None:
     assert not _material_at(solid, (1.2, 1.2, 0.3))
     assert not _material_at(solid, (0.0, -1.5, 0.3))
     assert not _material_at(solid, (-1.5, 0.0, 0.3))
-    # the center vertex carries the reinforcement tube: bore void, wall
+    # the center vertex is a void (fill box removes the pillar)
     assert not _material_at(solid, (0.0, 0.0, 0.3))
-    assert _material_at(solid, (0.0, 1.0, 0.3))
 
 
 def test_all_round_2x2_without_tubes() -> None:
@@ -193,8 +193,8 @@ def test_all_round_2x2_without_tubes() -> None:
     assert not _material_at(solid, (0.0, 1.0, 0.3))
 
 
-def test_all_round_3x2_tubes() -> None:
-    '''A 3x2 all-round block gets two tubes like the flat variant.'''
+def test_all_round_3x2_no_tubes() -> None:
+    '''A 3x2 all-round block gets no tubes (every vertex touches round cells).'''
     settings = BlockSettings(
         cells_x=3,
         cells_y=2,
@@ -202,13 +202,13 @@ def test_all_round_3x2_tubes() -> None:
     )
     solid = build_block(settings).val()
     assert len(build_block(settings).solids().vals()) == 1
-    # tube bores at the mid-lines between stud columns
+    # tube bores at mid-lines are now void (top-row cavities extend down)
     assert not _material_at(solid, (-2.0, 0.0, 0.3))
     assert not _material_at(solid, (2.0, 0.0, 0.3))
-    # tube walls
-    assert _material_at(solid, (-2.0, 1.0, 0.3))
-    assert _material_at(solid, (2.0, -1.0, 0.3))
-    # fused cavity between and around the tubes
+    # tube walls: left wall at y=1.0 is in cell (0,1) cavity; right wall cut by fill box
+    assert not _material_at(solid, (-2.0, 1.0, 0.3))
+    assert not _material_at(solid, (2.0, -1.0, 0.3))
+    # fused cavity between and around the former tube positions
     assert not _material_at(solid, (0.0, -0.5, 0.3))
     assert not _material_at(solid, (0.0, 0.5, 0.3))
     assert not _material_at(solid, (-2.0, 2.0, 0.3))
@@ -227,8 +227,9 @@ def test_round_cell_in_2x2_plain_block() -> None:
     assert not _material_at(solid, (-0.6, -2.0, 0.3))
     assert not _material_at(solid, (-2.0, -0.6, 0.3))
     assert not _material_at(solid, (0.0, 0.0, 0.3))
-    # the central tube sits on the merged cavity
-    assert _material_at(solid, (0.0, 1.0, 0.3))
+    # central vertex is now void (fill box removes the pillar)
+    # point above center is in cell (0,1)'s cavity (y=1.0 within [0.4, 3.6])
+    assert not _material_at(solid, (0.0, 1.0, 0.3))
 
 
 def test_round_l_shape_keeps_corner_wall() -> None:

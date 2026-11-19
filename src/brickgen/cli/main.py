@@ -2,8 +2,8 @@
 File:   main.py
 Brief:  Typer CLI entry point for headless block generation and export.
 Author: Mistress-Lukutar
-Date:   2026-11-17
-Version: v0.10.0
+Date:   2026-11-19
+Version: v0.11.0
 '''
 
 from __future__ import annotations
@@ -94,19 +94,22 @@ def generate(
     unit_size: float = typer.Option(4.0, "--unit-size", help="1x1 cell footprint, mm."),
     wall: float = typer.Option(0.8, "--wall", help="Wall thickness, mm."),
     height: float = typer.Option(3.0, "--height", help="Block height, mm."),
-    pin_diameter: float = typer.Option(
-        2.6, "--pin-diameter", help="Stud diameter, mm."
+    clearance_xy: float = typer.Option(
+        0.2,
+        "--clearance-xy",
+        help="Fit clearance X/Y, mm: stud diameter shrink from the cell socket.",
     ),
-    pin_height: float = typer.Option(2.0, "--pin-height", help="Stud height, mm."),
+    clearance_z: float = typer.Option(
+        0.2,
+        "--clearance-z",
+        help="Fit clearance Z, mm: stud height shrink from the cavity depth.",
+    ),
     no_pins: bool = typer.Option(
         False,
         "--no-pins",
         help="Omit top studs on plain cells (explicit --stud-cells still apply).",
     ),
     no_tubes: bool = typer.Option(False, "--no-tubes", help="Omit inner tubes."),
-    tube_inner_diameter: float = typer.Option(
-        1.2, "--tube-bore", help="Inner tube bore diameter, mm."
-    ),
     exclude: str = typer.Option(
         "", "--exclude", help="Cells to remove, e.g. '0,1;2,1' (ix,iy from 0)."
     ),
@@ -157,11 +160,10 @@ def generate(
             "unit_size": unit_size,
             "wall_thickness": wall,
             "block_height": height,
-            "pin_diameter": pin_diameter,
-            "pin_height": pin_height,
+            "clearance_xy": clearance_xy,
+            "clearance_z": clearance_z,
             "pins_enabled": not no_pins,
             "tubes_enabled": not no_tubes,
-            "tube_inner_diameter": tube_inner_diameter,
             "excluded_cells": _parse_cell_list(exclude, 2, "exclude"),
             "flat_cells": _parse_cell_list(flat_cells, 2, "flat-cells"),
             "stud_cells": _parse_cell_list(stud_cells, 2, "stud-cells"),

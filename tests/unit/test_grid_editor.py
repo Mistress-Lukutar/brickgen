@@ -2,8 +2,8 @@
 File:   test_grid_editor.py
 Brief:  Unit tests for the layout CellGridEditor selection behavior.
 Author: Mistress-Lukutar
-Date:   2026-11-18
-Version: v0.10.0
+Date:   2026-11-19
+Version: v0.11.0
 '''
 
 import os

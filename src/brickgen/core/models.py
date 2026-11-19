@@ -2,12 +2,13 @@
 File:   models.py
 Brief:  Pydantic settings model describing the parametric block geometry.
 Author: Mistress-Lukutar
-Date:   2026-11-17
-Version: v0.10.0
+Date:   2026-11-19
+Version: v0.11.0
 '''
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -16,6 +17,12 @@ from brickgen.core.exceptions import SettingsValidationError
 
 MAX_CELLS = 64  # sanity limit per axis for GUI/CLI input
 MAX_SLOPE_RISE = 16  # sanity limit for the slope rise in unit heights
+
+# Outer tube diameter factor: the tube surface keeps clearance_xy/2 to the
+# four surrounding stud surfaces along the stud-tube center line (stud
+# centers sit at unit_size*sqrt(2)/2 from the tube vertex), so the clearance
+# cancels out and the diameter depends only on unit and wall thickness.
+_TUBE_PRESS_RATIO: float = math.sqrt(2.0) - 1.0
 
 # Side of the raised edge that forms a slope (top) or a chamfer (bottom).
 SlopeSide = Literal["+X", "-X", "+Y", "-Y"]
@@ -27,8 +34,8 @@ _RECIPE_MM_FIELDS: tuple[tuple[str, str], ...] = (
     ("u", "unit_size"),
     ("w", "wall_thickness"),
     ("h", "block_height"),
-    ("pd", "pin_diameter"),
-    ("ph", "pin_height"),
+    ("cx", "clearance_xy"),
+    ("cz", "clearance_z"),
 )
 
 
@@ -73,9 +80,11 @@ class BlockSettings(BaseModel):
     The block is a hollow rectangular shell without a bottom: outer footprint
     ``cells_x * unit_size`` by ``cells_y * unit_size``, wall thickness
     ``wall_thickness``, open from below, with a solid top face. For blocks of
-    at least 2x2 cells, hollow reinforcement tubes are placed at the
-    intersections of the mid-lines between stud rows/columns (one tube per
-    sliding 2x2 cell group center).
+    at least 2x2 cells, hollow reinforcement tubes are derived (outer diameter
+    depends only on the unit and wall thickness) and placed at the intersections
+    of the mid-lines between stud rows/columns; their role is to press the
+    surrounding studs toward the cavity walls (they replace the missing wall at
+    inner lattice vertices), with a bore that only saves plastic.
 
     Every 1x1 cell carries a per-cell top feature and an optional bottom
     chamfer:
@@ -110,13 +119,16 @@ class BlockSettings(BaseModel):
         unit_size: Footprint of a single 1x1 cell in mm.
         wall_thickness: Shell wall thickness in mm (also used for tubes).
         block_height: Height of the shell from bottom rim to top face, mm.
-        pin_diameter: Top stud diameter in mm.
-        pin_height: Top stud height above the top face in mm.
+        clearance_xy: Fit clearance in the X/Y plane, mm. The stud diameter
+            shrinks by this value relative to the cell socket
+            (``unit_size - 2*wall_thickness``) so stacked blocks slide together.
+        clearance_z: Vertical fit clearance, mm. The stud height shrinks by
+            this value relative to the cavity depth
+            (``block_height - wall_thickness``) so studs never bottom out.
         pins_enabled: Default top for plain cells: studs. Cells listed in
             ``flat_cells``/``stud_cells`` override this per cell; sloped and
             excluded cells ignore it.
         tubes_enabled: Whether to place inner reinforcement tubes (2x2+ blocks).
-        tube_inner_diameter: Inner bore diameter of the tubes, mm.
         excluded_cells: 0-based ``[ix, iy]`` cells removed from the figure
             (top view, ix along X, iy along Y).
         flat_cells: ``[ix, iy]`` cells explicitly without a stud (plain top).
@@ -138,11 +150,10 @@ class BlockSettings(BaseModel):
     unit_size: float = Field(default=4.0, gt=0)
     wall_thickness: float = Field(default=0.8, gt=0)
     block_height: float = Field(default=3.0, gt=0)
-    pin_diameter: float = Field(default=2.6, gt=0)
-    pin_height: float = Field(default=2.0, gt=0)
+    clearance_xy: float = Field(default=0.2, ge=0)
+    clearance_z: float = Field(default=0.2, ge=0)
     pins_enabled: bool = True
     tubes_enabled: bool = True
-    tube_inner_diameter: float = Field(default=1.2, gt=0)
     excluded_cells: list[list[int]] = Field(default_factory=list)
     flat_cells: list[list[int]] = Field(default_factory=list)
     stud_cells: list[list[int]] = Field(default_factory=list)
@@ -154,15 +165,18 @@ class BlockSettings(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _migrate_v1_settings(cls, values: object) -> object:
-        '''Map v1 preset keys onto the v2 per-cell fields.
+    def _migrate_legacy_settings(cls, values: object) -> object:
+        '''Map v1 preset keys and drop derived-v3 legacy keys.
 
         v1 stored bottom chamfers in ``sloped_cells`` as ``[ix, iy, side]``
         triplets (now ``chamfered_cells``) and described the stud-less
         whole-block slope with global ``slope_side``/``slope_rise_units``.
         Triplet entries are moved to ``chamfered_cells``; a positive global
         rise on a stud-less block is expanded into per-cell slopes covering
-        the whole grid.
+        the whole grid.  v3 derived ``pin_diameter``, ``pin_height``, and
+        ``tube_inner_diameter`` from fit-clearance fields, so old presets that
+        still carry those keys are silently stripped (``extra="forbid"`` must
+        not reject them).
         '''
         if not isinstance(values, dict):
             return values
@@ -197,19 +211,22 @@ class BlockSettings(BaseModel):
                 for iy in range(cells_y)
                 for ix in range(cells_x)
             ]
+        # v3: pin_diameter, pin_height, tube_inner_diameter are now derived.
+        values.pop("pin_diameter", None)
+        values.pop("pin_height", None)
+        values.pop("tube_inner_diameter", None)
         return values
 
     @field_validator(
         "unit_size",
         "wall_thickness",
         "block_height",
-        "pin_diameter",
-        "pin_height",
-        "tube_inner_diameter",
+        "clearance_xy",
+        "clearance_z",
     )
     @classmethod
-    def _validate_positive_finite(cls, value: float) -> float:
-        '''Reject non-finite values (NaN/inf slip past ``gt=0``).'''
+    def _validate_finite(cls, value: float) -> float:
+        '''Reject non-finite values (NaN/inf slip past ``gt=0`` / ``ge=0``).'''
         if not value < float("inf") or value != value:
             raise SettingsValidationError("dimension must be a finite positive number")
         return value
@@ -318,9 +335,49 @@ class BlockSettings(BaseModel):
         return sorted(result)
 
     @property
+    def cavity_depth(self) -> float:
+        '''Internal cavity depth from the bottom rim to the ceiling, mm.'''
+        return self.block_height - self.wall_thickness
+
+    @property
+    def pin_diameter(self) -> float:
+        '''Derived stud diameter: cell socket minus the X/Y clearance, mm.
+
+        The socket a stud enters is ``unit_size - 2*wall_thickness`` wide (the
+        same hole a round cell gets), so the stud slides in with
+        ``clearance_xy`` of diametral play.
+        '''
+        return self.unit_size - 2.0 * self.wall_thickness - self.clearance_xy
+
+    @property
+    def pin_height(self) -> float:
+        '''Derived stud height: cavity depth minus the Z clearance, mm.
+
+        When a block is stacked onto the studs, its rim rests on the host top
+        face while each stud top stays ``clearance_z`` below the cavity
+        ceiling.
+        '''
+        return self.cavity_depth - self.clearance_z
+
+    @property
     def tube_outer_diameter(self) -> float:
-        '''Outer tube diameter: bore plus two wall-thickness shells, mm.'''
-        return self.tube_inner_diameter + 2.0 * self.wall_thickness
+        '''Derived outer tube diameter, mm.
+
+        The tube presses the four surrounding studs toward the cavity walls:
+        its surface keeps ``clearance_xy / 2`` to each stud surface along the
+        stud-tube center line, so the clearance cancels out of the formula and
+        the diameter depends only on the unit and wall thickness.
+        '''
+        return _TUBE_PRESS_RATIO * self.unit_size + 2.0 * self.wall_thickness
+
+    @property
+    def tube_inner_diameter(self) -> float:
+        '''Derived tube bore diameter: outer minus two wall shells, mm.
+
+        The bore only saves plastic; at very small units it collapses towards
+        zero and the builder fuses a solid rod instead.
+        '''
+        return self.tube_outer_diameter - 2.0 * self.wall_thickness
 
     @property
     def has_tubes(self) -> bool:
@@ -434,8 +491,16 @@ class BlockSettings(BaseModel):
                 "block_height must exceed wall_thickness "
                 "(top face keeps wall thickness)"
             )
-        if self.has_studs and self.pin_diameter >= self.unit_size:
-            raise SettingsValidationError("pin_diameter must be smaller than unit_size")
+        if self.clearance_xy >= self.unit_size - 2.0 * self.wall_thickness:
+            raise SettingsValidationError(
+                "clearance_xy must stay below the cell socket width "
+                "(unit_size - 2*wall_thickness) to keep a positive stud diameter"
+            )
+        if self.clearance_z >= self.block_height - self.wall_thickness:
+            raise SettingsValidationError(
+                "clearance_z must stay below the cavity depth "
+                "(block_height - wall_thickness) to keep a positive stud height"
+            )
         if self.has_tubes:
             cavity_min = (
                 min(self.outer_length_x, self.outer_length_y)
@@ -557,8 +622,8 @@ class BlockSettings(BaseModel):
         other apart (``2x2-studs`` vs ``2x2-studless``): dimensions, top
         type, tube state, every per-cell feature with its coordinates and
         sides, and any millimeter dimension deviating from the factory
-        defaults. Tokens that carry no geometry (e.g. the tube bore of a
-        tube-less block) are omitted, so common names stay short:
+        defaults. Tokens that carry no geometry are omitted, so common names
+        stay short:
 
         - ``2x2-studs`` / ``2x2-studless`` - plain blocks;
         - ``1x2-studs_sl0,1,+Y,1`` - the top-slope showcase brick;
@@ -581,10 +646,6 @@ class BlockSettings(BaseModel):
             value = getattr(self, field)
             if value != default:
                 tail.append(f"{token}{value:g}")
-        if self.has_tubes:
-            tb_default = BlockSettings.model_fields["tube_inner_diameter"].default
-            if self.tube_inner_diameter != tb_default:
-                tail.append(f"tb{self.tube_inner_diameter:g}")
         if self.excluded_cells:
             tail.append(_cell_entries("ex", self.excluded_cells))
         if self.flat_cells:

@@ -1,7 +1,7 @@
 {
   "schema": {
     "name": "brickgen-settings",
-    "version": 2
+    "version": 3
   },
   "template_name": "Brick 1x1",
   "cells_x": 1,

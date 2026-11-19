@@ -2,11 +2,13 @@
 File:   test_models.py
 Brief:  Unit tests for BlockSettings validation and derived properties.
 Author: Mistress-Lukutar
-Date:   2026-11-17
-Version: v0.10.0
+Date:   2026-11-19
+Version: v0.11.0
 '''
 
 from __future__ import annotations
+
+import math
 
 import pytest
 
@@ -19,9 +21,15 @@ def test_defaults_match_specification(default_settings: BlockSettings) -> None:
     assert default_settings.unit_size == 4.0
     assert default_settings.wall_thickness == 0.8
     assert default_settings.block_height == 3.0
-    assert default_settings.pin_diameter == 2.6
-    assert default_settings.pin_height == 2.0
-    assert default_settings.tube_inner_diameter == 1.2
+    assert default_settings.clearance_xy == 0.2
+    assert default_settings.clearance_z == 0.2
+    # Derived values from clearance fields
+    assert default_settings.pin_diameter == pytest.approx(2.2, abs=1e-9)
+    assert default_settings.pin_height == pytest.approx(2.0, abs=1e-9)
+    tube_od = (math.sqrt(2.0) - 1.0) * 4.0 + 2.0 * 0.8
+    tube_id = tube_od - 2.0 * 0.8
+    assert default_settings.tube_outer_diameter == pytest.approx(tube_od, abs=1e-9)
+    assert default_settings.tube_inner_diameter == pytest.approx(tube_id, abs=1e-9)
     assert default_settings.cells_x == 1
     assert default_settings.cells_y == 1
 
@@ -46,14 +54,34 @@ def test_total_height_without_pins() -> None:
         ("unit_size", 0.0),
         ("wall_thickness", -1.0),
         ("block_height", 0.0),
-        ("pin_diameter", 0.0),
-        ("pin_height", -0.5),
     ],
 )
 def test_rejects_non_positive_dimensions(field: str, value: float) -> None:
-    '''Zero and negative dimensions must fail validation.'''
+    '''Zero and negative values must fail for gt=0 dimension fields.'''
     with pytest.raises(SettingsValidationError):
         validate_settings({field: value})
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("clearance_xy", -0.1),
+        ("clearance_z", -0.5),
+    ],
+)
+def test_rejects_negative_clearances(field: str, value: float) -> None:
+    '''Negative values must fail for ge=0 clearance fields; zero is legal.'''
+    with pytest.raises(SettingsValidationError):
+        validate_settings({field: value})
+
+
+def test_zero_clearances_allowed() -> None:
+    '''Zero clearance_xy and clearance_z are valid (pin_diameter == 2.0).'''
+    settings = BlockSettings(
+        clearance_xy=0.0, clearance_z=0.0, unit_size=4.0, wall_thickness=1.0
+    )
+    assert settings.pin_diameter == pytest.approx(2.0, abs=1e-9)
+    assert settings.pin_height == pytest.approx(2.0, abs=1e-9)
 
 
 def test_rejects_wall_leaving_no_cavity() -> None:
@@ -62,10 +90,14 @@ def test_rejects_wall_leaving_no_cavity() -> None:
         validate_settings({"wall_thickness": 2.0})
 
 
-def test_rejects_pin_wider_than_cell() -> None:
-    '''A stud wider than the unit cell cannot fit.'''
-    with pytest.raises(SettingsValidationError):
-        validate_settings({"pin_diameter": 5.0})
+def test_rejects_clearance_leaving_no_stud() -> None:
+    '''clearance_xy >= socket width or clearance_z >= cavity depth must fail.'''
+    # At defaults: socket = 4.0 - 2*0.8 = 2.4; equality (>=) raises
+    with pytest.raises(SettingsValidationError, match="clearance_xy"):
+        validate_settings({"clearance_xy": 2.4})
+    # cavity_depth = 3.0 - 0.8 = 2.2; equality (>=) raises
+    with pytest.raises(SettingsValidationError, match="clearance_z"):
+        validate_settings({"clearance_z": 2.2})
 
 
 def test_rejects_unknown_fields() -> None:
@@ -75,9 +107,17 @@ def test_rejects_unknown_fields() -> None:
 
 
 def test_rejects_tube_that_does_not_fit_cavity() -> None:
-    '''A tube wider than the cavity must fail validation.'''
-    with pytest.raises(SettingsValidationError):
-        validate_settings({"cells_x": 2, "cells_y": 2, "tube_inner_diameter": 5.2})
+    '''A tube wider than the cavity must fail validation (via derived sizes).'''
+    # unit_size=4.0, wall_thickness=1.8 → tube_outer ≈ 5.26 ≥ cavity width 4.4
+    with pytest.raises(SettingsValidationError, match="tube_outer_diameter"):
+        validate_settings(
+            {
+                "cells_x": 2,
+                "cells_y": 2,
+                "unit_size": 4.0,
+                "wall_thickness": 1.8,
+            }
+        )
 
 
 def test_has_tubes_requires_2x2() -> None:
@@ -312,11 +352,24 @@ def test_recipe_name_tubes_and_dimensions() -> None:
     )
     tall = BlockSettings(cells_x=2, cells_y=2, block_height=6.0)
     assert tall.recipe_name() == "2x2-studs_h6"
+    # Non-default mm fields produce tokens in field order; no legacy pd/ph/tb
     exotic = BlockSettings(
         cells_x=2,
         cells_y=2,
         unit_size=5.6,
         block_height=4.5,
-        tube_inner_diameter=2.0,
+        clearance_xy=0.3,
+        clearance_z=0.1,
     )
-    assert exotic.recipe_name() == "2x2-studs_u5.6_h4.5_tb2"
+    name = exotic.recipe_name()
+    assert "u5.6" in name
+    assert "h4.5" in name
+    assert "cx0.3" in name
+    assert "cz0.1" in name
+    assert "pd" not in name
+    assert "ph" not in name
+    assert "tb" not in name
+    # Defaults produce no cx/cz token
+    defaults = BlockSettings()
+    assert "cx" not in defaults.recipe_name()
+    assert "cz" not in defaults.recipe_name()

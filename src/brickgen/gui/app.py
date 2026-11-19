@@ -2,8 +2,8 @@
 File:   app.py
 Brief:  BrickGen PySide6 main window: parameters, VTK preview, template library.
 Author: Mistress-Lukutar
-Date:   2026-11-18
-Version: v0.10.0
+Date:   2026-11-19
+Version: v0.11.0
 '''
 
 from __future__ import annotations
@@ -190,19 +190,24 @@ class MainWindow(QMainWindow):
         form.addRow("Cells Y (width)", self._cells_y)
 
         self._floats: dict[str, QDoubleSpinBox] = {}
-        for label, field, maximum in [
-            ("Unit size, mm", "unit_size", 100.0),
-            ("Wall thickness, mm", "wall_thickness", 20.0),
-            ("Block height, mm", "block_height", 200.0),
-            ("Pin diameter, mm", "pin_diameter", 50.0),
-            ("Pin height, mm", "pin_height", 100.0),
+        for label, field, minimum, maximum in [
+            ("Unit size, mm", "unit_size", 0.05, 100.0),
+            ("Wall thickness, mm", "wall_thickness", 0.05, 20.0),
+            ("Block height, mm", "block_height", 0.05, 200.0),
+            ("Clearance X/Y, mm", "clearance_xy", 0.0, 10.0),
+            ("Clearance Z, mm", "clearance_z", 0.0, 10.0),
         ]:
             spin = QDoubleSpinBox()
-            spin.setRange(0.05, maximum)
+            spin.setRange(minimum, maximum)
             spin.setSingleStep(0.1)
             spin.setDecimals(2)
             self._floats[field] = spin
             form.addRow(label, spin)
+
+        self._derived_label = QLabel("")
+        self._derived_label.setWordWrap(False)
+        self._derived_label.setStyleSheet("color: #888;")
+        form.addRow(self._derived_label)
 
         self._pins = QCheckBox("Studs on plain cells")
         self._pins.setToolTip(
@@ -214,12 +219,6 @@ class MainWindow(QMainWindow):
 
         self._tubes = QCheckBox("Inner tubes (2x2+ centers)")
         form.addRow(self._tubes)
-        tube_spin = QDoubleSpinBox()
-        tube_spin.setRange(0.1, 20.0)
-        tube_spin.setSingleStep(0.1)
-        tube_spin.setDecimals(2)
-        self._floats["tube_inner_diameter"] = tube_spin
-        form.addRow("Tube bore diameter, mm", tube_spin)
         return group
 
     def _build_layout_group(self) -> QGroupBox:
@@ -411,7 +410,32 @@ class MainWindow(QMainWindow):
         self._cells_y.valueChanged.connect(self._on_cells_changed)
         for spin in self._floats.values():
             spin.valueChanged.connect(self._schedule_rebuild)
+            spin.valueChanged.connect(self._update_derived_label)
         self._tubes.toggled.connect(self._schedule_rebuild)
+
+    def _update_derived_label(self) -> None:
+        '''Update the read-only derived-dimensions label from current spin values.
+
+        A temporary ``BlockSettings`` is built from the live form values so that
+        the computed properties (``pin_diameter``, ``pin_height``,
+        ``tube_outer_diameter``) are always consistent.  Invalid combos mid-edit
+        show a ``"–"`` placeholder instead of crashing.
+        '''
+        try:
+            s = BlockSettings(
+                unit_size=self._floats["unit_size"].value(),
+                wall_thickness=self._floats["wall_thickness"].value(),
+                block_height=self._floats["block_height"].value(),
+                clearance_xy=self._floats["clearance_xy"].value(),
+                clearance_z=self._floats["clearance_z"].value(),
+            )
+        except Exception:
+            self._derived_label.setText("–")
+            return
+        self._derived_label.setText(
+            f"Stud ⌀{s.pin_diameter:.2f} × {s.pin_height:.2f} mm "
+            f"· Tube ⌀{s.tube_outer_diameter:.2f} mm"
+        )
 
     def _schedule_rebuild(self) -> None:
         '''(Re)start the debounced regeneration timer.'''
@@ -694,6 +718,7 @@ class MainWindow(QMainWindow):
         )
         for field, spin in self._floats.items():
             spin.setValue(getattr(self._settings, field))
+        self._update_derived_label()
 
     def _on_mode_changed(self, mode: str) -> None:
         '''Apply the selected display mode to the preview.'''

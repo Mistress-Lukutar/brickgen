@@ -2,8 +2,8 @@
 File:   builder.py
 Brief:  CadQuery geometry builder for parametric stud blocks.
 Author: Mistress-Lukutar
-Date:   2026-11-17
-Version: v0.10.0
+Date:   2026-11-19
+Version: v0.11.0
 '''
 
 from __future__ import annotations
@@ -644,7 +644,8 @@ def _tube_centers(
     gets a single central tube; a 3x2 block gets two tubes along its length.
     With ``cavity_neighbors`` the centers are restricted to vertices whose
     four surrounding cells all keep a cavity (figure variant: vertices next
-    to excluded or chamfered cells carry a rib instead of a tube).
+    to excluded/chamfered cells carry a rib, vertices next to round cells
+    are skipped entirely).
 
     Args:
         settings: Validated parametric block description.
@@ -655,6 +656,7 @@ def _tube_centers(
     '''
     half_x = settings.outer_length_x / 2.0
     half_y = settings.outer_length_y / 2.0
+    round_cells = settings.round_cell_set()
     return [
         (ix * settings.unit_size - half_x, iy * settings.unit_size - half_y)
         for ix in range(1, settings.cells_x)
@@ -662,6 +664,9 @@ def _tube_centers(
         if cavity_neighbors is None
         or all(
             (ix + dx, iy + dy) in cavity_neighbors for dx in (-1, 0) for dy in (-1, 0)
+        )
+        and not any(
+            (ix + dx, iy + dy) in round_cells for dx in (-1, 0) for dy in (-1, 0)
         )
     ]
 
@@ -676,7 +681,8 @@ def _fuse_tubes(
     Each tube is an annulus (bore ``tube_inner_diameter``, wall equal to
     ``wall_thickness``) spanning the full cavity depth, closed on top by the
     solid top face. The outer cylinder overshoots into the top face for a
-    robust boolean union.
+    robust boolean union. The bore is derived (outer minus two wall shells)
+    and only saves plastic; very small units produce a solid rod.
 
     Args:
         shell: Hollow shell to attach tubes to.
@@ -690,12 +696,19 @@ def _fuse_tubes(
     r_in = settings.tube_inner_diameter / 2.0
     tubes: list[cq.Workplane] = []
     for cx, cy in centers if centers is not None else _tube_centers(settings):
-        tube = (
-            cq.Workplane("XY", origin=(cx, cy, 0))
-            .circle(r_out)
-            .circle(r_in)
-            .extrude(settings.block_height)
-        )
+        if r_in <= 0.0:
+            tube = (
+                cq.Workplane("XY", origin=(cx, cy, 0))
+                .circle(r_out)
+                .extrude(settings.block_height)
+            )
+        else:
+            tube = (
+                cq.Workplane("XY", origin=(cx, cy, 0))
+                .circle(r_out)
+                .circle(r_in)
+                .extrude(settings.block_height)
+            )
         tubes.append(tube)
     if not tubes:
         return shell
