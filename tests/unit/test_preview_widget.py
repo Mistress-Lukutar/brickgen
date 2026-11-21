@@ -332,8 +332,8 @@ def test_lmb_drag_never_rotates_camera(preview: PreviewWidget) -> None:
 # -------------------------------------------------------------- navigation
 
 
-def test_mmb_horizontal_drag_orbits_world_z(preview: PreviewWidget) -> None:
-    '''MMB drag right orbits around world Z: height and radius are kept.'''
+def test_mmb_horizontal_drag_turns_model_right(preview: PreviewWidget) -> None:
+    '''MMB drag right turns the model right: height and radius are kept.'''
     camera = preview.renderer.GetActiveCamera()
     offset_before = _camera_offset(preview)
     _mouse_drag(
@@ -347,12 +347,14 @@ def test_mmb_horizontal_drag_orbits_world_z(preview: PreviewWidget) -> None:
     assert float(np.linalg.norm(offset_after)) == pytest.approx(
         float(np.linalg.norm(offset_before))
     )
-    # The camera follows the cursor: dragging right increases the azimuth,
-    # by the configured speed (200 px of a 400 px wide drag).
+    # Grab: the model turns right with the cursor, so the camera azimuth
+    # decreases - 200 px of a 400 px wide drag at ORBIT_DEGREES_PER_AXIS.
     azimuth_before = math.atan2(offset_before[1], offset_before[0])
     azimuth_after = math.atan2(offset_after[1], offset_after[0])
-    assert azimuth_after > azimuth_before
-    assert math.degrees(azimuth_after - azimuth_before) == pytest.approx(75.0)
+    delta = math.degrees(
+        (azimuth_after - azimuth_before + math.pi) % (2.0 * math.pi) - math.pi
+    )
+    assert delta == pytest.approx(-100.0)
     # No roll: the view up keeps zero component along the camera right
     # axis (it stays in the vertical plane spanned by the view direction
     # and the world Z).

@@ -35,10 +35,10 @@ LINE_COLOR = "#111111"
 # Thin black outline around selected blocks.
 SELECTION_COLOR = "#000000"
 
-# Turntable navigation: horizontal drags rotate around the world Z axis and
-# vertical drags grab the model (the front face follows the cursor). Degrees
+# Turntable navigation: the model follows the cursor - horizontal drags
+# turn it around the world Z axis, vertical drags tip it up/down. Degrees
 # covered by a full-window drag, matched between the axes for a uniform feel.
-ORBIT_DEGREES_PER_AXIS = 150.0
+ORBIT_DEGREES_PER_AXIS = 200.0
 # LMB press-to-move distance (manhattan, px) before the rubber band appears.
 RUBBER_BAND_THRESHOLD_PX = 4
 # World up vector of the scene (blocks sit on the XY plane).
@@ -326,8 +326,8 @@ def orbit_offset(
     Args:
         offset: Vector from the focal point to the camera position.
         up: Camera view up vector (kept perpendicular to the view direction).
-        azimuth_deg: Horizontal rotation around world Z (positive follows the
-            cursor to the right), degrees.
+        azimuth_deg: Horizontal rotation around world Z, positive
+            counterclockwise viewed from above (+Z), degrees.
         elevation_deg: Vertical rotation (positive raises the camera),
             degrees.
 
@@ -391,8 +391,9 @@ class PreviewWidget(QtInteractor):
     the left button is selection only (a click picks the block under the
     cursor, Ctrl+click toggles it, a drag draws a rubber band selecting every
     block fully inside it), the middle button orbits the camera turntable
-    style (horizontal drags turn around the world Z, vertical drags grab the
-    model) and Shift+middle pans; the right button and the wheel keep the
+    style (the model follows the cursor: horizontal drags turn it around the
+    world Z, vertical drags tip it up/down) and Shift+middle pans; the right
+    button and the wheel keep the
     native VTK zoom. LMB/MMB events are consumed on the Qt level, so the VTK
     interactor never arms its native rotate/pan/spin states. Blocks are moved
     from the inspector position fields, not by dragging. The mesh is
@@ -902,18 +903,20 @@ class PreviewWidget(QtInteractor):
     def _orbit_camera(self, dx: float, dy: float) -> None:
         '''Turntable-orbit the camera by a mouse delta (Qt pixels).
 
-        Horizontal movement rotates around the world Z axis; vertical
-        movement grabs the model - the front face follows the cursor, so
-        dragging up tips the model up and the camera descends. The view up
-        is carried through the rotations, so the orbit never rolls the
-        camera and crossing the pole stays continuous.
+        Both axes grab the model - its front face follows the cursor:
+        horizontal movement turns it around the world Z axis, vertical
+        movement tips it up/down. The view up is carried through the
+        rotations, so the orbit never rolls the camera and crossing the
+        pole stays continuous.
         '''
         camera = self.renderer.GetActiveCamera()
         focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
         offset = np.asarray(camera.GetPosition(), dtype=np.float64) - focal
         up = np.asarray(camera.GetViewUp(), dtype=np.float64)
         width, height = self.size().width(), self.size().height()
-        azimuth = ORBIT_DEGREES_PER_AXIS * dx / max(width, 1)
+        # Grab signs: dragging right turns the model right (the camera
+        # orbits counterclockwise-negative), dragging down tips it down.
+        azimuth = -ORBIT_DEGREES_PER_AXIS * dx / max(width, 1)
         elevation = ORBIT_DEGREES_PER_AXIS * dy / max(height, 1)
         offset, up = orbit_offset(offset, up, azimuth, elevation)
         camera.SetPosition(*(focal + offset))
