@@ -35,14 +35,10 @@ LINE_COLOR = "#111111"
 # Thin black outline around selected blocks.
 SELECTION_COLOR = "#000000"
 
-# Turntable navigation: the camera follows the cursor like in common 3D
-# editors. Horizontal drags rotate around the world Z axis, vertical drags
-# raise/lower the camera without roll. Degrees covered by a full-window
-# drag, matching the VTK trackball scale.
-ORBIT_DEGREES_PER_AXIS = 75.0
-# Polar angle clamp (camera height above/below the focal plane): the world
-# up must stay well-defined, so the camera never reaches the pole.
-MAX_POLAR_DEGREES = 88.0
+# Turntable navigation: horizontal drags rotate around the world Z axis and
+# vertical drags grab the model (the front face follows the cursor). Degrees
+# covered by a full-window drag, matched between the axes for a uniform feel.
+ORBIT_DEGREES_PER_AXIS = 150.0
 # LMB press-to-move distance (manhattan, px) before the rubber band appears.
 RUBBER_BAND_THRESHOLD_PX = 4
 # World up vector of the scene (blocks sit on the XY plane).
@@ -313,64 +309,65 @@ def build_preview_mesh(
 
 
 def orbit_offset(
-    offset: np.ndarray, azimuth_deg: float, elevation_deg: float
-) -> np.ndarray:
-    '''Turntable-rotate the focal-to-camera offset vector.
+    offset: np.ndarray, up: np.ndarray, azimuth_deg: float, elevation_deg: float
+) -> tuple[np.ndarray, np.ndarray]:
+    '''Turntable-rotate the camera offset and view up around the scene.
 
     The azimuth component rotates around the world Z axis through the focal
-    point and the elevation component around the view-right axis (the world
-    up orthogonalized against the view direction). Horizontal drags therefore
-    never tilt the orbit plane and vertical drags never roll the camera - the
-    standard turntable navigation of 3D editors, unlike the native VTK
-    trackball which azimuths around the tilted camera up and orthogonalizes
-    the drifted view up in place, tumbling freely. The orbit radius is
-    preserved.
+    point and the elevation component around the camera's own right axis.
+    Both rotations are rigid - the view up is carried along with the
+    position - so the camera never rolls relative to the world (a roll-free
+    up stays roll-free under both rotations) and crossing the pole stays
+    continuous instead of flipping: at the pole the horizontal drag simply
+    spins the view. Unlike the native VTK trackball, which azimuths around
+    the tilted camera up and orthogonalizes the drifted view up in place,
+    the orbit radius and the roll-free state are preserved exactly.
 
     Args:
         offset: Vector from the focal point to the camera position.
+        up: Camera view up vector (kept perpendicular to the view direction).
         azimuth_deg: Horizontal rotation around world Z (positive follows the
             cursor to the right), degrees.
-        elevation_deg: Vertical rotation (positive raises the camera), degrees.
+        elevation_deg: Vertical rotation (positive raises the camera),
+            degrees.
 
     Returns:
-        The rotated offset, same length as the input.
+        Tuple of the rotated (offset, up) vectors.
     '''
     offset = np.asarray(offset, dtype=np.float64)
+    up = np.asarray(up, dtype=np.float64)
     radius = float(np.linalg.norm(offset))
     if radius < 1e-9:
-        return offset.copy()
-    polar = math.degrees(math.asin(min(1.0, max(-1.0, offset[2] / radius))))
-    # Clamp so the camera never crosses the pole (world up stays defined).
-    elevation_deg = max(
-        -MAX_POLAR_DEGREES - polar, min(MAX_POLAR_DEGREES - polar, elevation_deg)
-    )
+        return offset.copy(), up.copy()
+    up = up / max(float(np.linalg.norm(up)), 1e-12)
 
+    def rotated(vector: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        return (
+            vector * cos_a
+            + np.cross(axis, vector) * sin_a
+            + axis * float(np.dot(axis, vector)) * (1.0 - cos_a)
+        )
+
+    # Azimuth around the world Z; the up rotates along, which keeps the
+    # roll-free state (both vectors turn rigidly about the world axis).
     azimuth = math.radians(azimuth_deg)
-    cos_a, sin_a = math.cos(azimuth), math.sin(azimuth)
-    offset = np.array(
-        [
-            offset[0] * cos_a - offset[1] * sin_a,
-            offset[0] * sin_a + offset[1] * cos_a,
-            offset[2],
-        ]
-    )
+    offset = rotated(offset, WORLD_UP, azimuth)
+    up = rotated(up, WORLD_UP, azimuth)
 
+    # Elevation around the camera's own right axis (view direction x up):
+    # well defined even at the pole, unlike the world-up cross product.
     view_dir = -offset / radius
-    right = np.cross(view_dir, WORLD_UP)
+    right = np.cross(view_dir, up)
     right_norm = float(np.linalg.norm(right))
-    if right_norm < 1e-9:  # looking straight along world Z: axis is arbitrary
+    if right_norm < 1e-9:  # degenerate up: fall back to a horizontal axis
         right = np.array([1.0, 0.0, 0.0])
     else:
         right = right / right_norm
-
-    elevation = math.radians(-elevation_deg)
-    cos_e, sin_e = math.cos(elevation), math.sin(elevation)
-    offset = (
-        offset * cos_e
-        + np.cross(right, offset) * sin_e
-        + right * float(np.dot(right, offset)) * (1.0 - cos_e)
-    )
-    return offset
+    elevation = math.radians(-elevation_deg)  # positive angle raises
+    offset = rotated(offset, right, elevation)
+    up = rotated(up, right, elevation)
+    return offset, up
 
 
 def _settings_meta(settings: BlockSettings) -> dict:
@@ -394,7 +391,8 @@ class PreviewWidget(QtInteractor):
     the left button is selection only (a click picks the block under the
     cursor, Ctrl+click toggles it, a drag draws a rubber band selecting every
     block fully inside it), the middle button orbits the camera turntable
-    style and Shift+middle pans; the right button and the wheel keep the
+    style (horizontal drags turn around the world Z, vertical drags grab the
+    model) and Shift+middle pans; the right button and the wheel keep the
     native VTK zoom. LMB/MMB events are consumed on the Qt level, so the VTK
     interactor never arms its native rotate/pan/spin states. Blocks are moved
     from the inspector position fields, not by dragging. The mesh is
@@ -904,26 +902,23 @@ class PreviewWidget(QtInteractor):
     def _orbit_camera(self, dx: float, dy: float) -> None:
         '''Turntable-orbit the camera by a mouse delta (Qt pixels).
 
-        Horizontal movement rotates around the world Z axis, vertical
-        movement raises/lowers the camera (clamped before the pole); the
-        view up is re-derived from the world up after every step, so the
-        camera always follows the cursor without ever rolling.
+        Horizontal movement rotates around the world Z axis; vertical
+        movement grabs the model - the front face follows the cursor, so
+        dragging up tips the model up and the camera descends. The view up
+        is carried through the rotations, so the orbit never rolls the
+        camera and crossing the pole stays continuous.
         '''
         camera = self.renderer.GetActiveCamera()
         focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
         offset = np.asarray(camera.GetPosition(), dtype=np.float64) - focal
+        up = np.asarray(camera.GetViewUp(), dtype=np.float64)
         width, height = self.size().width(), self.size().height()
         azimuth = ORBIT_DEGREES_PER_AXIS * dx / max(width, 1)
-        elevation = ORBIT_DEGREES_PER_AXIS * (-dy) / max(height, 1)
-        offset = orbit_offset(offset, azimuth, elevation)
-        radius = float(np.linalg.norm(offset))
+        elevation = ORBIT_DEGREES_PER_AXIS * dy / max(height, 1)
+        offset, up = orbit_offset(offset, up, azimuth, elevation)
         camera.SetPosition(*(focal + offset))
         camera.SetFocalPoint(*focal)
-        view_dir = -offset / radius
-        up = WORLD_UP - view_dir * float(np.dot(WORLD_UP, view_dir))
-        up_norm = float(np.linalg.norm(up))
-        if up_norm > 1e-6:  # clamped orbit keeps the world up well-defined
-            camera.SetViewUp(*(up / up_norm))
+        camera.SetViewUp(*up)
         self.renderer.ResetCameraClippingRange()
         self.render()
 

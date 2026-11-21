@@ -347,10 +347,12 @@ def test_mmb_horizontal_drag_orbits_world_z(preview: PreviewWidget) -> None:
     assert float(np.linalg.norm(offset_after)) == pytest.approx(
         float(np.linalg.norm(offset_before))
     )
-    # The camera follows the cursor: dragging right increases the azimuth.
-    assert math.atan2(offset_after[1], offset_after[0]) > math.atan2(
-        offset_before[1], offset_before[0]
-    )
+    # The camera follows the cursor: dragging right increases the azimuth,
+    # by the configured speed (200 px of a 400 px wide drag).
+    azimuth_before = math.atan2(offset_before[1], offset_before[0])
+    azimuth_after = math.atan2(offset_after[1], offset_after[0])
+    assert azimuth_after > azimuth_before
+    assert math.degrees(azimuth_after - azimuth_before) == pytest.approx(75.0)
     # No roll: the view up keeps zero component along the camera right
     # axis (it stays in the vertical plane spanned by the view direction
     # and the world Z).
@@ -361,17 +363,27 @@ def test_mmb_horizontal_drag_orbits_world_z(preview: PreviewWidget) -> None:
     assert float(np.dot(up, right)) == pytest.approx(0.0, abs=1e-9)
 
 
-def test_mmb_vertical_drag_raises_camera(preview: PreviewWidget) -> None:
-    '''MMB drag up raises the camera (turntable elevation).'''
-    z_before = preview.renderer.GetActiveCamera().GetPosition()[2]
+def test_mmb_vertical_drag_grabs_model(preview: PreviewWidget) -> None:
+    '''Vertical drags grab the model: up tips it up, the camera descends.'''
+    camera = preview.renderer.GetActiveCamera()
+    z_before = camera.GetPosition()[2]
     _mouse_drag(
         preview,
-        QPoint(200, 250),
-        QPoint(200, 50),
+        QPoint(200, 200),
+        QPoint(200, 80),
         button=Qt.MouseButton.MiddleButton,
     )
-    z_after = preview.renderer.GetActiveCamera().GetPosition()[2]
-    assert z_after > z_before
+    z_lowered = camera.GetPosition()[2]
+    assert z_lowered < z_before
+    # And dragging down raises the camera again (model front follows down).
+    _mouse_drag(
+        preview,
+        QPoint(200, 80),
+        QPoint(200, 140),
+        button=Qt.MouseButton.MiddleButton,
+    )
+    z_raised = camera.GetPosition()[2]
+    assert z_raised > z_lowered
 
 
 def test_mmb_drag_does_not_change_selection(preview: PreviewWidget) -> None:

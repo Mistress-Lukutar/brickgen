@@ -26,7 +26,6 @@ pytestmark = pytest.mark.filterwarnings(
 
 from brickgen.gui.preview import (  # noqa: E402  # see filterwarnings note above
     DISPLAY_MODES,
-    MAX_POLAR_DEGREES,
     MODE_SOLID,
     MODE_SOLID_FEATURE_EDGES,
     MODE_SOLID_WIREFRAME,
@@ -260,46 +259,81 @@ def test_feature_edges_mode_position() -> None:
 def test_orbit_offset_azimuth_rotates_world_z() -> None:
     '''Azimuth rotates the offset around world Z; the camera height stays.'''
     offset = np.array([0.0, -40.0, 10.0])
-    rotated = orbit_offset(offset, azimuth_deg=90.0, elevation_deg=0.0)
+    up = np.array([0.0, 0.0, 1.0])
+    rotated, rotated_up = orbit_offset(offset, up, azimuth_deg=90.0, elevation_deg=0.0)
     assert rotated[2] == pytest.approx(10.0)
     assert np.linalg.norm(rotated) == pytest.approx(np.linalg.norm(offset))
     # (0, -40) rotated CCW by 90 degrees around Z lands on (40, 0).
     assert rotated[0] == pytest.approx(40.0, abs=1e-9)
     assert rotated[1] == pytest.approx(0.0, abs=1e-9)
+    assert rotated_up[2] == pytest.approx(1.0)  # world up is Z-invariant
 
 
 def test_orbit_offset_elevation_raises_camera_without_azimuth() -> None:
     '''Positive elevation raises the camera, preserving orbit radius/azimuth.'''
     offset = np.array([0.0, -40.0, 10.0])
-    radius = float(np.linalg.norm(offset))
+    up = np.array([0.0, 0.0, 1.0])
+    radius = np.linalg.norm(offset)
     azimuth_before = math.atan2(offset[1], offset[0])
-    raised = orbit_offset(offset, azimuth_deg=0.0, elevation_deg=45.0)
+    raised, _ = orbit_offset(offset, up, azimuth_deg=0.0, elevation_deg=45.0)
     assert raised[2] > offset[2]
-    assert float(np.linalg.norm(raised)) == pytest.approx(radius)
+    assert np.linalg.norm(raised) == pytest.approx(radius)
     assert math.atan2(raised[1], raised[0]) == pytest.approx(azimuth_before)
 
 
 def test_orbit_offset_elevation_lowers_camera() -> None:
     '''Negative elevation lowers the camera below the horizon.'''
     offset = np.array([0.0, -40.0, 10.0])
-    lowered = orbit_offset(offset, azimuth_deg=0.0, elevation_deg=-45.0)
+    up = np.array([0.0, 0.0, 1.0])
+    lowered, _ = orbit_offset(offset, up, azimuth_deg=0.0, elevation_deg=-45.0)
     assert lowered[2] < offset[2]
 
 
-def test_orbit_offset_clamps_at_pole() -> None:
-    '''Elevation never pushes the camera through the pole.'''
-    offset = np.array([0.0, -40.0, 10.0])
+def test_orbit_offset_carries_view_up_without_roll() -> None:
+    '''The view up rotates with the camera: perpendicular and roll-free.'''
+    offset = np.array([0.0, -40.0, 0.0])
+    up = np.array([0.0, 0.0, 1.0])
+    moved, moved_up = orbit_offset(offset, up, azimuth_deg=30.0, elevation_deg=40.0)
+    view_dir = -moved / np.linalg.norm(moved)
+    assert float(np.dot(moved_up, view_dir)) == pytest.approx(0.0, abs=1e-9)
+    # No roll: zero component along the world-horizontal camera right.
+    right = np.cross(view_dir, (0.0, 0.0, 1.0))
+    right = right / np.linalg.norm(right)
+    assert float(np.dot(moved_up, right)) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_orbit_offset_crosses_pole_continuously() -> None:
+    '''Crossing the pole mirrors the orbit instead of flipping the view.'''
+    offset = np.array([0.0, -40.0, 39.0])
     radius = float(np.linalg.norm(offset))
-    raised = orbit_offset(offset, azimuth_deg=0.0, elevation_deg=500.0)
-    polar = math.degrees(math.asin(raised[2] / radius))
-    assert polar == pytest.approx(MAX_POLAR_DEGREES)
-    lowered = orbit_offset(offset, azimuth_deg=0.0, elevation_deg=-500.0)
-    polar = math.degrees(math.asin(lowered[2] / radius))
-    assert polar == pytest.approx(-MAX_POLAR_DEGREES)
+    # Roll-free up of this oblique view (world Z orthogonalized).
+    view_dir = -offset / radius
+    world_up = np.array([0.0, 0.0, 1.0])
+    up = world_up - view_dir * float(np.dot(world_up, view_dir))
+    up = up / np.linalg.norm(up)
+    crossed, crossed_up = orbit_offset(offset, up, azimuth_deg=0.0, elevation_deg=60.0)
+    polar = math.degrees(math.asin(offset[2] / radius))
+    assert np.linalg.norm(crossed) == pytest.approx(radius)
+    # Past the pole: still above the focal plane, horizontal side mirrored.
+    assert crossed[2] == pytest.approx(radius * math.sin(math.radians(polar + 60.0)))
+    assert crossed[1] > 0.0  # was -40: the camera is now on the far side
+    assert float(np.dot(crossed_up, -crossed / radius)) == pytest.approx(0.0, abs=1e-9)
+    assert np.linalg.norm(crossed_up) == pytest.approx(1.0)
+
+
+def test_orbit_offset_spins_at_pole() -> None:
+    '''At the pole the azimuth axis is the view axis: the view spins.'''
+    offset = np.array([0.0, 0.0, 40.0])
+    up = np.array([0.0, 1.0, 0.0])
+    spun, spun_up = orbit_offset(offset, up, azimuth_deg=30.0, elevation_deg=0.0)
+    np.testing.assert_allclose(spun, offset)
+    # (0, 1, 0) rotated CCW by 30 degrees around Z lands on (-0.5, 0.866, 0).
+    np.testing.assert_allclose(spun_up, [-0.5, math.sqrt(3) / 2, 0.0], atol=1e-9)
 
 
 def test_orbit_offset_preserves_radius() -> None:
     '''Combined azimuth/elevation keep the orbit radius (pure rotation).'''
     offset = np.array([12.0, -30.0, 5.0])
-    rotated = orbit_offset(offset, azimuth_deg=33.0, elevation_deg=17.0)
+    up = np.array([0.0, 0.0, 1.0])
+    rotated, _ = orbit_offset(offset, up, azimuth_deg=33.0, elevation_deg=17.0)
     assert np.linalg.norm(rotated) == pytest.approx(np.linalg.norm(offset))
