@@ -2,8 +2,8 @@
 File:   jobtasks.py
 Brief:  Child-process task handlers for the process-based JobQueue.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 
 Each handler is invoked inside a child process; heavy modules (cadquery, pyvista,
 OCC) are imported lazily inside the handler so the first job pays the import cost.
@@ -12,6 +12,8 @@ The module maintains an LRU cache of built models keyed by caller-supplied keys.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -65,6 +67,39 @@ def run_task(task: str, payload: dict) -> dict:
 # Maximum 3 entries; used to avoid rebuilding the same model for export.
 _MODEL_CACHE: OrderedDict[str, cq.Workplane] = OrderedDict()
 _MAX_CACHE_SIZE = 3
+
+
+def _scene_fingerprint(settings_dump: dict, tolerance: float, angular: float) -> str:
+    '''Stable per-block cache key: canonical settings JSON + tessellation tolerances.'''
+    canonical = json.dumps(settings_dump, sort_keys=True, separators=(',', ':'))
+    raw = f'{canonical}|{tolerance!r}|{angular!r}'
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+# LRU of finished per-block mesh arrays (picklable dicts), keyed by
+# _scene_fingerprint. A hit lets build_scene skip the OCC build and the
+# BRepMesh tessellation for blocks whose settings and tolerances did not
+# change (the key includes both tolerances, so a precision change misses).
+_ARRAY_CACHE: OrderedDict[str, dict] = OrderedDict()
+_ARRAY_CACHE_MAX = 64
+
+
+def _array_cache_get(key: str) -> dict | None:
+    '''Return the cached arrays dict for *key*, or None on miss.'''
+    if key in _ARRAY_CACHE:
+        _ARRAY_CACHE.move_to_end(key)
+        return _ARRAY_CACHE[key]
+    return None
+
+
+def _array_cache_put(key: str, arrays: dict) -> None:
+    '''Store *arrays* under *key*, evicting oldest entries beyond _ARRAY_CACHE_MAX.'''
+    if key in _ARRAY_CACHE:
+        _ARRAY_CACHE.move_to_end(key)
+    else:
+        while len(_ARRAY_CACHE) >= _ARRAY_CACHE_MAX:
+            _ARRAY_CACHE.popitem(last=False)
+        _ARRAY_CACHE[key] = arrays
 
 
 @handler('ping')
@@ -193,8 +228,12 @@ def _handle_build_scene(payload: dict) -> dict:
             'angular': float angular tolerance in rad (optional, 0.1).
 
     Returns:
-        ``{'blocks': [mesh_to_arrays(mesh), ...]}`` aligned with the payload
-        block order; arrays carry ``points``/``faces``/``part``.
+        Dict with keys::
+
+            'blocks': list of mesh_to_arrays results aligned with payload block order;
+                each carries ``points``/``faces``/``part``.
+            'cached': list[bool] parallel to *blocks*; True when the per-block
+                arrays were served from the array cache (no OCC rebuild).
     '''
     from brickgen.core.builder import build_block
     from brickgen.core.models import BlockSettings
@@ -207,14 +246,24 @@ def _handle_build_scene(payload: dict) -> dict:
     tolerance = payload.get('tolerance', 0.15)
     angular = payload.get('angular', 0.1)
     blocks_data: list[dict] = []
+    cached_flags: list[bool] = []
     for entry in payload['blocks']:
-        settings = BlockSettings.model_validate(entry['settings'])
-        model = build_block(settings)
-        shape = cast(cq.Shape, model.val())
-        classifier = make_face_classifier(settings)
-        mesh = solid_to_mesh(shape, tolerance, angular, classifier)
-        blocks_data.append(mesh_to_arrays(mesh))
-    return {'blocks': blocks_data}
+        key = _scene_fingerprint(entry['settings'], tolerance, angular)
+        cached = _array_cache_get(key)
+        if cached is not None:
+            blocks_data.append(dict(cached))
+            cached_flags.append(True)
+        else:
+            settings = BlockSettings.model_validate(entry['settings'])
+            model = build_block(settings)
+            shape = cast(cq.Shape, model.val())
+            classifier = make_face_classifier(settings)
+            mesh = solid_to_mesh(shape, tolerance, angular, classifier)
+            arrays = mesh_to_arrays(mesh)
+            _array_cache_put(key, arrays)
+            blocks_data.append(arrays)
+            cached_flags.append(False)
+    return {'blocks': blocks_data, 'cached': cached_flags}
 
 
 @handler('thumbnail')

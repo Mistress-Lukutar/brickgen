@@ -2,8 +2,8 @@
 File:   test_project.py
 Brief:  Unit tests for Project and BlockInstance models.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -118,6 +118,24 @@ def test_to_settings_merges_shared_and_layout() -> None:
     assert merged.clearance_xy == -0.25
     assert merged.unit_size == shared.unit_size
     assert merged.wall_thickness == shared.wall_thickness
+
+
+def test_to_settings_block_flags_win_over_shared() -> None:
+    '''The block's own pins/tubes flags take priority over shared settings.
+
+    Regression: adding a studless block must never flip the studs of the
+    already placed blocks (the flags used to be project-wide).
+    '''
+    shared = BlockSettings(pins_enabled=False, tubes_enabled=False)
+    pinned = BlockInstance(cells_x=2, cells_y=2)
+    studless = BlockInstance(cells_x=2, cells_y=2, pins_enabled=False)
+
+    merged_pinned = pinned.to_settings(BlockSettings(pins_enabled=True))
+    merged_studless = studless.to_settings(shared)
+
+    assert merged_pinned.pins_enabled is True
+    assert merged_studless.pins_enabled is False
+    assert merged_studless.tubes_enabled is True
 
 
 # ------------------------------------------------------------- Project

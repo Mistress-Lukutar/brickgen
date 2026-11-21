@@ -54,16 +54,18 @@ ORBIT_DEGREES_PER_AXIS = 200.0
 RUBBER_BAND_THRESHOLD_PX = 4
 # World up vector of the scene (blocks sit on the XY plane).
 WORLD_UP = np.array([0.0, 0.0, 1.0])
-# Floor grid: lines are drawn a hair below z=0 so they never z-fight with
-# block bottoms; the grid half-extent adapts to the camera and recenters on
-# pan (practically infinite, XY plane only).
+# Floor grid: static plane at z=0, centered on the world origin. The line
+# plane sits a hair below z=0 so it never z-fights with block bottoms.
 GRID_Z_OFFSET = -0.05
-# Camera distance -> grid half-extent mapping: the extent covers several
-# viewports but the line count stays bounded (2*R/step <= ~5000 per axis).
-GRID_EXTENT_MIN_CELLS = 60
-GRID_EXTENT_MAX_CELLS = 2500
-GRID_RECENTER_FRACTION = 0.5  # rebuild when the focal point passes R/2
-GRID_ZOOM_REGRID_RATIO = 0.3  # rebuild when the camera distance changed 30%
+# The colored axes sit slightly ABOVE the line plane: coplanar lines
+# z-fight into dashed bands when the plane is seen at a grazing angle.
+GRID_AXIS_Z_OFFSET = -0.02
+# Static half-extent of the floor grid, in cell steps.
+GRID_EXTENT_CELLS = 1000
+# mm coordinate labels span only ±WINDOW cells around the origin. Labels
+# render at a constant screen size, so letting them reach the full extent
+# crowds the far ones into wide bands at grazing view angles.
+GRID_LABEL_WINDOW_CELLS = 50
 # One mm label per axis at most every LABEL_SPACING mm / one line in 10.
 GRID_LABEL_SPACING_MM = 16.0
 GRID_MAJOR_EVERY = 10
@@ -427,8 +429,9 @@ class PreviewWidget(QtInteractor):
     also moved by the G (grab) hotkey: the selection follows the cursor on
     the floor plane until a click/Enter confirms or Esc/right-click cancels.
     When snap is enabled every move rounds to the grid step. The floor grid
-    is an infinite XY plane with colored X/Y axes and mm coordinate labels;
-    its cell scale is ``unit_size * scale``. The mesh is tessellated once
+    is a static XY plane at the world origin with colored X/Y axes and mm
+    coordinate labels; its cell scale is ``unit_size * scale``. The mesh is
+    tessellated once
     per block; display-mode/grid/label changes only touch actors, not
     geometry. Quantity labels render the per-block BOM count next to each
     block (View menu).
@@ -465,16 +468,14 @@ class PreviewWidget(QtInteractor):
         self._mesh: pv.PolyData | None = None
         self._mode = MODE_SOLID
         # Floor grid state: enabled flag, unit size of the shared block
-        # geometry (set by the window), cell scale factor, and the center /
-        # extent the actors were last built for (regrid triggers).
+        # geometry (set by the window), cell scale factor.
         self._grid_enabled = False
         self._grid_unit = 4.0
         self._grid_scale = 0.5
         self._grid_snap = False
-        self._grid_center = np.zeros(2)
-        self._grid_extent = 0.0
-        self._grid_distance = 0.0
         self._grid_actors: list[pv.Actor] = []
+        # SSAO state for incremental enable/disable.
+        self._ssao_radius: float | None = None
         # Selection/navigation transient state. The left button picks up a
         # block (move drag) or draws the rubber band on the background, the
         # middle button orbits, Shift+middle pans; the right button and the
@@ -506,17 +507,24 @@ class PreviewWidget(QtInteractor):
 
     # ------------------------------------------------------------- scene API
     def update_scene(
-        self, meshes: list[pv.PolyData], colors: list[str], meta: list[dict]
+        self,
+        meshes: list[pv.PolyData | None],
+        colors: list[str],
+        meta: list[dict],
+        changed: list[bool] | None = None,
     ) -> None:
         '''Replace the whole scene with per-block meshes.
 
         Args:
-            meshes: One pre-tessellated PolyData per block (each built
-                centered on the origin; placement comes from the meta
-                ``pos_x``/``pos_y`` via actor positions).
+            meshes: One pre-tessellated PolyData (or ``None``) per block.
+                A ``None`` entry means "keep the mesh currently stored at
+                this index" (ignored when there is no existing scene).
             colors: One hex color per block, aligned with *meshes*.
             meta: One dict per block with keys ``pos_x``, ``pos_y``,
                 ``half_x``, ``half_y``, ``top_z`` and ``quantity``.
+            changed: Optional bool mask; ``True`` at index *i* means the
+                actor for block *i* must be rebuilt.  ``None`` (or length
+                / count mismatch) triggers a full rebuild of every block.
 
         Raises:
             ValueError: If the lists are not aligned.
@@ -525,19 +533,40 @@ class PreviewWidget(QtInteractor):
             raise ValueError("meshes/colors/meta must be aligned lists")
         had_scene = bool(self._block_actors)
         camera_position = None if not had_scene else self.camera_position
-        self._scene_meshes = list(meshes)
+
+        # Resolve None entries: keep existing mesh when no old scene exists.
+        resolved_meshes: list[pv.PolyData] = []
+        for i, m in enumerate(meshes):
+            if m is not None:
+                resolved_meshes.append(m)
+            elif i < len(self._scene_meshes):
+                resolved_meshes.append(self._scene_meshes[i])
+            else:
+                resolved_meshes.append(pv.PolyData())  # empty sentinel
+        self._scene_meshes = resolved_meshes
         self._scene_colors = list(colors)
         self._scene_meta = [dict(item) for item in meta]
-        self._mesh = meshes[0] if meshes else None  # legacy single-mesh attr
+        self._mesh = next(
+            (m for m in self._scene_meshes if m is not None and m.n_points > 0), None
+        )
         self._selection = {i for i in self._selection if i < len(meshes)}
         if self._primary is not None and self._primary >= len(meshes):
             self._primary = None
+
+        # SSAO: only enable when the radius changes (an empty scene keeps
+        # the last configuration instead of warning on every generation).
         try:
-            radius = max(2.0, *(m['half_x'] + m['half_y'] for m in self._scene_meta))
-            self.enable_ssao(radius=radius, bias=0.02)  # type: ignore[call-arg]
+            if self._scene_meta:
+                radius = max(
+                    2.0, *(m['half_x'] + m['half_y'] for m in self._scene_meta)
+                )
+                if self._ssao_radius != radius:
+                    self._ssao_radius = radius
+                    self.enable_ssao(radius=radius, bias=0.02)  # type: ignore[call-arg]
         except Exception:  # noqa: BLE001 - SSAO is optional eye-candy; GL may lack it
             logger.warning("SSAO unavailable in this environment", exc_info=True)
-        self._rebuild_actors()
+
+        self._rebuild_actors(changed)
         if camera_position is not None:
             self.camera_position = camera_position
             self.camera_set = True
@@ -548,8 +577,6 @@ class PreviewWidget(QtInteractor):
             # resets the camera on later actor additions whenever camera_set
             # is False, which would yank the view on the first selection.
             self.camera_set = True
-        # After the camera is in place: the grid extent follows the view.
-        self._update_grid()
         logger.debug(
             "Preview scene: %d blocks / %d points total",
             len(self._scene_meshes),
@@ -644,81 +671,28 @@ class PreviewWidget(QtInteractor):
 
     # ------------------------------------------------------------- floor grid
     def _update_grid(self) -> None:
-        '''Rebuild or clear the floor-grid actors around the camera.'''
+        '''Rebuild the static floor-grid actors around the world origin.
+
+        The grid is centred at (0, 0) with a fixed extent; it is rebuilt only
+        by ``set_grid_unit`` / ``set_grid_scale`` / ``set_grid_enabled``.
+        '''
         for actor in self._grid_actors:
             try:
                 self.remove_actor(actor)
             except Exception:  # noqa: BLE001 - actor may already be detached
                 pass
         self._grid_actors.clear()
-        if self._grid_enabled and self._mesh is not None:
-            self._grid_center = self._camera_focal_xy()
-            self._grid_distance = self._camera_distance()
-            self._grid_extent = self._grid_extent_for(self._grid_distance)
+        if self._grid_enabled:
             self._add_grid_actors()
         self.render()
 
-    def _grid_extent_for(self, distance: float) -> float:
-        '''Grid half-extent (mm) that covers the view at *distance*.
-
-        The extent follows the camera so the grid always reads as infinite,
-        while the line count stays bounded by the min/max cell clamps.
-
-        Args:
-            distance: Camera distance from its focal point, mm.
-
-        Returns:
-            Grid half-extent in mm.
-        '''
-        step = max(self.grid_step(), 1e-9)
-        extent = distance * 2.5
-        return float(
-            np.clip(extent, GRID_EXTENT_MIN_CELLS * step, GRID_EXTENT_MAX_CELLS * step)
-        )
-
-    def _maybe_regrid(self) -> None:
-        '''Rebuild the grid when the view left the built region.
-
-        Cheap check on every camera-affecting mouse move / wheel tick: when
-        the focal point approached the edge of the built area or the zoom
-        changed enough to alter the sensible extent, the actors are rebuilt
-        around the new focal point.
-        '''
-        if not self._grid_enabled or self._mesh is None or not self._grid_actors:
-            return
-        center = self._camera_focal_xy()
-        distance = self._camera_distance()
-        recentered = (
-            float(np.linalg.norm(center - self._grid_center))
-            > self._grid_extent * GRID_RECENTER_FRACTION
-        )
-        zoomed = (
-            self._grid_distance > 0.0
-            and abs(distance / self._grid_distance - 1.0) > GRID_ZOOM_REGRID_RATIO
-        )
-        if not (recentered or zoomed):
-            return
-        step = max(self.grid_step(), 1e-9)
-        self._grid_center = np.round(center / step) * step
-        self._grid_distance = distance
-        self._grid_extent = self._grid_extent_for(distance)
-        for actor in self._grid_actors:
-            try:
-                self.remove_actor(actor)
-            except Exception:  # noqa: BLE001 - actor may already be detached
-                pass
-        self._grid_actors.clear()
-        self._add_grid_actors()
-        self.render()
-
     def _add_grid_actors(self) -> None:
-        '''Build the line/axis/label actors for the current center+extent.'''
+        '''Build the line/axis/label actors for the static centered grid.'''
         step = max(self.grid_step(), 1e-9)
-        half = self._grid_extent
-        center_x, center_y = (float(self._grid_center[0]), float(self._grid_center[1]))
-        cells = int(round(half / step))
+        center_x = center_y = 0.0
+        half = GRID_EXTENT_CELLS * step
+        cells = GRID_EXTENT_CELLS
         ks = np.arange(-cells, cells + 1, dtype=np.int64)
-        center_cells = int(round(center_x / step)), int(round(center_y / step))
 
         def segments(coords: np.ndarray, vertical: bool) -> np.ndarray:
             '''(N, 2, 3) segment array of full-length grid lines.'''
@@ -732,10 +706,9 @@ class PreviewWidget(QtInteractor):
                 second = np.stack([fixed, coords, z], axis=1)
             return np.stack([first, second], axis=1)
 
-        # Major lines sit on world-aligned multiples of 10 cells; the
-        # vertical/horizontal masks share the integer cell offsets.
-        vertical_major = (ks + center_cells[0]) % GRID_MAJOR_EVERY == 0
-        horizontal_major = (ks + center_cells[1]) % GRID_MAJOR_EVERY == 0
+        # Major lines sit on world-aligned multiples of 10 cells.
+        vertical_major = ks % GRID_MAJOR_EVERY == 0
+        horizontal_major = ks % GRID_MAJOR_EVERY == 0
         verticals = segments(center_x + ks * step, vertical=True)
         horizontals = segments(center_y + ks * step, vertical=False)
         minor = np.concatenate(
@@ -753,15 +726,17 @@ class PreviewWidget(QtInteractor):
                     self._add_grid_lines(mesh, color=color, line_width=width)
                 )
         # Colored world axes: X along y=0, Y along x=0, spanning the window.
+        # They sit slightly above the line plane (GRID_AXIS_Z_OFFSET):
+        # coplanar lines z-fight into dashed bands at grazing view angles.
         axes = np.array(
             [
                 [
-                    [center_x - half, 0.0, GRID_Z_OFFSET],
-                    [center_x + half, 0.0, GRID_Z_OFFSET],
+                    [center_x - half, 0.0, GRID_AXIS_Z_OFFSET],
+                    [center_x + half, 0.0, GRID_AXIS_Z_OFFSET],
                 ],
                 [
-                    [0.0, center_y - half, GRID_Z_OFFSET],
-                    [0.0, center_y + half, GRID_Z_OFFSET],
+                    [0.0, center_y - half, GRID_AXIS_Z_OFFSET],
+                    [0.0, center_y + half, GRID_AXIS_Z_OFFSET],
                 ],
             ]
         )
@@ -791,22 +766,26 @@ class PreviewWidget(QtInteractor):
     ) -> None:
         '''mm coordinate labels along the X and Y axes.
 
-        One label per ``label_step`` mm where the spacing adapts to the step
-        and the view extent, so the label count stays bounded at any zoom.
+        One label per ``label_step`` mm where the spacing adapts to the step.
+        The labels span only ±:data:`GRID_LABEL_WINDOW_CELLS` cells around
+        the origin: they render at a constant screen size, so labels reaching
+        the full extent crowd into wide bands when the plane is seen at a
+        grazing angle (and the count stays bounded at any zoom).
 
         Args:
             step: Grid step in mm.
             center_x: Grid center X (mm) the window is built around.
             center_y: Grid center Y (mm) the window is built around.
-            half: Grid half-extent in mm.
+            half: Grid half-extent in mm (labels may span less).
         '''
-        spacing = max(GRID_LABEL_SPACING_MM, half / 100.0)
+        label_half = min(half, GRID_LABEL_WINDOW_CELLS * step)
+        spacing = max(GRID_LABEL_SPACING_MM, label_half / 100.0)
         label_step = step * max(1, int(math.ceil(spacing / step)))
         offset = max(1.0, min(step * 1.5, label_step * 0.35))
         z = 0.2
         for axis, low, high in (
-            ("x", center_x - half, center_x + half),
-            ("y", center_y - half, center_y + half),
+            ("x", center_x - label_half, center_x + label_half),
+            ("y", center_y - label_half, center_y + label_half),
         ):
             first = int(math.ceil(low / label_step))
             last = int(math.floor(high / label_step))
@@ -836,19 +815,6 @@ class PreviewWidget(QtInteractor):
             if actor is not None:
                 self._grid_actors.append(actor)
         self.render()
-
-    def _camera_focal_xy(self) -> np.ndarray:
-        '''Focal point XY of the active camera (grid recentering anchor).'''
-        camera = self.renderer.GetActiveCamera()
-        return np.asarray(camera.GetFocalPoint(), dtype=np.float64)[:2]
-
-    def _camera_distance(self) -> float:
-        '''Distance between the camera position and its focal point.'''
-        camera = self.renderer.GetActiveCamera()
-        offset = np.asarray(camera.GetPosition(), dtype=np.float64) - np.asarray(
-            camera.GetFocalPoint(), dtype=np.float64
-        )
-        return float(np.linalg.norm(offset))
 
     def set_selection(self, selection: set[int], primary: int | None = None) -> None:
         '''Replace the scene selection programmatically (no signal).
@@ -951,44 +917,89 @@ class PreviewWidget(QtInteractor):
         self._qty_actors.clear()
         self._actor_map.clear()
 
-    def _rebuild_actors(self) -> None:
-        '''Remove and re-add every per-block actor for the active mode.
+    def _build_block_actors(self, index: int) -> list[pv.Actor]:
+        '''Build the actors for a single block and register them in ``_actor_map``.
 
-        Every actor of a block (surface, feature edges, wireframe) is
-        positioned at the block's scene position: the decorations share the
-        placement of the surface instead of sitting at the world origin.
+        Args:
+            index: Block index in the current scene.
+
+        Returns:
+            List of actors created for this block (surface, feature edges,
+            wireframe decorations).
         '''
-        self._clear_scene_actors()
-        if not self._scene_meshes:
+        mesh = self._scene_meshes[index]
+        position = self._scene_meta[index]
+        x, y = float(position['pos_x']), float(position['pos_y'])
+        actors: list[pv.Actor] = []
+        if mesh.n_points == 0:
+            # Empty placeholder mesh (e.g. a None entry with no previous
+            # scene): pyvista refuses to plot empty meshes, so add nothing.
+            return actors
+        if self._mode == MODE_WIREFRAME:
+            # No solid underneath: the wireframe itself is the pick
+            # target (the cell picker intersects the mesh triangles, not
+            # the rendered lines), so blocks stay selectable.
+            wire = self._add_wireframe_actor(mesh, line_width=1.5, tubes=False)
+            wire.SetPickable(True)
+            actors.append(wire)
+            self._actor_map[wire] = index
+        else:
+            surface = add_surface_actor(self, mesh, color=self._scene_colors[index])
+            surface.SetPickable(True)
+            actors.append(surface)
+            self._actor_map[surface] = index
+            if self._mode == MODE_SOLID_FEATURE_EDGES:
+                edges = self._add_feature_edge_actor(mesh)
+                if edges is not None:
+                    actors.append(edges)
+            elif self._mode == MODE_SOLID_WIREFRAME:
+                actors.append(
+                    self._add_wireframe_actor(mesh, line_width=2.5, tubes=True)
+                )
+        for actor in actors:
+            actor.SetPosition(x, y, 0.0)
+        return actors
+
+    def _rebuild_actors(self, changed: list[bool] | None = None) -> None:
+        '''Remove and re-add per-block actors for the active mode.
+
+        When *changed* is ``None`` (or length/count mismatch) every block
+        is rebuilt.  Otherwise only indices where ``changed[i]`` is ``True``
+        are rebuilt; unchanged blocks keep their existing actors.
+
+        Args:
+            changed: Optional bool mask for incremental rebuild.
+        '''
+        n_blocks = len(self._scene_meshes)
+        if not n_blocks:
+            # The scene went empty: clear the actors of the removed blocks,
+            # otherwise they linger as ghosts until the next non-empty
+            # full rebuild (only outlines/labels would be refreshed below).
+            self._clear_scene_actors()
             return
-        for index, mesh in enumerate(self._scene_meshes):
-            position = self._scene_meta[index]
-            x, y = float(position['pos_x']), float(position['pos_y'])
-            actors: list[pv.Actor] = []
-            if self._mode == MODE_WIREFRAME:
-                # No solid underneath: the wireframe itself is the pick
-                # target (the cell picker intersects the mesh triangles, not
-                # the rendered lines), so blocks stay selectable.
-                wire = self._add_wireframe_actor(mesh, line_width=1.5, tubes=False)
-                wire.SetPickable(True)
-                actors.append(wire)
-                self._actor_map[wire] = index
-            else:
-                surface = add_surface_actor(self, mesh, color=self._scene_colors[index])
-                surface.SetPickable(True)
-                actors.append(surface)
-                self._actor_map[surface] = index
-                if self._mode == MODE_SOLID_FEATURE_EDGES:
-                    edges = self._add_feature_edge_actor(mesh)
-                    if edges is not None:
-                        actors.append(edges)
-                elif self._mode == MODE_SOLID_WIREFRAME:
-                    actors.append(
-                        self._add_wireframe_actor(mesh, line_width=2.5, tubes=True)
-                    )
-            for actor in actors:
-                actor.SetPosition(x, y, 0.0)
-            self._block_actors.append(actors)
+
+        # Determine whether we do a full or incremental rebuild.
+        if (
+            changed is None
+            or len(changed) != n_blocks
+            or len(self._block_actors) != n_blocks
+        ):
+            self._clear_scene_actors()
+            for index in range(n_blocks):
+                self._block_actors.append(self._build_block_actors(index))
+        else:
+            for index, do_build in enumerate(changed):
+                if do_build:
+                    # Remove existing actors for this block.
+                    old_actors = self._block_actors[index]
+                    for actor in old_actors:
+                        try:
+                            self.remove_actor(actor)
+                        except Exception:  # noqa: BLE001 - may be detached
+                            pass
+                        self._actor_map.pop(actor, None)
+                    self._block_actors[index] = self._build_block_actors(index)
+
         self._update_selection_outlines()
         self._refresh_quantity_labels()
 
@@ -1385,8 +1396,6 @@ class PreviewWidget(QtInteractor):
             self._update_grab(pos)
             event.accept()
             return
-        # Camera-driven grid upkeep (cheap no-op most of the time).
-        self._maybe_regrid()
         if self._left_down:
             if (
                 not self._rubbing
@@ -1463,12 +1472,11 @@ class PreviewWidget(QtInteractor):
         super().keyPressEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt naming
-        '''Zoom natively (except during a move) and keep the grid infinite.'''
+        '''Zoom natively (except during a move).'''
         if self._grabbing:
             event.accept()
             return
         super().wheelEvent(event)
-        self._maybe_regrid()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         '''Route a rapid second click through the press handler.

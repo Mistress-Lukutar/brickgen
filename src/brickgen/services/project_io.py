@@ -2,8 +2,8 @@
 File:   project_io.py
 Brief:  JSON save/load of multi-block GUI projects with legacy settings migration.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from pathlib import Path
 from brickgen.core.exceptions import ProjectIOError
 from brickgen.core.models import BlockSettings
 from brickgen.core.project import (
+    BLOCK_FLAG_FIELDS,
     LAYOUT_FIELDS,
     SHARED_SETTING_FIELDS,
     BlockInstance,
@@ -26,7 +27,11 @@ logger = logging.getLogger(__name__)
 
 PROJECT_SCHEMA_KEY = "schema"
 PROJECT_SCHEMA_NAME = "brickgen-project"
-PROJECT_SCHEMA_VERSION = 4
+PROJECT_SCHEMA_VERSION = 5
+# Versions accepted by load_project: v4 payloads are migrated on the fly
+# (v4 kept pins/tubes flags on the shared settings, v5 moved them onto
+# each block).
+_MIGRATABLE_VERSIONS = (4, 5)
 
 
 def save_project(project: Project, path: Path) -> Path:
@@ -67,9 +72,10 @@ def save_project(project: Project, path: Path) -> Path:
 def load_project(path: Path) -> Project:
     '''Load a project from a JSON file.
 
-    Supports the current project schema (v4) and legacy single-block preset
-    files that lack a ``blocks`` key or carry the old ``brickgen-settings``
-    schema marker.
+    Supports the current project schema (v5), the previous v4 schema
+    (per-block pins/tubes flags backfilled from the shared settings) and
+    legacy single-block preset files that lack a ``blocks`` key or carry
+    the old ``brickgen-settings`` schema marker.
 
     Args:
         path: Source ``*.json`` path.
@@ -109,11 +115,13 @@ def load_project(path: Path) -> Project:
     # --- Current project format ---
     if isinstance(schema, dict) and schema.get("name") == PROJECT_SCHEMA_NAME:
         version = schema.get("version")
-        if version != PROJECT_SCHEMA_VERSION:
+        if version not in _MIGRATABLE_VERSIONS:
             raise ProjectIOError(
                 f"Unsupported project schema version in {path}: {version!r}"
             )
         payload = {k: v for k, v in payload.items() if k != PROJECT_SCHEMA_KEY}
+        if version != PROJECT_SCHEMA_VERSION:
+            payload = _migrate_v4_blocks(payload)
     else:
         raise ProjectIOError(f"{path} is not a {PROJECT_SCHEMA_NAME} project")
 
@@ -148,6 +156,29 @@ def _legacy_project(payload: dict, path: Path) -> Project:
     block = BlockInstance(
         cells_x=settings.cells_x,
         cells_y=settings.cells_y,
+        **{field: getattr(settings, field) for field in BLOCK_FLAG_FIELDS},
         **{field: getattr(settings, field) for field in LAYOUT_FIELDS},
     )
     return Project(settings=shared, blocks=[block])
+
+
+def _migrate_v4_blocks(payload: dict) -> dict:
+    '''Backfill the per-block pins/tubes flags of a v4 payload.
+
+    v4 stored ``pins_enabled``/``tubes_enabled`` only on the shared project
+    settings; v5 stores them on every block. The shared values are copied
+    into each block so an old scene renders exactly as it did.
+
+    Args:
+        payload: The parsed project dict (schema key already removed).
+
+    Returns:
+        The payload with every block carrying explicit flag fields.
+    '''
+    settings = payload.get("settings")
+    shared = settings if isinstance(settings, dict) else {}
+    for block in payload.get("blocks") or []:
+        if isinstance(block, dict):
+            for field in BLOCK_FLAG_FIELDS:
+                block.setdefault(field, shared.get(field, True))
+    return payload

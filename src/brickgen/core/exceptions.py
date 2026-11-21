@@ -2,8 +2,8 @@
 File:   exceptions.py
 Brief:  Custom exception hierarchy for BrickGen.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 from __future__ import annotations

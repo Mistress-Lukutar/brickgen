@@ -2,8 +2,8 @@
 File:   test_project_io.py
 Brief:  Unit tests for JSON save/load of multi-block projects.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -77,13 +77,13 @@ def test_save_load_roundtrip(tmp_path: Path) -> None:
 
 # ------------------------------------------------------- saved file format
 def test_saved_file_has_correct_schema(tmp_path: Path) -> None:
-    '''Saved JSON must contain schema brickgen-project version 4.'''
+    '''Saved JSON must contain schema brickgen-project version 5.'''
     proj = Project(blocks=[BlockInstance()])
     path = save_project(proj, tmp_path / "project.json")
     payload = json.loads(path.read_text(encoding="utf-8"))
 
     assert payload["schema"]["name"] == "brickgen-project"
-    assert payload["schema"]["version"] == 4
+    assert payload["schema"]["version"] == 5
 
 
 def test_saved_settings_has_no_layout_fields(tmp_path: Path) -> None:
@@ -105,6 +105,109 @@ def test_saved_settings_has_no_layout_fields(tmp_path: Path) -> None:
         assert field not in payload["settings"], (
             f"Layout field '{field}' must not appear in settings"
         )
+
+
+def test_saved_blocks_carry_flag_fields(tmp_path: Path) -> None:
+    '''The per-block pins/tubes flags must be stored on every block.'''
+    proj = Project(
+        blocks=[
+            BlockInstance(cells_x=2, cells_y=2),
+            BlockInstance(
+                cells_x=2,
+                cells_y=2,
+                pins_enabled=False,
+                tubes_enabled=False,
+            ),
+        ],
+    )
+    path = save_project(proj, tmp_path / "project.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["blocks"][0]["pins_enabled"] is True
+    assert payload["blocks"][0]["tubes_enabled"] is True
+    assert payload["blocks"][1]["pins_enabled"] is False
+    assert payload["blocks"][1]["tubes_enabled"] is False
+    # The flags are block-level now: they must not leak into shared settings.
+    assert "pins_enabled" not in payload["settings"]
+    assert "tubes_enabled" not in payload["settings"]
+
+
+# ------------------------------------------------------------- v4 migration
+def test_v4_project_migrates_flags_from_shared_settings(tmp_path: Path) -> None:
+    '''A v4 project loads with per-block flags backfilled from the shared
+    settings, so old scenes keep their stud/tube look.'''
+    payload = {
+        "schema": {"name": "brickgen-project", "version": 4},
+        "settings": {
+            "unit_size": 8.0,
+            "wall_thickness": 1.0,
+            "block_height": 5.0,
+            "clearance_xy": -0.25,
+            "clearance_z": 0.0,
+            "pins_enabled": False,
+            "tubes_enabled": False,
+        },
+        "blocks": [
+            {"cells_x": 2, "cells_y": 2},
+            {"cells_x": 1, "cells_y": 1},
+        ],
+    }
+    path = tmp_path / "v4.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    proj = load_project(path)
+
+    for block in proj.blocks:
+        assert block.pins_enabled is False
+        assert block.tubes_enabled is False
+
+
+def test_v4_project_defaults_flags_to_true(tmp_path: Path) -> None:
+    '''A v4 payload whose shared settings lack the flag keys migrates with
+    the factory default (studs and tubes on).'''
+    payload = {
+        "schema": {"name": "brickgen-project", "version": 4},
+        "settings": {"unit_size": 8.0},
+        "blocks": [{"cells_x": 2, "cells_y": 2}],
+    }
+    path = tmp_path / "v4_min.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    proj = load_project(path)
+
+    assert proj.blocks[0].pins_enabled is True
+    assert proj.blocks[0].tubes_enabled is True
+
+
+def test_v4_project_mixed_flags_roundtrip(tmp_path: Path) -> None:
+    '''A migrated v4 project saves as v5 and reloads to the same state.'''
+    payload = {
+        "schema": {"name": "brickgen-project", "version": 4},
+        "settings": {
+            "unit_size": 8.0,
+            "wall_thickness": 1.0,
+            "block_height": 5.0,
+            "clearance_xy": -0.25,
+            "clearance_z": 0.0,
+            "pins_enabled": False,
+            "tubes_enabled": True,
+        },
+        "blocks": [{"cells_x": 2, "cells_y": 4, "position_x": 1.0}],
+    }
+    path = tmp_path / "v4.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    proj = load_project(path)
+    saved = save_project(proj, tmp_path / "v5.json")
+    reloaded = load_project(saved)
+
+    # The v4 shared flag keys are vestigial after migration (flags are
+    # block-level now), so compare the fields that matter for rendering.
+    assert reloaded.blocks == proj.blocks
+    assert reloaded.settings.unit_size == proj.settings.unit_size
+    assert reloaded.settings.block_height == proj.settings.block_height
+    assert reloaded.blocks[0].pins_enabled is False
+    assert reloaded.blocks[0].tubes_enabled is True
 
 
 # ------------------------------------------------------- legacy migration

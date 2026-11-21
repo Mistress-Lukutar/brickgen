@@ -1,9 +1,9 @@
 '''
 File:   template_library.py
-Brief:  Template library: named settings presets from builtin and user dirs.
+Brief:  Template library: block layout templates from builtin and user dirs.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -15,12 +15,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from brickgen.core.exceptions import TemplateError
-from brickgen.core.models import BlockSettings, validate_settings
+from brickgen.core.models import validate_settings
+from brickgen.core.project import LAYOUT_FIELDS, BlockLayout
 
 logger = logging.getLogger(__name__)
 
 SCHEMA_KEY = "schema"
 TEMPLATE_NAME_KEY = "template_name"
+TEMPLATE_SCHEMA_NAME = "brickgen-block-template"
+TEMPLATE_SCHEMA_VERSION = 1
 SETTINGS_SCHEMA_NAME = "brickgen-settings"
 SETTINGS_SCHEMA_VERSION = 3
 
@@ -30,16 +33,16 @@ BUILTIN_DIR = Path(__file__).resolve().parent.parent / "data" / "templates"
 
 @dataclass(frozen=True)
 class Template:
-    '''A named parameter preset for the template library.
+    '''A named block-layout template for the template library.
 
     Attributes:
         name: Display name.
-        settings: Validated block settings.
+        layout: Validated block layout (grid size, flags, per-cell lists).
         builtin: True for templates shipped with the application.
     '''
 
     name: str
-    settings: BlockSettings
+    layout: BlockLayout
     builtin: bool
 
 
@@ -58,6 +61,12 @@ def user_templates_dir() -> Path:
 
 def _load_template_file(path: Path, builtin: bool) -> Template:
     '''Load and validate a single template JSON file.
+
+    Supports the new block-template format (schema name
+    ``brickgen-block-template``) and the legacy settings format
+    (``brickgen-settings``). New-format files are parsed as ``BlockLayout``;
+    legacy files are parsed as full ``BlockSettings`` and converted to a
+    ``BlockLayout`` carrying only the block-level fields.
 
     Args:
         path: Source file.
@@ -78,16 +87,40 @@ def _load_template_file(path: Path, builtin: bool) -> Template:
     if not isinstance(payload, dict):
         raise TemplateError(f"Invalid template structure in {path}")
     name = str(payload.pop(TEMPLATE_NAME_KEY, path.stem))
-    payload.pop(SCHEMA_KEY, None)  # marker is optional, never validated
+    schema = payload.pop(SCHEMA_KEY, None)
+    # New format: try BlockLayout first (extra keys forbidden).
+    if (
+        isinstance(schema, dict)
+        and schema.get("name") == TEMPLATE_SCHEMA_NAME
+        and schema.get("version") == TEMPLATE_SCHEMA_VERSION
+    ):
+        try:
+            layout = BlockLayout.model_validate(payload)
+        except Exception as exc:
+            raise TemplateError(f"Invalid template layout in {path}: {exc}") from exc
+        return Template(name=name, layout=layout, builtin=builtin)
+    # Legacy format: full BlockSettings → extract block-level fields.
     try:
         settings = validate_settings(payload)
     except Exception as exc:
         raise TemplateError(f"Invalid template settings in {path}: {exc}") from exc
-    return Template(name=name, settings=settings, builtin=builtin)
+    try:
+        layout_dict = {
+            "cells_x": settings.cells_x,
+            "cells_y": settings.cells_y,
+            "pins_enabled": settings.pins_enabled,
+            "tubes_enabled": settings.tubes_enabled,
+        }
+        for field in LAYOUT_FIELDS:
+            layout_dict[field] = getattr(settings, field)
+        layout = BlockLayout.model_validate(layout_dict)
+    except Exception as exc:
+        raise TemplateError(f"Cannot extract block layout from {path}: {exc}") from exc
+    return Template(name=name, layout=layout, builtin=builtin)
 
 
 def list_templates() -> list[Template]:
-    '''List all templates: builtin first, then user templates.
+    '''List all block-layout templates: builtin first, then user templates.
 
     Unreadable files are skipped with a warning.
 
@@ -107,12 +140,12 @@ def list_templates() -> list[Template]:
     return templates
 
 
-def save_template(name: str, settings: BlockSettings) -> Path:
-    '''Save current settings as a named user template.
+def save_template(name: str, layout: BlockLayout) -> Path:
+    '''Save current block layout as a named user template.
 
     Args:
         name: Display name (also sanitized into the file name).
-        settings: Settings to persist.
+        layout: Block layout to persist.
 
     Returns:
         Path of the written template file (existing file is overwritten).
@@ -126,11 +159,11 @@ def save_template(name: str, settings: BlockSettings) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         SCHEMA_KEY: {
-            "name": SETTINGS_SCHEMA_NAME,
-            "version": SETTINGS_SCHEMA_VERSION,
+            "name": TEMPLATE_SCHEMA_NAME,
+            "version": TEMPLATE_SCHEMA_VERSION,
         },
         TEMPLATE_NAME_KEY: display_name,
-        **settings.model_dump(),
+        **layout.model_dump(),
     }
     try:
         path.write_text(

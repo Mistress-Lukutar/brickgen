@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QShowEvent
@@ -46,9 +47,10 @@ from brickgen.core.models import (
     validate_settings,
 )
 from brickgen.core.project import (
+    BLOCK_FLAG_FIELDS,
     LAYOUT_FIELDS,
-    SHARED_SETTING_FIELDS,
     BlockInstance,
+    BlockLayout,
     Project,
 )
 from brickgen.gui.grid_editor import CellGridEditor, CellState
@@ -69,6 +71,7 @@ from brickgen.services.app_settings import (
 )
 from brickgen.services.export_service import SUPPORTED_FORMATS
 from brickgen.services.project_io import load_project, save_project
+from brickgen.services.template_library import Template
 
 logger = logging.getLogger(__name__)
 
@@ -131,17 +134,27 @@ class MainWindow(QMainWindow):
         self._jobs = JobQueue(self)
         self._gen_seq = 0
         self._job_meta: dict[int, tuple[int, dict]] = {}
-        self._applied_context: dict | None = None
+        self._applied_context: dict[str, Any] | None = None
         self._export_meta: dict[int, str] = {}  # job id -> resolved export path
+        # Per-block regeneration flags (the "scene engine"): every edit of a
+        # block's geometry marks that block dirty; a whole-scene rebuild is
+        # requested only by structural changes (add/remove/open/template) and
+        # by shared geometry edits that every block inherits. An edit made
+        # while a generation is in flight stays dirty: the flag carries the
+        # edit epoch, which is always newer than the epoch the generation
+        # committed. `_compute_changed_mask` turns the flags into the per-block
+        # mask consumed by ``update_scene``.
+        self._edit_epoch = 0
+        self._scene_dirty = True
+        self._dirty_epoch: dict[int, int] = {}  # block index -> last edit epoch
+        self._committed_epoch: dict[int, int] = {}  # block index -> applied epoch
         self._jobs.job_done.connect(self._on_job_done)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self._sidebar = self._build_sidebar()
         splitter.addWidget(self._sidebar)
         splitter.addWidget(self._build_preview_pane())
-        self._library = TemplateLibraryPanel(
-            self._collect_settings_or_default, self._jobs
-        )
+        self._library = TemplateLibraryPanel(self._selected_block_layout, self._jobs)
         self._library.apply_requested.connect(self._on_template_selected)
         splitter.addWidget(self._library)
         splitter.setStretchFactor(0, 0)
@@ -336,15 +349,6 @@ class MainWindow(QMainWindow):
         self._derived_label.setStyleSheet("color: #888;")
         form.addRow(self._derived_label)
 
-        self._pins = QCheckBox("Studs on plain cells")
-        self._pins.setToolTip(
-            "Default top for cells without an explicit per-cell assignment.\n"
-            "Individual cells are edited in the layout below (click a cell)."
-        )
-        form.addRow(self._pins)
-
-        self._tubes = QCheckBox("Inner tubes (2x2+ centers)")
-        form.addRow(self._tubes)
         return group
 
     def _build_blocks_group(self) -> QGroupBox:
@@ -405,6 +409,12 @@ class MainWindow(QMainWindow):
             "How many physical copies this block represents (BOM tracking)."
         )
         form.addRow("Quantity", self._block_quantity)
+
+        self._block_tubes = QCheckBox("Inner tubes (2x2+ centers)")
+        self._block_tubes.setToolTip(
+            "Build the inner tubes of this block (2x2+ blocks only)."
+        )
+        form.addRow(self._block_tubes)
 
         self._block_pos_x = QDoubleSpinBox()
         self._block_pos_x.setRange(-100000.0, 100000.0)
@@ -554,8 +564,7 @@ class MainWindow(QMainWindow):
         for spin in self._floats.values():
             spin.valueChanged.connect(self._on_shared_param_changed)
             spin.valueChanged.connect(self._update_derived_label)
-        self._pins.toggled.connect(self._on_pins_toggled)
-        self._tubes.toggled.connect(self._on_shared_param_changed)
+        self._block_tubes.toggled.connect(self._on_block_tubes_toggled)
         self._preview.selection_changed.connect(self._on_scene_selection)
         self._preview.blocks_moved.connect(self._on_preview_blocks_moved)
         self._block_cells_x.valueChanged.connect(self._on_block_cells_changed)
@@ -595,14 +604,90 @@ class MainWindow(QMainWindow):
 
     def _on_shared_param_changed(self) -> None:
         '''A shared geometry control changed: mark dirty and regenerate.'''
+        self._mark_scene_dirty()
         self._mark_dirty()
         self._schedule_rebuild()
 
-    def _on_pins_toggled(self, checked: bool) -> None:
-        '''Apply the new plain-cell default and regenerate.'''
-        self._cell_grid.set_default_studs(checked)
-        self._sync_inspector()
-        self._on_shared_param_changed()
+    # ----------------------------------------------------- scene engine flags
+    def _mark_blocks_dirty(self, indices: Iterable[int]) -> None:
+        '''Flag the given blocks as needing a rebuild on the next generation.
+
+        MUST be called by every handler that changes a block's geometry
+        (per-cell layout, stud/tube flags, cell counts). Forgetting the flag
+        leaves the block stale on screen until something else rebuilds it.
+
+        Args:
+            indices: Scene indices of the edited blocks.
+        '''
+        self._edit_epoch += 1
+        for index in indices:
+            self._dirty_epoch[index] = self._edit_epoch
+
+    def _mark_scene_dirty(self) -> None:
+        '''Request a full-scene rebuild (structural or shared-geometry edit).
+
+        Used whenever the per-block flags are not enough: the block list
+        changed, a shared numeric field changed (every block inherits it),
+        or the tessellation tolerances changed.
+        '''
+        self._edit_epoch += 1
+        self._scene_dirty = True
+
+    @staticmethod
+    def _compute_changed_mask(
+        scene_dirty: bool,
+        applied_blocks: int,
+        block_count: int,
+        dirty_epoch: dict[int, int],
+        committed_epoch: dict[int, int],
+    ) -> list[bool]:
+        '''Per-block rebuild mask for the next generation.
+
+        A block is rebuilt when its edit epoch is newer than the epoch of the
+        generation last applied for it. A whole-scene rebuild happens when
+        the structure changed (or nothing was applied yet); then the per-block
+        bookkeeping is ignored and every block is rebuilt.
+
+        Args:
+            scene_dirty: True after a structural or shared-geometry edit.
+            applied_blocks: Block count of the last applied generation
+                (0 when nothing was applied yet).
+            block_count: Current block count.
+            dirty_epoch: Block index -> epoch of the last geometry edit.
+            committed_epoch: Block index -> epoch committed by the last
+                generation that rebuilt that block.
+
+        Returns:
+            One bool per block: True = rebuild this block's mesh and actors.
+        '''
+        if scene_dirty or applied_blocks != block_count:
+            return [True] * block_count
+        return [
+            dirty_epoch.get(index, -1) > committed_epoch.get(index, -1)
+            for index in range(block_count)
+        ]
+
+    def _commit_applied_mask(self, changed: list[bool], epoch: int) -> None:
+        '''Record which blocks the applied generation actually rebuilt.
+
+        Blocks with ``True`` in *changed* are committed at *epoch*; an edit
+        of the same block made after the submission keeps a newer epoch and
+        therefore stays dirty for the next generation. A full-scene rebuild
+        resets the per-block bookkeeping.
+
+        Args:
+            changed: The rebuild mask of the applied generation.
+            epoch: The edit epoch at the moment the generation was submitted.
+        '''
+        if all(changed) or not changed:
+            self._scene_dirty = False
+            self._dirty_epoch.clear()
+            self._committed_epoch.clear()
+            return
+        for index, rebuilt in enumerate(changed):
+            if rebuilt:
+                self._committed_epoch[index] = epoch
+        self._scene_dirty = False
 
     def _on_include_all(self) -> None:
         '''Reset every cell feature from the "Include all" button.'''
@@ -637,6 +722,7 @@ class MainWindow(QMainWindow):
         self._project = Project(blocks=[BlockInstance()])
         self._project_path = None
         self._applied_context = None
+        self._mark_scene_dirty()
         self._selection = {0}
         self._primary = 0
         self._mark_clean()
@@ -661,6 +747,7 @@ class MainWindow(QMainWindow):
         self._project = project
         self._project_path = Path(path)
         self._applied_context = None
+        self._mark_scene_dirty()
         self._selection = {0} if project.blocks else set()
         self._primary = 0 if project.blocks else None
         self._mark_clean()
@@ -734,6 +821,7 @@ class MainWindow(QMainWindow):
             BlockInstance(position_x=position[0], position_y=position[1])
         )
         self._select_index(len(self._project.blocks) - 1)
+        self._mark_scene_dirty()
         self._mark_dirty()
         self._sync_all()
         self._on_generate()
@@ -752,6 +840,7 @@ class MainWindow(QMainWindow):
         }
         self._project.blocks.append(BlockInstance.model_validate(values))
         self._select_index(len(self._project.blocks) - 1)
+        self._mark_scene_dirty()
         self._mark_dirty()
         self._sync_all()
         self._on_generate()
@@ -766,6 +855,7 @@ class MainWindow(QMainWindow):
         self._selection = set()
         self._primary = None
         self._preview.set_selection(set(), None)
+        self._mark_scene_dirty()
         self._mark_dirty()
         self._sync_all()
         self._on_generate()
@@ -794,6 +884,12 @@ class MainWindow(QMainWindow):
             b.position_x + b.to_settings(settings).outer_length_x / 2 for b in blocks
         )
         return (max_x + half_x + settings.unit_size / 2, blocks[-1].position_y)
+
+    def _selected_block_layout(self) -> BlockLayout | None:
+        '''Block-level definition of the primary selected block (None if empty).'''
+        if self._primary is None:
+            return None
+        return self._project.blocks[self._primary]
 
     def _on_scene_selection(self, payload: object) -> None:
         '''Sync the inspector after the scene selection changed.
@@ -860,6 +956,7 @@ class MainWindow(QMainWindow):
                 f"QPushButton {{ background-color: {block.color}; }}"
             )
             self._block_quantity.setValue(block.quantity)
+            self._block_tubes.setChecked(block.tubes_enabled)
             self._block_pos_x.setValue(block.position_x)
             self._block_pos_y.setValue(block.position_y)
             self._inspector_pos = (block.position_x, block.position_y)
@@ -916,6 +1013,16 @@ class MainWindow(QMainWindow):
         self._preview.set_block_quantities(changed)
         self._sync_blocks_list()
         self._mark_dirty()
+
+    def _on_block_tubes_toggled(self, checked: bool) -> None:
+        '''Apply the block-level inner-tubes toggle to every selected block.'''
+        if self._syncing_inspector or self._primary is None:
+            return
+        for index in sorted(self._selection):
+            self._project.blocks[index].tubes_enabled = bool(checked)
+        self._mark_blocks_dirty(sorted(self._selection))
+        self._mark_dirty()
+        self._schedule_rebuild()
 
     def _on_block_position_changed(self) -> None:
         '''Apply the edited position to the selection.
@@ -979,7 +1086,7 @@ class MainWindow(QMainWindow):
                 return
             block = self._project.blocks[self._primary]
             self._cell_grid.set_dimensions(block.cells_x, block.cells_y)
-            self._cell_grid.set_default_studs(self._project.settings.pins_enabled)
+            self._cell_grid.set_default_studs(block.pins_enabled)
             self._cell_grid.set_from_lists(
                 block.excluded_cells,
                 block.flat_cells,
@@ -1038,6 +1145,7 @@ class MainWindow(QMainWindow):
                 self._project.blocks[index] = BlockInstance.model_validate(values)
             except Exception:  # noqa: BLE001 - invalid layout: keep the block as is
                 logger.debug("Layout rejected for block %d", index, exc_info=True)
+        self._mark_blocks_dirty(sorted(self._selection))
 
     @staticmethod
     def _outward_sides(
@@ -1265,8 +1373,8 @@ class MainWindow(QMainWindow):
         '''Build the shared BlockSettings from the form widgets.
 
         Returns:
-            Validated settings (shared geometry only; per-cell layout lives
-            on the placed blocks).
+            Validated settings (shared geometry only; per-cell layout and
+            stud/tube flags live on the placed blocks).
 
         Raises:
             SettingsValidationError: If values fail geometry validation.
@@ -1274,21 +1382,7 @@ class MainWindow(QMainWindow):
         values: dict[str, object] = {
             field: spin.value() for field, spin in self._floats.items()
         }
-        values["pins_enabled"] = self._pins.isChecked()
-        values["tubes_enabled"] = self._tubes.isChecked()
         return validate_settings(values)
-
-    def _collect_settings_or_default(self) -> BlockSettings:
-        '''Best-effort settings snapshot for the template library panel.
-
-        Returns:
-            Current shared settings, or the last valid project settings
-            when the form is currently in an invalid state.
-        '''
-        try:
-            return self._collect_shared_settings()
-        except BrickGenError:
-            return self._project.settings
 
     def _sync_all(self) -> None:
         '''Push the whole project state into every form widget.'''
@@ -1304,8 +1398,6 @@ class MainWindow(QMainWindow):
         settings = self._project.settings
         for field, spin in self._floats.items():
             spin.setValue(getattr(settings, field))
-        self._pins.setChecked(settings.pins_enabled)
-        self._tubes.setChecked(settings.tubes_enabled)
         self._update_derived_label()
 
     def _mark_dirty(self) -> None:
@@ -1380,41 +1472,51 @@ class MainWindow(QMainWindow):
             return
         self._app_settings = updated
         self._save_app_settings()
+        self._mark_scene_dirty()  # the tessellation tolerances changed
         self._on_generate()  # re-render the preview with the new precision
         self._set_status("Preferences saved.")
 
     # ------------------------------------------------------------- templates
-    def _on_template_selected(self, settings: BlockSettings) -> None:
+    def _on_template_selected(self, template: Template) -> None:
         '''Apply a template picked in the library panel.
 
-        The shared geometry is replaced from the template and the template
-        itself is added to the scene as a new block with its own layout.
+        Builds a block from ``template.layout`` merged against the current
+        shared settings, auto-places it, appends and selects it; the shared
+        geometry is never replaced by the template.
         '''
-        self._project.settings = validate_settings(
-            {field: getattr(settings, field) for field in SHARED_SETTING_FIELDS}
+        merged = template.layout.to_settings(self._project.settings)
+        position = self._auto_place_position(
+            merged.outer_length_x / 2, merged.outer_length_y / 2
         )
         block = BlockInstance(
-            cells_x=settings.cells_x,
-            cells_y=settings.cells_y,
-            **{field: getattr(settings, field) for field in LAYOUT_FIELDS},
+            cells_x=template.layout.cells_x,
+            cells_y=template.layout.cells_y,
+            **{field: getattr(template.layout, field) for field in BLOCK_FLAG_FIELDS},
+            **{field: getattr(template.layout, field) for field in LAYOUT_FIELDS},
+            position_x=position[0],
+            position_y=position[1],
         )
         self._project.blocks.append(block)
         self._select_index(len(self._project.blocks) - 1)
+        self._mark_scene_dirty()
         self._mark_dirty()
         self._sync_all()
         self._on_generate()
-        self._set_status(f"Template applied: {settings.describe()}")
+        self._set_status(f"Template applied: {template.name}")
 
     # ------------------------------------------------------------- generation
     def _on_generate(self) -> None:
-        '''Schedule a background rebuild of the whole scene.
+        '''Schedule a background rebuild of the scene.
 
         Invalid intermediate form states are reported in the status label
         only (no dialogs), so typing stays uninterrupted.  A
         ``build_scene`` task (per-block settings snapshots + tolerances) is
         sent to the worker process; every block is built and meshed there,
         and the meshes come back as arrays via ``_on_job_done``.  Same-key
-        submissions buffer (latest-wins).
+        submissions buffer (latest-wins).  The per-block rebuild mask comes
+        from the dirty flags (see the scene engine fields in ``__init__``):
+        only edited blocks change their preview actors, structural and
+        shared-geometry edits rebuild the whole scene.
         '''
         try:
             shared = self._collect_shared_settings()
@@ -1428,7 +1530,7 @@ class MainWindow(QMainWindow):
         self._gen_seq += 1
         seq = self._gen_seq
         merged = [block.to_settings(shared) for block in self._project.blocks]
-        payload = {
+        payload: dict[str, Any] = {
             'blocks': [
                 {
                     'position_x': block.position_x,
@@ -1441,7 +1543,25 @@ class MainWindow(QMainWindow):
             'angular': self._app_settings.preview_angular_tolerance,
             'cache_key': f'gen{seq}',
         }
-        context = {'payload': payload, 'settings': merged}
+        # Per-block rebuild mask from the dirty flags: unchanged blocks keep
+        # their actors, so editing one block never rebuilds the whole scene.
+        changed = self._compute_changed_mask(
+            scene_dirty=self._scene_dirty,
+            applied_blocks=(
+                len(self._applied_context['payload']['blocks'])
+                if self._applied_context is not None
+                else -1
+            ),
+            block_count=len(merged),
+            dirty_epoch=self._dirty_epoch,
+            committed_epoch=self._committed_epoch,
+        )
+        context = {
+            'payload': payload,
+            'settings': merged,
+            'changed': changed,
+            'epoch': self._edit_epoch,
+        }
         count = len(merged)
         self._set_status(
             f"Generating {count} blocks…" if count else "Scene is empty - add a block."
@@ -1456,6 +1576,9 @@ class MainWindow(QMainWindow):
         results (by ``_export_meta`` path lookup), dropping unknown ids as
         foreign jobs.  Skipped/stale generation results are silently discarded;
         export errors always show a dialog because the user explicitly acted.
+        Uses the per-block rebuild mask so unchanged blocks keep their
+        existing preview actors, and commits the applied epochs afterwards
+        (edits made while the generation was in flight stay dirty).
 
         Args:
             job_id: The job identifier returned by :meth:`JobQueue.submit`.
@@ -1503,8 +1626,12 @@ class MainWindow(QMainWindow):
         if not isinstance(result, dict) or 'blocks' not in result:
             logger.error("Generation job %d returned unexpected payload", job_id)
             return
-        meshes = [mesh_from_arrays(arrays) for arrays in result['blocks']]
+        meshes = [
+            mesh_from_arrays(arrays) if flag else None
+            for arrays, flag in zip(result['blocks'], context['changed'])
+        ]
         self._applied_context = context
+        self._commit_applied_mask(context['changed'], context['epoch'])
 
         # Colors/quantities/positions come from the CURRENT project state:
         # a matching sequence number means the block list is unchanged, and
@@ -1524,7 +1651,7 @@ class MainWindow(QMainWindow):
                 }
             )
             colors.append(block.color)
-        self._preview.update_scene(meshes, colors, meta_list)
+        self._preview.update_scene(meshes, colors, meta_list, context['changed'])
         self._set_status(self._scene_summary())
 
     # ------------------------------------------------------------- export

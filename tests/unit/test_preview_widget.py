@@ -673,12 +673,103 @@ def test_grid_scale_extends_step(preview: PreviewWidget) -> None:
     assert preview.grid_step() == pytest.approx(2.0)
 
 
-def test_grid_recenters_on_far_pan(preview: PreviewWidget) -> None:
-    '''_maybe_regrid rebuilds the grid around the new focal point.'''
+def test_grid_present_with_empty_scene(preview: PreviewWidget) -> None:
+    '''Grid is visible even when the scene has no blocks.'''
+    preview.set_grid_unit(4.0)
+    preview.set_grid_scale(0.5)
     preview.set_grid_enabled(True)
-    camera = preview.renderer.GetActiveCamera()
-    camera.SetFocalPoint(2000.0, -1500.0, 0.0)
-    camera.SetPosition(2000.0, -1500.0, 300.0)
-    preview.renderer.ResetCameraClippingRange()
-    preview._maybe_regrid()
-    assert preview._grid_center == pytest.approx((2000.0, -1500.0))
+    # Clear the scene and call update_scene with empty lists.
+    preview.update_scene([], [], [])
+    assert len(preview._grid_actors) >= 6
+
+
+def test_grid_survives_scene_update(preview: PreviewWidget) -> None:
+    '''Grid actors persist across an update_scene call.'''
+    preview.set_grid_unit(4.0)
+    preview.set_grid_scale(0.5)
+    preview.set_grid_enabled(True)
+    grid_actors_before = list(preview._grid_actors)
+    # Re-trigger the scene with the same data.
+    meshes = [preview._scene_meshes[0]] if preview._scene_meshes else [_cube_mesh()]
+    preview.update_scene(meshes, [BLOCK_COLOR], [_scene_meta(30.0, 20.0)])
+    assert len(preview._grid_actors) >= 6
+    # The grid actor objects are the same instances (not rebuilt).
+    for old_actor in grid_actors_before:
+        assert old_actor in preview._grid_actors
+
+
+def test_grid_rebuilt_by_scale_and_unit(preview: PreviewWidget) -> None:
+    '''set_grid_scale / set_grid_unit rebuild the grid actors.'''
+    preview.set_grid_unit(4.0)
+    preview.set_grid_scale(0.5)
+    preview.set_grid_enabled(True)
+    first_actors = list(preview._grid_actors)
+    preview.set_grid_scale(1.0)
+    assert len(preview._grid_actors) != len(first_actors) or (
+        len(preview._grid_actors) > 0 and preview._grid_actors[0] is not first_actors[0]
+    )
+    second_actors = list(preview._grid_actors)
+    preview.set_grid_unit(8.0)
+    assert len(preview._grid_actors) != len(second_actors) or (
+        len(preview._grid_actors) > 0
+        and preview._grid_actors[0] is not second_actors[0]
+    )
+
+
+def test_incremental_update_preserves_unchanged_actors(
+    preview_two: PreviewWidget,
+) -> None:
+    '''Incremental update: changed=True rebuilds, changed=False keeps actors.'''
+    preview_two.set_display_mode(MODE_SOLID)
+    actors_idx0_old = list(preview_two._block_actors[0])
+    actors_idx1_old = list(preview_two._block_actors[1])
+
+    # Build a new mesh for block 0 only; None for block 1 (keep old).
+    new_mesh = _cube_mesh()
+    preview_two.update_scene(
+        [new_mesh, None],
+        [BLOCK_COLOR, '#bf7f3f'],
+        [_scene_meta(0.0, 0.0), _scene_meta(100.0, 0.0)],
+        changed=[True, False],
+    )
+    # Block 0: new actors.
+    assert preview_two._block_actors[0] != actors_idx0_old
+    # Block 1: same actor objects.
+    for old_actor in actors_idx1_old:
+        assert old_actor in preview_two._block_actors[1]
+    # Actor map: every pickable actor maps to a valid index.
+    for actor, idx in preview_two._actor_map.items():
+        assert idx < len(preview_two._scene_meshes)
+
+
+def test_changed_none_triggers_full_rebuild(preview: PreviewWidget) -> None:
+    '''changed=None causes a full rebuild of all actors.'''
+    preview.set_display_mode(MODE_SOLID)
+    actors_before = list(preview._block_actors[0])
+    preview.update_scene(
+        [_cube_mesh()],
+        [BLOCK_COLOR],
+        [_scene_meta(30.0, 20.0)],
+        changed=None,
+    )
+    # All actors are new objects after a full rebuild.
+    assert preview._block_actors[0] != actors_before
+
+
+def test_empty_scene_update_removes_block_actors(
+    preview_two: PreviewWidget,
+) -> None:
+    '''Regression: emptying the scene must remove the block actors from the
+    renderer — the early-return-before-clear left them as visible ghosts.'''
+    preview_two.set_display_mode(MODE_SOLID)
+    block_actors = [a for actors in preview_two._block_actors for a in actors]
+    assert block_actors
+
+    preview_two.update_scene([], [], [], [])
+
+    assert preview_two._block_actors == []
+    assert preview_two._actor_map == {}
+    # None of the previously rendered block actors remains in the renderer.
+    renderer_actors = set(map(id, preview_two.actors.values()))
+    for actor in block_actors:
+        assert id(actor) not in renderer_actors

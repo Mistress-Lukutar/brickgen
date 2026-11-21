@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import BlockSettings
+from brickgen.core.project import BlockLayout
 from brickgen.gui.jobs import SKIPPED, JobError, JobQueue
 from brickgen.gui.preview import BLOCK_COLOR, VIEWPORT_BG, mesh_from_arrays
 from brickgen.services.template_library import list_templates, save_template
@@ -86,26 +87,26 @@ class TemplateLibraryPanel(QWidget):
     splitter/maximize resizes, permanently offsetting the grid.
     '''
 
-    # Emitted with the settings of the template the user clicked.
+    # Emitted with the Template object when the user clicks a card.
     apply_requested = Signal(object)
 
     def __init__(
         self,
-        current_settings: Callable[[], BlockSettings],
+        current_block: Callable[[], BlockLayout | None],
         jobs: JobQueue,
         parent: QWidget | None = None,
     ) -> None:
         '''Create the library panel.
 
         Args:
-            current_settings: Callback returning the settings currently
-                entered in the form (used by "Save as template").
+            current_block: Callback returning the primary selected block layout
+                (``None`` when no block is selected).
             jobs: Background job queue on which thumbnail build work is
                 dispatched.
             parent: Optional parent widget.
         '''
         super().__init__(parent)
-        self._get_current_settings = current_settings
+        self._current_block = current_block
         self._jobs = jobs
         self._refresh_seq = 0
         self._thumb_meta: dict[int, tuple[str, int]] = {}  # job id -> (name, seq)
@@ -194,18 +195,16 @@ class TemplateLibraryPanel(QWidget):
             button.setIconSize(QSize(*THUMBNAIL_SIZE))
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
             button.setFixedSize(*CARD_SIZE)
+            merged = template.layout.to_settings(BlockSettings())
             button.setToolTip(
-                f"{template.settings.describe()} | height "
-                f"{template.settings.total_height:.1f} mm"
+                f"{merged.describe()} | height {merged.total_height:.1f} mm"
             )
             button.clicked.connect(
-                lambda checked=False, tpl=template: self.apply_requested.emit(
-                    tpl.settings
-                )
+                lambda checked=False, tpl=template: self.apply_requested.emit(tpl)
             )
             self._cards[template.name] = button
             self._card_order.append(button)
-            payload = {'settings': template.settings.model_dump()}
+            payload = {'settings': merged.model_dump()}
             job_id = self._jobs.submit('thumbnail', payload)
             self._thumb_meta[job_id] = (template.name, refresh_seq)
 
@@ -261,21 +260,28 @@ class TemplateLibraryPanel(QWidget):
             logger.warning("Thumbnail VTK render failed for %s", name)
 
     def _on_save_template(self) -> None:
-        '''Ask for a name and save the current form settings as a template.
+        '''Ask for a name and save the current block layout as a template.
 
         The recipe name is pre-filled, so templates of different blocks
         stay distinguishable by default.
         '''
+        layout = self._current_block()
+        if layout is None:
+            QMessageBox.information(
+                self, "Save as template", "Select a block on the scene first."
+            )
+            return
+        merged = layout.to_settings(BlockSettings())
         name, ok = QInputDialog.getText(
             self,
             "Save as template",
             "Template name:",
-            text=self._get_current_settings().recipe_name(),
+            text=merged.recipe_name(),
         )
         if not ok or not name.strip():
             return
         try:
-            save_template(name, self._get_current_settings())
+            save_template(name, layout)
         except BrickGenError as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
             return

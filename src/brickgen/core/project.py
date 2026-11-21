@@ -2,8 +2,8 @@
 File:   project.py
 Brief:  Project and placed-block models for the multi-block GUI scene.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -19,13 +19,17 @@ from brickgen.core.models import MAX_CELLS, BlockSettings, validate_settings
 DEFAULT_BLOCK_COLOR = "#3f7fbf"
 
 # BlockSettings fields describing geometry shared by the whole project
-# (identical for every block) versus per-cell layout owned by each instance.
+# (identical for every block) versus block-level data owned by each
+# instance (grid size, stud/tube defaults, per-cell layout).
 SHARED_SETTING_FIELDS: tuple[str, ...] = (
     "unit_size",
     "wall_thickness",
     "block_height",
     "clearance_xy",
     "clearance_z",
+)
+# Block-level BlockSettings flags carried by every instance/template.
+BLOCK_FLAG_FIELDS: tuple[str, ...] = (
     "pins_enabled",
     "tubes_enabled",
 )
@@ -42,12 +46,14 @@ _QUANTITY_MAX = 100000
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
-class BlockInstance(BaseModel):
-    '''A single placed block within a project scene.
+class BlockLayout(BaseModel):
+    '''Scene-independent definition of one block: grid size, stud/tube
+    defaults and the per-cell layout lists.
 
-    Each instance carries its own grid size, per-cell layout, scene position,
-    color, and quantity (for BOM tracking). Shared geometry is inherited from
-    the parent :class:`Project.settings`.
+    This is everything a template stores and everything a placed instance
+    contributes on top of the shared project geometry. ``pins_enabled``
+    sets the default top of cells without an explicit per-cell assignment;
+    ``tubes_enabled`` toggles the inner tubes of 2x2+ blocks.
 
     Model config:
         extra: "forbid" — rejects unknown keys to catch payload typos.
@@ -57,29 +63,16 @@ class BlockInstance(BaseModel):
 
     cells_x: int = Field(default=1, ge=1, le=MAX_CELLS)
     cells_y: int = Field(default=1, ge=1, le=MAX_CELLS)
-    position_x: float = Field(
-        default=0.0,
+    pins_enabled: bool = Field(
+        default=True,
         description=(
-            "Scene offset of the block center along X (mm); blocks are built "
-            "centered on the origin."
+            "Default top for cells without an explicit per-cell assignment: "
+            "True puts a stud on every plain cell."
         ),
     )
-    position_y: float = Field(
-        default=0.0,
-        description=(
-            "Scene offset of the block center along Y (mm); blocks are built "
-            "centered on the origin."
-        ),
-    )
-    color: str = Field(
-        default=DEFAULT_BLOCK_COLOR,
-        description="'#rrggbb' hex preview color for visual distinction.",
-    )
-    quantity: int = Field(
-        default=1,
-        description=(
-            "How many physical copies this placed block represents, for BOM tracking."
-        ),
+    tubes_enabled: bool = Field(
+        default=True,
+        description="Build the inner tubes (centers of 2x2+ blocks) of this block.",
     )
     excluded_cells: list[list[int]] = Field(
         default_factory=list,
@@ -104,6 +97,85 @@ class BlockInstance(BaseModel):
     round_cells: list[list[int]] = Field(
         default_factory=list,
         description="See BlockSettings.round_cells.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_layout(self) -> BlockLayout:
+        '''Reuse all BlockSettings per-cell rules against this grid size.'''
+        # Explicit bounds check for sloped cells (BlockSettings does not
+        # call _check_cell_bounds for the sloped set, only flat/stud/round).
+        for cell in self.sloped_cells:
+            ix, iy = int(cell[0]), int(cell[1])
+            if not (0 <= ix < self.cells_x and 0 <= iy < self.cells_y):
+                raise SettingsValidationError(
+                    f"sloped cell [{ix}, {iy}] is outside the "
+                    f"{self.cells_x}x{self.cells_y} grid"
+                )
+        values = {
+            "cells_x": self.cells_x,
+            "cells_y": self.cells_y,
+        }
+        for field_name in LAYOUT_FIELDS:
+            values[field_name] = getattr(self, field_name)
+        try:
+            BlockSettings.model_validate(values)
+        except Exception as exc:  # noqa: BLE001
+            raise SettingsValidationError(str(exc)) from exc
+        return self
+
+    def to_settings(self, shared: BlockSettings) -> BlockSettings:
+        '''Merge the shared project geometry with this block's definition.
+
+        The block's own ``pins_enabled``/``tubes_enabled`` flags win over
+        the shared settings, which only contribute the numeric geometry.
+
+        Args:
+            shared: The project-level ``BlockSettings`` carrying shared
+                geometry (unit_size, wall_thickness, etc.).
+
+        Returns:
+            A fully-populated ``BlockSettings`` instance combining shared
+            geometry and this block's grid, flags and per-cell layout.
+        '''
+        values = {field: getattr(shared, field) for field in SHARED_SETTING_FIELDS}
+        values["cells_x"] = self.cells_x
+        values["cells_y"] = self.cells_y
+        values.update({field: getattr(self, field) for field in BLOCK_FLAG_FIELDS})
+        values.update({field: getattr(self, field) for field in LAYOUT_FIELDS})
+        return validate_settings(values)
+
+
+class BlockInstance(BlockLayout):
+    '''A single placed block within a project scene.
+
+    Each instance carries its own grid size, stud/tube defaults, per-cell
+    layout, scene position, color, and quantity (for BOM tracking). Shared
+    geometry is inherited from the parent :class:`Project.settings`.
+    '''
+
+    position_x: float = Field(
+        default=0.0,
+        description=(
+            "Scene offset of the block center along X (mm); blocks are built "
+            "centered on the origin."
+        ),
+    )
+    position_y: float = Field(
+        default=0.0,
+        description=(
+            "Scene offset of the block center along Y (mm); blocks are built "
+            "centered on the origin."
+        ),
+    )
+    color: str = Field(
+        default=DEFAULT_BLOCK_COLOR,
+        description="'#rrggbb' hex preview color for visual distinction.",
+    )
+    quantity: int = Field(
+        default=1,
+        description=(
+            "How many physical copies this placed block represents, for BOM tracking."
+        ),
     )
 
     @field_validator("quantity")
@@ -132,47 +204,6 @@ class BlockInstance(BaseModel):
             raise SettingsValidationError("position must be a finite number")
         return value
 
-    @model_validator(mode="after")
-    def _validate_layout(self) -> BlockInstance:
-        '''Reuse all BlockSettings per-cell rules against this grid size.'''
-        # Explicit bounds check for sloped cells (BlockSettings does not
-        # call _check_cell_bounds for the sloped set, only flat/stud/round).
-        for cell in self.sloped_cells:
-            ix, iy = int(cell[0]), int(cell[1])
-            if not (0 <= ix < self.cells_x and 0 <= iy < self.cells_y):
-                raise SettingsValidationError(
-                    f"sloped cell [{ix}, {iy}] is outside the "
-                    f"{self.cells_x}x{self.cells_y} grid"
-                )
-        values = {
-            "cells_x": self.cells_x,
-            "cells_y": self.cells_y,
-        }
-        for field_name in LAYOUT_FIELDS:
-            values[field_name] = getattr(self, field_name)
-        try:
-            BlockSettings.model_validate(values)
-        except Exception as exc:  # noqa: BLE001
-            raise SettingsValidationError(str(exc)) from exc
-        return self
-
-    def to_settings(self, shared: BlockSettings) -> BlockSettings:
-        '''Merge the shared project geometry with this block's grid and layout.
-
-        Args:
-            shared: The project-level ``BlockSettings`` carrying shared
-                geometry (unit_size, wall_thickness, etc.).
-
-        Returns:
-            A fully-populated ``BlockSettings`` instance combining shared
-            geometry and this instance's per-cell layout.
-        '''
-        values = {field: getattr(shared, field) for field in SHARED_SETTING_FIELDS}
-        values["cells_x"] = self.cells_x
-        values["cells_y"] = self.cells_y
-        values.update({field: getattr(self, field) for field in LAYOUT_FIELDS})
-        return validate_settings(values)
-
 
 class Project(BaseModel):
     '''A multi-block project scene.
@@ -182,8 +213,8 @@ class Project(BaseModel):
     scene position, color, and quantity.
 
     Convention: ``settings`` carries **shared geometry only**; its per-cell
-    lists are unused (kept empty). Per-instance layout lives in the
-    :class:`BlockInstance` objects.
+    lists and stud/tube flags are unused. Per-instance layout and flags
+    live in the :class:`BlockInstance` objects.
 
     Model config:
         extra: "forbid" — rejects unknown keys to catch payload typos.
@@ -195,7 +226,7 @@ class Project(BaseModel):
         default_factory=BlockSettings,
         description=(
             "Shared block geometry for the whole project. Carries shared "
-            "geometry only; per-cell lists are unused (kept empty)."
+            "geometry only; per-cell lists and stud/tube flags are unused."
         ),
     )
     blocks: list[BlockInstance] = Field(
@@ -211,7 +242,7 @@ class Project(BaseModel):
 
         Returns:
             A merged ``BlockSettings`` combining shared geometry with the
-            instance's per-cell layout.
+            instance's flags and per-cell layout.
         '''
         return self.blocks[index].to_settings(self.settings)
 
@@ -222,8 +253,10 @@ class Project(BaseModel):
 
 __all__ = [
     "Project",
+    "BlockLayout",
     "BlockInstance",
     "DEFAULT_BLOCK_COLOR",
     "SHARED_SETTING_FIELDS",
+    "BLOCK_FLAG_FIELDS",
     "LAYOUT_FIELDS",
 ]

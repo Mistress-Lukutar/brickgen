@@ -2,8 +2,8 @@
 File:   test_scene_jobs.py
 Brief:  Worker-handler tests for multi-block scene build and export.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 import os
@@ -192,6 +192,149 @@ def test_export_scene_empty_rejected():
         _, result = results[0]
         assert isinstance(result, JobError), f'Expected JobError, got {type(result)}'
         assert 'no blocks' in str(result.exc) or 'no blocks' in result.message
+
+    finally:
+        q.close()
+
+
+# ===========================================================================
+# Test 4: test_build_scene_cache_hit_rebuild
+# ===========================================================================
+
+
+def test_build_scene_cache_hit_rebuild():
+    '''Same payload submitted twice: second call reports cached == [True, ...].'''
+    from brickgen.gui import jobtasks
+
+    jobtasks._ARRAY_CACHE.clear()
+
+    q = JobQueue()
+    results = _collect_results(q)
+
+    try:
+        payload = {
+            'blocks': [BLOCK_A, BLOCK_B],
+            'tolerance': 0.15,
+            'angular': 0.1,
+        }
+
+        # First build -- all cached=False.
+        q.submit('build_scene', payload)
+        _wait_until(lambda: len(results) == 1, timeout=120.0)
+        _, first_result = results[0]
+        assert isinstance(first_result, dict)
+        assert 'cached' in first_result
+        assert first_result['cached'] == [False, False]
+        first_points = [blk['points'].copy() for blk in first_result['blocks']]
+
+        # Second build -- all cached=True.
+        q.submit('build_scene', payload)
+        _wait_until(lambda: len(results) == 2, timeout=120.0)
+        _, second_result = results[1]
+        assert isinstance(second_result, dict)
+        assert second_result['cached'] == [True, True]
+
+        # Points arrays must be identical (cache hit returns exact copy).
+        for i in range(2):
+            np.testing.assert_array_equal(
+                first_points[i], second_result['blocks'][i]['points']
+            )
+
+    finally:
+        q.close()
+
+
+# ===========================================================================
+# Test 5: test_build_scene_partial_cache_hit
+# ===========================================================================
+
+
+def test_build_scene_partial_cache_hit():
+    '''Two blocks: changing one block settings misses only that index.'''
+    from brickgen.gui import jobtasks
+
+    jobtasks._ARRAY_CACHE.clear()
+
+    q = JobQueue()
+    results = _collect_results(q)
+
+    try:
+        # First build with both blocks.
+        payload = {
+            'blocks': [BLOCK_A, BLOCK_B],
+            'tolerance': 0.15,
+            'angular': 0.1,
+        }
+        q.submit('build_scene', payload)
+        _wait_until(lambda: len(results) == 1, timeout=120.0)
+        _, first_result = results[0]
+        assert isinstance(first_result, dict)
+        assert first_result['cached'] == [False, False]
+
+        # Second build: change BLOCK_B settings (cells_x=2 instead of 1).
+        modified_b = {
+            'position_x': 12.0,
+            'position_y': 0.0,
+            'settings': BlockSettings(
+                cells_x=2, cells_y=1, pins_enabled=False
+            ).model_dump(),
+        }
+        payload2 = {
+            'blocks': [BLOCK_A, modified_b],
+            'tolerance': 0.15,
+            'angular': 0.1,
+        }
+        q.submit('build_scene', payload2)
+        _wait_until(lambda: len(results) == 2, timeout=120.0)
+        _, second_result = results[1]
+        assert isinstance(second_result, dict)
+        # BLOCK_A cached=True (unchanged), BLOCK_B cached=False (changed).
+        assert second_result['cached'] == [True, False]
+
+    finally:
+        q.close()
+
+
+# ===========================================================================
+# Test 6: test_build_scene_tolerance_miss
+# ===========================================================================
+
+
+def test_build_scene_tolerance_miss():
+    '''Changing tolerance produces no cache hits.'''
+    from brickgen.gui import jobtasks
+
+    jobtasks._ARRAY_CACHE.clear()
+
+    q = JobQueue()
+    results = _collect_results(q)
+
+    try:
+        payload = {
+            'blocks': [BLOCK_A, BLOCK_B],
+            'tolerance': 0.15,
+            'angular': 0.1,
+        }
+
+        # First build.
+        q.submit('build_scene', payload)
+        _wait_until(lambda: len(results) == 1, timeout=120.0)
+        _, first_result = results[0]
+        assert isinstance(first_result, dict)
+        assert first_result['cached'] == [False, False]
+
+        # Second build with different tolerance.
+        payload2 = {
+            'blocks': [BLOCK_A, BLOCK_B],
+            'tolerance': 0.10,
+            'angular': 0.1,
+        }
+        q.submit('build_scene', payload2)
+        _wait_until(lambda: len(results) == 2, timeout=120.0)
+        _, second_result = results[1]
+        assert isinstance(second_result, dict)
+        # Both blocks miss because tolerance changed (key includes tolerance).
+        assert second_result['cached'] == [False, False]
 
     finally:
         q.close()
