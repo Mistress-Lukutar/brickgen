@@ -2,7 +2,7 @@
 File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
-Date:   2026-11-20
+Date:   2026-11-21
 Version: v0.13.0
 '''
 
@@ -528,7 +528,6 @@ class MainWindow(QMainWindow):
         self._pins.toggled.connect(self._on_pins_toggled)
         self._tubes.toggled.connect(self._on_shared_param_changed)
         self._preview.selection_changed.connect(self._on_scene_selection)
-        self._preview.blocks_dragged.connect(self._on_blocks_dragged)
         self._block_cells_x.valueChanged.connect(self._on_block_cells_changed)
         self._block_cells_y.valueChanged.connect(self._on_block_cells_changed)
         self._block_quantity.valueChanged.connect(self._on_block_quantity_changed)
@@ -777,18 +776,6 @@ class MainWindow(QMainWindow):
         self._sync_block_inspector()
         self._sync_layout_from_primary()
         self._sync_inspector()
-
-    def _on_blocks_dragged(self, dx: float, dy: float) -> None:
-        '''Commit the drag delta of the selected blocks to the project.'''
-        for index in sorted(self._selection):
-            block = self._project.blocks[index]
-            x = block.position_x + dx
-            y = block.position_y + dy
-            block.position_x = x
-            block.position_y = y
-            self._preview.set_block_position(index, x, y)
-        self._mark_dirty()
-        self._sync_block_inspector()
 
     # ---------------------------------------------------- block inspector
     def _sync_blocks_list(self) -> None:

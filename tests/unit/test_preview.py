@@ -2,11 +2,13 @@
 File:   test_preview.py
 Brief:  Unit tests for the pyvista mesh conversion used by the preview.
 Author: Mistress-Lukutar
-Date:   2026-11-20
+Date:   2026-11-21
 Version: v0.13.0
 '''
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import pytest
@@ -24,6 +26,7 @@ pytestmark = pytest.mark.filterwarnings(
 
 from brickgen.gui.preview import (  # noqa: E402  # see filterwarnings note above
     DISPLAY_MODES,
+    MAX_POLAR_DEGREES,
     MODE_SOLID,
     MODE_SOLID_FEATURE_EDGES,
     MODE_SOLID_WIREFRAME,
@@ -33,6 +36,7 @@ from brickgen.gui.preview import (  # noqa: E402  # see filterwarnings note abov
     PART_STUD,
     PART_TUBE,
     make_face_classifier,
+    orbit_offset,
     semantic_edges,
     solid_to_mesh,
 )
@@ -248,3 +252,54 @@ def test_feature_edges_mode_position() -> None:
     '''MODE_SOLID_FEATURE_EDGES in DISPLAY_MODES and index == 1.'''
     assert MODE_SOLID_FEATURE_EDGES in DISPLAY_MODES
     assert DISPLAY_MODES.index(MODE_SOLID_FEATURE_EDGES) == 1
+
+
+# ------------------------------------------------- turntable orbit math
+
+
+def test_orbit_offset_azimuth_rotates_world_z() -> None:
+    '''Azimuth rotates the offset around world Z; the camera height stays.'''
+    offset = np.array([0.0, -40.0, 10.0])
+    rotated = orbit_offset(offset, azimuth_deg=90.0, elevation_deg=0.0)
+    assert rotated[2] == pytest.approx(10.0)
+    assert np.linalg.norm(rotated) == pytest.approx(np.linalg.norm(offset))
+    # (0, -40) rotated CCW by 90 degrees around Z lands on (40, 0).
+    assert rotated[0] == pytest.approx(40.0, abs=1e-9)
+    assert rotated[1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_orbit_offset_elevation_raises_camera_without_azimuth() -> None:
+    '''Positive elevation raises the camera, preserving orbit radius/azimuth.'''
+    offset = np.array([0.0, -40.0, 10.0])
+    radius = float(np.linalg.norm(offset))
+    azimuth_before = math.atan2(offset[1], offset[0])
+    raised = orbit_offset(offset, azimuth_deg=0.0, elevation_deg=45.0)
+    assert raised[2] > offset[2]
+    assert float(np.linalg.norm(raised)) == pytest.approx(radius)
+    assert math.atan2(raised[1], raised[0]) == pytest.approx(azimuth_before)
+
+
+def test_orbit_offset_elevation_lowers_camera() -> None:
+    '''Negative elevation lowers the camera below the horizon.'''
+    offset = np.array([0.0, -40.0, 10.0])
+    lowered = orbit_offset(offset, azimuth_deg=0.0, elevation_deg=-45.0)
+    assert lowered[2] < offset[2]
+
+
+def test_orbit_offset_clamps_at_pole() -> None:
+    '''Elevation never pushes the camera through the pole.'''
+    offset = np.array([0.0, -40.0, 10.0])
+    radius = float(np.linalg.norm(offset))
+    raised = orbit_offset(offset, azimuth_deg=0.0, elevation_deg=500.0)
+    polar = math.degrees(math.asin(raised[2] / radius))
+    assert polar == pytest.approx(MAX_POLAR_DEGREES)
+    lowered = orbit_offset(offset, azimuth_deg=0.0, elevation_deg=-500.0)
+    polar = math.degrees(math.asin(lowered[2] / radius))
+    assert polar == pytest.approx(-MAX_POLAR_DEGREES)
+
+
+def test_orbit_offset_preserves_radius() -> None:
+    '''Combined azimuth/elevation keep the orbit radius (pure rotation).'''
+    offset = np.array([12.0, -30.0, 5.0])
+    rotated = orbit_offset(offset, azimuth_deg=33.0, elevation_deg=17.0)
+    assert np.linalg.norm(rotated) == pytest.approx(np.linalg.norm(offset))

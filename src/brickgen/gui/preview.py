@@ -1,8 +1,8 @@
 '''
 File:   preview.py
-Brief:  PyVista/VTK-based 3D scene preview: multi-block meshes, selection, drag.
+Brief:  PyVista/VTK-based 3D scene preview: multi-block meshes, selection, navigation.
 Author: Mistress-Lukutar
-Date:   2026-11-20
+Date:   2026-11-21
 Version: v0.13.0
 '''
 
@@ -18,8 +18,9 @@ import numpy as np
 import pyvista as pv
 import vtk  # type: ignore[import-untyped]
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtWidgets import QRubberBand, QWidget
 from pyvistaqt import QtInteractor
 
 from brickgen.core.models import BlockSettings
@@ -33,6 +34,19 @@ BLOCK_COLOR = "#3f7fbf"
 LINE_COLOR = "#111111"
 # Thin black outline around selected blocks.
 SELECTION_COLOR = "#000000"
+
+# Turntable navigation: the camera follows the cursor like in common 3D
+# editors. Horizontal drags rotate around the world Z axis, vertical drags
+# raise/lower the camera without roll. Degrees covered by a full-window
+# drag, matching the VTK trackball scale.
+ORBIT_DEGREES_PER_AXIS = 75.0
+# Polar angle clamp (camera height above/below the focal plane): the world
+# up must stay well-defined, so the camera never reaches the pole.
+MAX_POLAR_DEGREES = 88.0
+# LMB press-to-move distance (manhattan, px) before the rubber band appears.
+RUBBER_BAND_THRESHOLD_PX = 4
+# World up vector of the scene (blocks sit on the XY plane).
+WORLD_UP = np.array([0.0, 0.0, 1.0])
 
 # Display modes offered by the GUI. Wireframe lines are the edges of the
 # tessellated mesh itself, not separate B-Rep geometry.
@@ -225,6 +239,7 @@ def add_surface_actor(plotter, mesh: pv.PolyData, color: str = BLOCK_COLOR) -> p
         specular=0.3,
         lighting="three lights",
         backface_params={"color": INTERIOR_COLOR, "specular": 0.1},
+        reset_camera=False,
     )
 
 
@@ -297,32 +312,65 @@ def build_preview_mesh(
     )
 
 
-def _ray_plane_hit(renderer, x: float, y: float, z_plane: float) -> np.ndarray | None:
-    '''Intersect the display ray at (x, y) with the horizontal plane z=z_plane.
+def orbit_offset(
+    offset: np.ndarray, azimuth_deg: float, elevation_deg: float
+) -> np.ndarray:
+    '''Turntable-rotate the focal-to-camera offset vector.
+
+    The azimuth component rotates around the world Z axis through the focal
+    point and the elevation component around the view-right axis (the world
+    up orthogonalized against the view direction). Horizontal drags therefore
+    never tilt the orbit plane and vertical drags never roll the camera - the
+    standard turntable navigation of 3D editors, unlike the native VTK
+    trackball which azimuths around the tilted camera up and orthogonalizes
+    the drifted view up in place, tumbling freely. The orbit radius is
+    preserved.
 
     Args:
-        renderer: Active vtkRenderer (used for display -> world unprojection).
-        x: Display coordinate.
-        y: Display coordinate.
-        z_plane: Height of the horizontal plane, mm.
+        offset: Vector from the focal point to the camera position.
+        azimuth_deg: Horizontal rotation around world Z (positive follows the
+            cursor to the right), degrees.
+        elevation_deg: Vertical rotation (positive raises the camera), degrees.
 
     Returns:
-        World point of the intersection, or None when the ray misses the
-        plane (looks away from it or behind the camera).
+        The rotated offset, same length as the input.
     '''
-    renderer.SetDisplayPoint(float(x), float(y), 0.0)
-    renderer.DisplayToWorld()
-    near = np.asarray(renderer.GetWorldPoint()[:3], dtype=np.float64)
-    renderer.SetDisplayPoint(float(x), float(y), 1.0)
-    renderer.DisplayToWorld()
-    far = np.asarray(renderer.GetWorldPoint()[:3], dtype=np.float64)
-    direction = far - near
-    if abs(direction[2]) < 1e-9:
-        return None
-    t = (z_plane - near[2]) / direction[2]
-    if t <= 0.0:
-        return None
-    return near + t * direction
+    offset = np.asarray(offset, dtype=np.float64)
+    radius = float(np.linalg.norm(offset))
+    if radius < 1e-9:
+        return offset.copy()
+    polar = math.degrees(math.asin(min(1.0, max(-1.0, offset[2] / radius))))
+    # Clamp so the camera never crosses the pole (world up stays defined).
+    elevation_deg = max(
+        -MAX_POLAR_DEGREES - polar, min(MAX_POLAR_DEGREES - polar, elevation_deg)
+    )
+
+    azimuth = math.radians(azimuth_deg)
+    cos_a, sin_a = math.cos(azimuth), math.sin(azimuth)
+    offset = np.array(
+        [
+            offset[0] * cos_a - offset[1] * sin_a,
+            offset[0] * sin_a + offset[1] * cos_a,
+            offset[2],
+        ]
+    )
+
+    view_dir = -offset / radius
+    right = np.cross(view_dir, WORLD_UP)
+    right_norm = float(np.linalg.norm(right))
+    if right_norm < 1e-9:  # looking straight along world Z: axis is arbitrary
+        right = np.array([1.0, 0.0, 0.0])
+    else:
+        right = right / right_norm
+
+    elevation = math.radians(-elevation_deg)
+    cos_e, sin_e = math.cos(elevation), math.sin(elevation)
+    offset = (
+        offset * cos_e
+        + np.cross(right, offset) * sin_e
+        + right * float(np.dot(right, offset)) * (1.0 - cos_e)
+    )
+    return offset
 
 
 def _settings_meta(settings: BlockSettings) -> dict:
@@ -337,57 +385,27 @@ def _settings_meta(settings: BlockSettings) -> dict:
     }
 
 
-class _SceneInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
-    '''Trackball camera style that routes block picking/dragging to the widget.
-
-    VTK events are observed on the style itself (the pattern pyvista's own
-    styles use). Because a style that observes an event never gets the C++
-    ``On*`` dispatch for it (``ProcessEvents`` prefers observers when
-    ``HandleObservers`` is on), the widget drives the left button itself and
-    calls the base ``OnLeftButtonDown``/``OnMouseMove``/``OnLeftButtonUp``
-    explicitly, in balanced pairs. The base ``OnLeftButtonDown`` grab is
-    what makes the follow-up move/release events reach the style on this
-    platform, and the paired ``OnLeftButtonUp`` always runs in a ``finally``
-    so a failing callback can never leave the grab or the ROTATE state
-    armed. The C++ state machine stays untouched for the middle/right
-    buttons and the wheel.
-    '''
-
-    def __init__(self, widget: PreviewWidget) -> None:  # noqa: F821
-        super().__init__()
-        self._widget = widget
-        self.AddObserver('LeftButtonPressEvent', self._on_press)
-        self.AddObserver('MouseMoveEvent', self._on_move)
-        self.AddObserver('LeftButtonReleaseEvent', self._on_release)
-
-    def _on_press(self, *_args) -> None:
-        self._widget._style_press(self)
-
-    def _on_move(self, *_args) -> None:
-        self._widget._style_move(self)
-
-    def _on_release(self, *_args) -> None:
-        self._widget._style_release(self)
-
-
 class PreviewWidget(QtInteractor):
     '''Interactive 3D scene preview: one shaded actor per placed block.
 
     Wraps a pyvista QtInteractor. Each block of the project scene renders as
     its own actor tinted with the block color; selection adds a thin black
-    outline around the block. Clicking a block selects it (Ctrl+click toggles it in
-    the selection), dragging selected blocks moves them along the XY plane
-    (Z is fixed), and rotating the camera stays available on empty space.
-    The mesh is tessellated once per block; display-mode/grid/label changes
-    only touch actors, not geometry. Quantity labels render the per-block
-    BOM count next to each block (View menu).
+    outline around the block. The mouse scheme is the common 3D-editor one:
+    the left button is selection only (a click picks the block under the
+    cursor, Ctrl+click toggles it, a drag draws a rubber band selecting every
+    block fully inside it), the middle button orbits the camera turntable
+    style and Shift+middle pans; the right button and the wheel keep the
+    native VTK zoom. LMB/MMB events are consumed on the Qt level, so the VTK
+    interactor never arms its native rotate/pan/spin states. Blocks are moved
+    from the inspector position fields, not by dragging. The mesh is
+    tessellated once per block; display-mode/grid/label changes only touch
+    actors, not geometry. Quantity labels render the per-block BOM count next
+    to each block (View menu).
     '''
 
     # Emitted when scene selection changed: (frozenset of indices, primary
     # index of the last-clicked block or None).
     selection_changed = Signal(object)
-    # Emitted when a drag committed: total (dx, dy) of the dragged selection.
-    blocks_dragged = Signal(float, float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         '''Create the renderer with a white background.
@@ -400,8 +418,9 @@ class PreviewWidget(QtInteractor):
         self._scene_meshes: list[pv.PolyData] = []
         self._scene_colors: list[str] = []
         self._scene_meta: list[dict] = []
-        self._block_actors: list[pv.Actor] = []
-        self._extra_actors: list[pv.Actor] = []
+        # One list of actors (surface + mode decorations) per block, aligned
+        # with the scene: everything of a block follows its position.
+        self._block_actors: list[list[pv.Actor]] = []
         self._outline_actors: dict[int, pv.Actor] = {}
         self._qty_actors: dict[int, Any] = {}
         self._actor_map: dict[pv.Actor, int] = {}
@@ -413,31 +432,20 @@ class PreviewWidget(QtInteractor):
         self._grid_actor: pv.CubeAxesActor | None = None
         self._mode = MODE_SOLID
         self._grid_enabled = False
-        # Drag/pick transient state. The left button is driven by our
-        # callbacks in balanced On* pairs (see _SceneInteractorStyle); the
-        # always-running release cleanup keeps VTK's state machine clean.
+        # Selection/navigation transient state. The left button is selection
+        # only (click or rubber band), the middle button orbits, Shift+middle
+        # pans; the right button and the wheel stay native VTK zoom.
         self._picker = vtk.vtkCellPicker()
         self._picker.SetTolerance(0.01)
+        self._left_down = False
         self._press_ctrl = False
-        self._press_block: int | None = None
-        self._left_state_armed = False
-        self._rotated = False
-        self._drag_block: int | None = None
-        self._drag_plane_z = 0.0
-        self._drag_origin: tuple[float, float] | None = None
-        self._drag_start: dict[int, tuple[float, float]] = {}
-        self._drag_delta: tuple[float, float] | None = None
+        self._press_pos = QPoint()
+        self._rubbing = False
+        self._rubber: QRubberBand | None = None
+        self._orbiting = False
+        self._panning = False
+        self._last_mouse = QPoint()
         self.enable_anti_aliasing("msaa")  # type: ignore[call-arg]  # pyvista stub bug
-        self._install_scene_style()
-
-    def _install_scene_style(self) -> None:
-        '''Replace the default trackball style with the scene-aware one.'''
-        style = _SceneInteractorStyle(self)
-        try:
-            self.iren.style = style  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001 - fall back to the raw VTK setter
-            logger.warning("pyvista style property unavailable, using raw setter")
-            self.iren.interactor.SetInteractorStyle(style)  # type: ignore[union-attr]
 
     # ------------------------------------------------------------- scene API
     def update_scene(
@@ -480,6 +488,10 @@ class PreviewWidget(QtInteractor):
         else:
             # reset_camera: pyvista stub bug (decorated _Wrapped signature).
             self.reset_camera()  # type: ignore[call-arg]
+            # Mark the camera as deliberately placed: pyvista's add_mesh
+            # resets the camera on later actor additions whenever camera_set
+            # is False, which would yank the view on the first selection.
+            self.camera_set = True
         logger.debug(
             "Preview scene: %d blocks / %d points total",
             len(self._scene_meshes),
@@ -579,12 +591,15 @@ class PreviewWidget(QtInteractor):
     def set_block_colors(self, colors: dict[int, str]) -> None:
         '''Recolor the given blocks without rebuilding geometry.
 
+        The first actor of a block carries its color (the shaded surface, or
+        the wireframe in the wireframe-only mode); decorations stay black.
+
         Args:
             colors: Mapping of block index to hex color.
         '''
         for index, color in colors.items():
-            if 0 <= index < len(self._block_actors):
-                self._block_actors[index].prop.color = color
+            if 0 <= index < len(self._block_actors) and self._block_actors[index]:
+                self._block_actors[index][0].prop.color = color
         self.render()
 
     def set_block_quantities(self, quantities: dict[int, int]) -> None:
@@ -614,18 +629,15 @@ class PreviewWidget(QtInteractor):
 
     # ------------------------------------------------------------- internals
     def _position_actor(self, index: int, x: float, y: float) -> None:
-        '''Move the surface actor and its outline of block *index*.'''
+        '''Move every actor of block *index* to the scene position.'''
         if 0 <= index < len(self._block_actors):
-            self._block_actors[index].SetPosition(float(x), float(y), 0.0)
-        outline = self._outline_actors.get(index)
-        if outline is not None:
-            outline.SetPosition(float(x), float(y), 0.0)
+            for actor in self._block_actors[index]:
+                actor.SetPosition(float(x), float(y), 0.0)
 
     def _clear_scene_actors(self) -> None:
         '''Remove every surface/edge/wireframe/outline/label actor.'''
         for actor in (
-            *self._block_actors,
-            *self._extra_actors,
+            *(actor for actors in self._block_actors for actor in actors),
             *self._outline_actors.values(),
             *self._qty_actors.values(),
         ):
@@ -634,65 +646,89 @@ class PreviewWidget(QtInteractor):
             except Exception:  # noqa: BLE001 - actor may already be detached
                 pass
         self._block_actors.clear()
-        self._extra_actors.clear()
         self._outline_actors.clear()
         self._qty_actors.clear()
         self._actor_map.clear()
 
     def _rebuild_actors(self) -> None:
-        '''Remove and re-add every per-block actor for the active mode.'''
+        '''Remove and re-add every per-block actor for the active mode.
+
+        Every actor of a block (surface, feature edges, wireframe) is
+        positioned at the block's scene position: the decorations share the
+        placement of the surface instead of sitting at the world origin.
+        '''
         self._clear_scene_actors()
         if not self._scene_meshes:
             return
         for index, mesh in enumerate(self._scene_meshes):
-            surface = add_surface_actor(self, mesh, color=self._scene_colors[index])
-            surface.SetPickable(True)
             position = self._scene_meta[index]
-            surface.SetPosition(position['pos_x'], position['pos_y'], 0.0)
-            self._block_actors.append(surface)
-            self._actor_map[surface] = index
-            self._add_mode_actors(index, mesh)
+            x, y = float(position['pos_x']), float(position['pos_y'])
+            actors: list[pv.Actor] = []
+            if self._mode == MODE_WIREFRAME:
+                # No solid underneath: the wireframe itself is the pick
+                # target (the cell picker intersects the mesh triangles, not
+                # the rendered lines), so blocks stay selectable.
+                wire = self._add_wireframe_actor(mesh, line_width=1.5, tubes=False)
+                wire.SetPickable(True)
+                actors.append(wire)
+                self._actor_map[wire] = index
+            else:
+                surface = add_surface_actor(self, mesh, color=self._scene_colors[index])
+                surface.SetPickable(True)
+                actors.append(surface)
+                self._actor_map[surface] = index
+                if self._mode == MODE_SOLID_FEATURE_EDGES:
+                    edges = self._add_feature_edge_actor(mesh)
+                    if edges is not None:
+                        actors.append(edges)
+                elif self._mode == MODE_SOLID_WIREFRAME:
+                    actors.append(
+                        self._add_wireframe_actor(mesh, line_width=2.5, tubes=True)
+                    )
+            for actor in actors:
+                actor.SetPosition(x, y, 0.0)
+            self._block_actors.append(actors)
         self._update_selection_outlines()
         self._refresh_quantity_labels()
 
-    def _add_mode_actors(self, index: int, mesh: pv.PolyData) -> None:
-        '''Add the display-mode decoration actors of one block.'''
-        if self._mode == MODE_SOLID_FEATURE_EDGES:
-            edges = semantic_edges(mesh)
-            if edges.n_points == 0:
-                return
-            actor = self.add_mesh(
-                edges,
-                color=LINE_COLOR,
-                line_width=2.0,
-                lighting=False,
-                render_lines_as_tubes=True,
-                pickable=False,
-            )
-            self._extra_actors.append(actor)
-        elif self._mode == MODE_SOLID_WIREFRAME:
-            # Tubes give the lines real volume so they win the depth test
-            # against the surface (plain polylines z-fight with the mesh).
-            actor = self.add_mesh(
-                mesh,
-                color=LINE_COLOR,
-                style="wireframe",
-                line_width=2.5,
-                lighting=False,
-                render_lines_as_tubes=True,
-                pickable=False,
-            )
-            self._extra_actors.append(actor)
-        elif self._mode == MODE_WIREFRAME:
-            actor = self.add_mesh(
-                mesh,
-                color=LINE_COLOR,
-                style="wireframe",
-                line_width=1.5,
-                lighting=False,
-                pickable=False,
-            )
-            self._extra_actors.append(actor)
+    def _add_feature_edge_actor(self, mesh: pv.PolyData) -> pv.Actor | None:
+        '''Semantic part-boundary outline actor of one block (None if bare).
+
+        Feature edges are derived from ``cell_data["part"]`` differences; a
+        mesh without classification (or without boundaries) adds nothing.
+        '''
+        edges = semantic_edges(mesh)
+        if edges.n_points == 0:
+            return None
+        return self.add_mesh(
+            edges,
+            color=LINE_COLOR,
+            line_width=2.0,
+            lighting=False,
+            render_lines_as_tubes=True,
+            pickable=False,
+            reset_camera=False,
+        )
+
+    def _add_wireframe_actor(
+        self, mesh: pv.PolyData, line_width: float, tubes: bool
+    ) -> pv.Actor:
+        '''Wireframe rendering of the block mesh.
+
+        With *tubes* the lines get real volume so they win the depth test
+        against the surface (plain polylines z-fight with the mesh); the
+        bare wireframe mode renders plain lines without a solid underneath.
+        '''
+        return self.add_mesh(
+            mesh,
+            color=LINE_COLOR,
+            style="wireframe",
+            line_width=line_width,
+            lighting=False,
+            render_lines_as_tubes=tubes,
+            pickable=False,
+            reset_camera=False,
+        )
 
     def _update_selection_outlines(self) -> None:
         '''Rebuild the thin black outline actors around selected blocks.'''
@@ -711,6 +747,7 @@ class PreviewWidget(QtInteractor):
                 line_width=1.5,
                 lighting=False,
                 pickable=False,
+                reset_camera=False,
             )
             position = self._scene_meta[index]
             actor.SetPosition(position['pos_x'], position['pos_y'], 0.0)
@@ -749,6 +786,7 @@ class PreviewWidget(QtInteractor):
                 font_size=13,
                 text_color='black',
                 name=f'quantity_{index}',
+                reset_camera=False,
             )
             self._qty_actors[index] = actor
 
@@ -762,20 +800,244 @@ class PreviewWidget(QtInteractor):
             self._grid_actor = self.show_grid(font_size=8)  # type: ignore[call-arg]
         self.render()
 
-    # ------------------------------------------------- scene input (style cb)
-    def _pick_block(self, style: _SceneInteractorStyle) -> tuple[int | None, list]:
-        '''Block index and world point under the current cursor, or (None, []).
+    # ------------------------------------------------ scene input (Qt events)
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
+        '''LMB arms a click/rubber-band selection, MMB orbits, Shift+MMB pans.
+
+        Left/middle presses are consumed here so the VTK interactor never
+        arms its native rotate/pan/spin states; the right button falls
+        through to the native VTK zoom.
+        '''
+        button = event.button()
+        if button == Qt.MouseButton.LeftButton:
+            self._left_down = True
+            self._press_ctrl = bool(
+                event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            )
+            self._press_pos = event.position().toPoint()
+            self._rubbing = False
+            event.accept()
+            return
+        if button == Qt.MouseButton.MiddleButton:
+            self._last_mouse = event.position().toPoint()
+            self._panning = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self._orbiting = not self._panning
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
+        '''Route moves to the rubber band, the camera orbit or the pan.'''
+        pos = event.position().toPoint()
+        if self._left_down:
+            if (
+                not self._rubbing
+                and (pos - self._press_pos).manhattanLength() > RUBBER_BAND_THRESHOLD_PX
+            ):
+                self._rubbing = True
+            if self._rubbing:
+                rubber = self._ensure_rubber_band()
+                rubber.setGeometry(QRect(self._press_pos, pos).normalized())
+                rubber.show()
+            event.accept()
+            return
+        if self._orbiting:
+            self._orbit_camera(
+                pos.x() - self._last_mouse.x(), pos.y() - self._last_mouse.y()
+            )
+            self._last_mouse = pos
+            event.accept()
+            return
+        if self._panning:
+            self._pan_camera(self._last_mouse, pos)
+            self._last_mouse = pos
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
+        '''Finish the rubber-band selection or apply the click semantics.'''
+        button = event.button()
+        if button == Qt.MouseButton.LeftButton and self._left_down:
+            self._left_down = False
+            if self._rubbing:
+                self._rubbing = False
+                rubber = self._ensure_rubber_band()
+                rect = rubber.geometry()
+                rubber.hide()
+                self._select_from_rubber(rect, add=self._press_ctrl)
+            else:
+                self._finish_click(event)
+            event.accept()
+            return
+        if button == Qt.MouseButton.MiddleButton:
+            self._orbiting = False
+            self._panning = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        '''Route a rapid second click through the press handler.
+
+        Qt replaces the second press of a fast same-spot click with a
+        MouseButtonDblClick; treating it as a press keeps every physical
+        click's selection semantics instead of dropping it. Middle/right
+        double clicks are swallowed (VTK never sees them).
+        '''
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.mousePressEvent(event)
+            return
+        event.accept()
+
+    def _ensure_rubber_band(self) -> QRubberBand:
+        '''The lazily created Qt rubber-band overlay of the frame selection.'''
+        if self._rubber is None:
+            self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        return self._rubber
+
+    def _to_display(self, pos: QPoint) -> tuple[float, float]:
+        '''Qt widget coordinates -> VTK display coordinates (y flipped).'''
+        return float(pos.x()), float(self.size().height() - pos.y())
+
+    # ------------------------------------------------------ camera navigation
+    def _orbit_camera(self, dx: float, dy: float) -> None:
+        '''Turntable-orbit the camera by a mouse delta (Qt pixels).
+
+        Horizontal movement rotates around the world Z axis, vertical
+        movement raises/lowers the camera (clamped before the pole); the
+        view up is re-derived from the world up after every step, so the
+        camera always follows the cursor without ever rolling.
+        '''
+        camera = self.renderer.GetActiveCamera()
+        focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
+        offset = np.asarray(camera.GetPosition(), dtype=np.float64) - focal
+        width, height = self.size().width(), self.size().height()
+        azimuth = ORBIT_DEGREES_PER_AXIS * dx / max(width, 1)
+        elevation = ORBIT_DEGREES_PER_AXIS * (-dy) / max(height, 1)
+        offset = orbit_offset(offset, azimuth, elevation)
+        radius = float(np.linalg.norm(offset))
+        camera.SetPosition(*(focal + offset))
+        camera.SetFocalPoint(*focal)
+        view_dir = -offset / radius
+        up = WORLD_UP - view_dir * float(np.dot(WORLD_UP, view_dir))
+        up_norm = float(np.linalg.norm(up))
+        if up_norm > 1e-6:  # clamped orbit keeps the world up well-defined
+            camera.SetViewUp(*(up / up_norm))
+        self.renderer.ResetCameraClippingRange()
+        self.render()
+
+    def _pan_camera(self, last: QPoint, current: QPoint) -> None:
+        '''Pan the camera so the world point under the cursor follows it.
+
+        The display delta is unprojected at the focal-plane depth and
+        applied as a translation of both the position and the focal point
+        (the view direction is preserved).
+        '''
+        renderer = self.renderer
+        camera = renderer.GetActiveCamera()
+        focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
+        renderer.SetWorldPoint(focal[0], focal[1], focal[2], 1.0)
+        renderer.WorldToDisplay()
+        depth = float(renderer.GetDisplayPoint()[2])
+        x0, y0 = self._to_display(last)
+        x1, y1 = self._to_display(current)
+        renderer.SetDisplayPoint(x0, y0, depth)
+        renderer.DisplayToWorld()
+        world0 = np.asarray(renderer.GetWorldPoint()[:3], dtype=np.float64)
+        renderer.SetDisplayPoint(x1, y1, depth)
+        renderer.DisplayToWorld()
+        world1 = np.asarray(renderer.GetWorldPoint()[:3], dtype=np.float64)
+        delta = world0 - world1  # grab: the scene follows the cursor
+        position = np.asarray(camera.GetPosition(), dtype=np.float64)
+        camera.SetPosition(*(position + delta))
+        camera.SetFocalPoint(*(focal + delta))
+        renderer.ResetCameraClippingRange()
+        self.render()
+
+    # ------------------------------------------------------ scene selection
+    def _pick_block_at(self, pos: QPoint) -> int | None:
+        '''Block index under the Qt cursor position, or None.'''
+        x, y = self._to_display(pos)
+        if not self._picker.Pick(x, y, 0, self.renderer):
+            return None
+        return self._actor_map.get(self._picker.GetActor())
+
+    def _finish_click(self, event: QMouseEvent) -> None:
+        '''Apply the click semantics of an LMB press without a drag.
+
+        A plain click selects the pressed block (or clears the selection on
+        empty space); Ctrl+click toggles the pressed block in the selection.
+        '''
+        ctrl = self._press_ctrl or bool(
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        )
+        index = self._pick_block_at(event.position().toPoint())
+        if index is None:
+            if not ctrl:
+                self._select_clear()
+            return
+        if ctrl:
+            self._toggle_selection(index)
+        else:
+            self._select_only(index)
+
+    def _select_from_rubber(self, rect: QRect, add: bool) -> None:
+        '''Select every block fully inside the rubber-band rect (Qt coords).
+
+        With *add* (Ctrl held) the framed blocks extend the current
+        selection; otherwise the selection is replaced.
 
         Args:
-            style: The interactor style the event came from.
+            rect: Rubber-band rectangle in Qt widget coordinates.
+            add: True to extend the selection instead of replacing it.
         '''
-        x, y = style.GetInteractor().GetEventPosition()
-        if not self._picker.Pick(x, y, 0, self.renderer):
-            return None, []
-        index = self._actor_map.get(self._picker.GetActor())
-        if index is None:
-            return None, []
-        return index, list(self._picker.GetPickPosition())
+        selection = self._blocks_in_rect(rect)
+        if add:
+            selection |= self._selection
+        self._selection = selection
+        self._primary = None  # no clicked block: let the window pick one
+        self._update_selection_outlines()
+        self._emit_selection()
+        self.render()
+
+    def _blocks_in_rect(self, rect: QRect) -> set[int]:
+        '''Indices of blocks whose screen bounding box lies fully in *rect*.'''
+        inside: set[int] = set()
+        for index, mesh in enumerate(self._scene_meshes):
+            block_rect = self._block_screen_rect(index, mesh)
+            if block_rect is not None and rect.contains(block_rect):
+                inside.add(index)
+        return inside
+
+    def _block_screen_rect(self, index: int, mesh: pv.PolyData) -> QRect | None:
+        '''Qt screen bounding rect of block *index*, or None off-screen.
+
+        The eight world-space corners of the mesh bounds (plus the block
+        position) are projected to display coordinates. A corner behind the
+        camera projects to garbage, which just yields an oversized rect and
+        a missed selection - the scene stays outside the camera in normal
+        navigation.
+        '''
+        xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
+        meta = self._scene_meta[index]
+        position_x, position_y = float(meta['pos_x']), float(meta['pos_y'])
+        renderer = self.renderer
+        height = self.size().height()
+        xs: list[float] = []
+        ys: list[float] = []
+        for x in (xmin, xmax):
+            for y in (ymin, ymax):
+                for z in (zmin, zmax):
+                    renderer.SetWorldPoint(x + position_x, y + position_y, z, 1.0)
+                    renderer.WorldToDisplay()
+                    display_x, display_y, _ = renderer.GetDisplayPoint()[:3]
+                    xs.append(display_x)
+                    ys.append(height - display_y)
+        return QRect(
+            QPoint(round(min(xs)), round(min(ys))),
+            QPoint(round(max(xs)), round(max(ys))),
+        )
 
     def _emit_selection(self) -> None:
         '''Notify about the current selection (set + primary index).'''
@@ -799,148 +1061,6 @@ class PreviewWidget(QtInteractor):
         self._primary = index
         self._update_selection_outlines()
         self._emit_selection()
-
-    def _arm_drag(self, index: int, pick_position: list) -> None:
-        '''Arm an XY drag of the whole selection starting at *pick_position*.
-
-        Args:
-            index: Block the press landed on (drag anchor).
-            pick_position: World point under the cursor (defines the drag
-                plane height so the block follows the cursor naturally).
-        '''
-        self._drag_block = index
-        self._drag_plane_z = float(pick_position[2])
-        self._drag_origin = (float(pick_position[0]), float(pick_position[1]))
-        self._drag_start = {
-            i: (m['pos_x'], m['pos_y'])
-            for i, m in enumerate(self._scene_meta)
-            if i in self._selection
-        }
-        self._drag_delta = None
-
-    def _cancel_drag_visual(self) -> None:
-        '''Restore actor positions after a non-committed drag.'''
-        for index, (x, y) in self._drag_start.items():
-            self._position_actor(index, x, y)
-        self.render()
-
-    def _style_press(self, style: _SceneInteractorStyle) -> None:
-        '''Handle a left-button press: pick a block or arm a camera orbit.
-
-        Every press path ends with ``style.OnLeftButtonDown()``: its grab is
-        what makes the follow-up move/release events reach the style on this
-        platform, and the paired ``OnLeftButtonUp`` runs unconditionally on
-        release (in a ``finally``), so the VTK state machine stays balanced.
-
-        Plain press on a block selects it immediately (unless already in a
-        multi-selection) and arms an XY drag of the whole selection.
-        Ctrl+press on an unselected block defers its toggle to the release
-        (a Ctrl+drag stays a no-op, mirroring the layout editor). A press on
-        empty space arms the native camera rotate.
-        '''
-        iren = style.GetInteractor()
-        self._press_ctrl = bool(iren.GetControlKey())
-        self._left_state_armed = False
-        self._rotated = False
-        self._drag_delta = None
-        index, pick_position = self._pick_block(style)
-        self._press_block = index
-        if index is None:
-            self._drag_block = None
-            style.OnLeftButtonDown()  # grab + arm the native rotate state
-            self._left_state_armed = True
-            return
-        if self._press_ctrl and index not in self._selection:
-            # Deferred toggle only: grab the events (via the base press) but
-            # suppress the move handling below, so Ctrl+drag is a no-op.
-            style.OnLeftButtonDown()
-            self._left_state_armed = True
-            return
-        if not self._press_ctrl and index not in self._selection:
-            self._select_only(index)
-        self._arm_drag(index, pick_position)
-        style.OnLeftButtonDown()
-        self._left_state_armed = True
-
-    def _style_move(self, style: _SceneInteractorStyle) -> None:
-        '''Drag the selection along the XY plane or rotate the camera.
-
-        While a block drag is armed the cursor ray is intersected with the
-        horizontal plane of the grab point and every selected block follows
-        the cursor; the model commit happens on release. Otherwise the move
-        goes to the native trackball (camera rotate/spin/pan), and a
-        deferred Ctrl+click stays a no-op until its release.
-        '''
-        if self._drag_block is not None and self._drag_origin is not None:
-            x, y = style.GetInteractor().GetEventPosition()
-            hit = _ray_plane_hit(self.renderer, x, y, self._drag_plane_z)
-            if hit is None:
-                return
-            dx = float(hit[0] - self._drag_origin[0])
-            dy = float(hit[1] - self._drag_origin[1])
-            if (
-                self._drag_delta is not None
-                and abs(dx - self._drag_delta[0]) < 1e-9
-                and abs(dy - self._drag_delta[1]) < 1e-9
-            ):
-                return
-            self._drag_delta = (dx, dy)
-            for index, (sx, sy) in self._drag_start.items():
-                self._position_actor(index, sx + dx, sy + dy)
-            self.render()
-            return
-        if self._press_ctrl and self._press_block is not None:
-            return  # deferred Ctrl+click: no spin while waiting for release
-        style.OnMouseMove()
-        if self._left_state_armed:
-            self._rotated = True
-
-    def _style_release(self, style: _SceneInteractorStyle) -> None:
-        '''Commit a finished drag or apply the click selection semantics.
-
-        A drag over a block emits :attr:`blocks_dragged` with the total
-        delta; the window applies it to the project and pushes exact
-        positions back. Without movement: plain click selects the pressed
-        block, Ctrl+click toggles it, and a click on empty space (without
-        camera rotation) clears the selection. The paired
-        ``OnLeftButtonUp`` always runs - a failure above must never leave
-        the grab or the ROTATE state armed.
-        '''
-        try:
-            rotated = self._rotated
-            moved = (
-                self._drag_delta is not None
-                and abs(self._drag_delta[0]) + abs(self._drag_delta[1]) > 1e-9
-            )
-            if self._drag_block is not None:
-                if moved and self._drag_delta is not None:
-                    dx, dy = self._drag_delta
-                    # Keep the visual until the window pushes exact positions.
-                    for index, (sx, sy) in self._drag_start.items():
-                        self._position_actor(index, sx + dx, sy + dy)
-                    self.blocks_dragged.emit(dx, dy)
-                else:
-                    self._cancel_drag_visual()
-                    if self._press_ctrl:
-                        self._toggle_selection(self._drag_block)
-                    else:
-                        self._select_only(self._drag_block)
-            elif self._press_block is not None and self._press_ctrl:
-                if not rotated:
-                    self._toggle_selection(self._press_block)
-            elif self._press_block is None and not rotated:
-                # Plain click on empty space (no rotation): clear the selection.
-                self._select_clear()
-        finally:
-            if self._left_state_armed:
-                style.OnLeftButtonUp()  # EndRotate + ReleaseFocus
-            self._drag_block = None
-            self._drag_delta = None
-            self._drag_origin = None
-            self._drag_start = {}
-            self._press_block = None
-            self._left_state_armed = False
-            self._rotated = False
 
     def _select_clear(self) -> None:
         '''Clear the selection and notify.'''
