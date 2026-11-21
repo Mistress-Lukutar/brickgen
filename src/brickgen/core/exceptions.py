@@ -2,8 +2,8 @@
 File:   exceptions.py
 Brief:  Custom exception hierarchy for BrickGen.
 Author: Mistress-Lukutar
-Date:   2026-11-19
-Version: v0.12.0
+Date:   2026-11-20
+Version: v0.13.0
 '''
 
 from __future__ import annotations
@@ -27,3 +27,7 @@ class TemplateError(BrickGenError):
 
 class ExportError(BrickGenError):
     '''Raised when a 3D model export fails or the format is unsupported.'''
+
+
+class ProjectIOError(BrickGenError):
+    '''Raised when a project file cannot be read, written, or parsed.'''

@@ -2,8 +2,8 @@
 File:   app_settings.py
 Brief:  Persistent application preferences (precisions, default format).
 Author: Mistress-Lukutar
-Date:   2026-11-19
-Version: v0.12.0
+Date:   2026-11-20
+Version: v0.13.0
 '''
 
 from __future__ import annotations
@@ -11,12 +11,17 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from brickgen.services.export_service import SUPPORTED_FORMATS
 
 logger = logging.getLogger(__name__)
+
+# Anchor side of the per-block BOM quantity label (relative to each block).
+QuantityLabelPosition = Literal["left", "right", "top", "bottom"]
+QUANTITY_LABEL_POSITIONS: tuple[str, ...] = ("left", "right", "top", "bottom")
 
 
 class AppSettings(BaseModel):
@@ -29,6 +34,10 @@ class AppSettings(BaseModel):
         export_tolerance: Mesh tolerance for tessellated export formats
             (STL/AMF/3MF), mm.
         default_format: Format preselected in the export dialog.
+        quantity_labels_enabled: Show the BOM quantity label next to every
+            placed block in the preview (View menu toggle).
+        quantity_label_position: Anchor side of the quantity label,
+            relative to each block.
     '''
 
     preview_tolerance: float = Field(default=0.15, gt=0, le=1.0)
@@ -36,6 +45,8 @@ class AppSettings(BaseModel):
     export_tolerance: float = Field(default=0.1, gt=0, le=1.0)
     export_angular_tolerance: float = Field(default=0.1, gt=0, le=1.0)
     default_format: str = "STEP"
+    quantity_labels_enabled: bool = False
+    quantity_label_position: QuantityLabelPosition = "right"
 
     model_config = {"extra": "forbid"}
 

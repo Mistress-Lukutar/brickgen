@@ -2,8 +2,8 @@
 File:   test_slope_builder.py
 Brief:  Unit tests for per-cell sloped-top wedge cells.
 Author: Mistress-Lukutar
-Date:   2026-11-19
-Version: v0.12.0
+Date:   2026-11-20
+Version: v0.13.0
 '''
 
 from __future__ import annotations

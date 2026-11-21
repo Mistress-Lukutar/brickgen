@@ -2,7 +2,7 @@
 File:   test_jobs.py
 Brief:  Unit tests for JobQueue (process-based background job queue).
 Author: Mistress-Lukutar
-Date:   2026-11-19
+Date:   2026-11-20
 """
 
 import os
@@ -374,7 +374,7 @@ def test_build_preview_handler_arrays():
 
 
 def test_app_generation_and_export_smoke():
-    """MainWindow generates via the process queue and exports the applied model.
+    """MainWindow generates the scene via the process queue and exports it.
 
     Requires offscreen Qt platform. Timeout is generous because the worker
     process pays the OCC/pyvista import cost on the very first job.
@@ -385,32 +385,34 @@ def test_app_generation_and_export_smoke():
 
     w = MainWindow()
 
-    # Initial auto-generation completes on the queue (applied cache key set).
+    # Initial auto-generation completes on the queue (applied context set).
     # NOTE: startup fires _on_generate twice (explicit call + debounced timer
     # from form sync), so the applied key is 'gen2' — latest-wins in action.
-    _wait_until(lambda: w._applied_cache_key is not None, timeout=180.0)
-    assert w._applied_cache_key == 'gen2'
+    _wait_until(lambda: w._applied_context is not None, timeout=180.0)
+    assert len(w._preview._block_actors) >= 1
     assert w._preview._mesh is not None and w._preview._mesh.n_cells > 0
 
-    # A parameter change schedules the next generation (latest-wins key).
-    w._cells_x.setValue(3)
-    _wait_until(lambda: w._applied_cache_key == 'gen3', timeout=180.0)
+    # Adding a block schedules the next generation (latest-wins key).
+    w._on_add_block()
+    _wait_until(lambda: len(w._preview._block_actors) == 2, timeout=180.0)
 
-    # Export the applied generation exactly like _on_export does after its dialog.
+    # Export the applied scene exactly like _on_export does after its dialog.
     out = os.path.join(tempfile.gettempdir(), 'brickgen_app_export_smoke.step')
+    context = w._applied_context
     payload = {
-        'cache_key': w._applied_cache_key,
+        'blocks': context['payload']['blocks'],
         'path': out,
         'format': 'STEP',
         'tolerance': 0.1,
         'angular': 0.1,
     }
-    job_id = w._jobs.submit('export', payload)
+    job_id = w._jobs.submit('export_scene', payload)
     w._export_meta[job_id] = out
 
     _wait_until(lambda: job_id not in w._export_meta, timeout=120.0)
     assert Path(out).exists() and Path(out).stat().st_size > 0
 
+    w._mark_clean()
     w.close()
     w._jobs.close()
 

@@ -2,8 +2,8 @@
 File:   jobs.py
 Brief:  Process-based serialized background job queue for CPU-heavy GUI work.
 Author: Mistress-Lukutar
-Date:   2026-11-19
-Version: v0.12.0
+Date:   2026-11-20
+Version: v0.13.0
 '''
 
 from __future__ import annotations

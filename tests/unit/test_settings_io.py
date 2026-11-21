@@ -2,8 +2,8 @@
 File:   test_settings_io.py
 Brief:  Unit tests for JSON settings persistence.
 Author: Mistress-Lukutar
-Date:   2026-11-19
-Version: v0.12.0
+Date:   2026-11-20
+Version: v0.13.0
 '''
 
 from __future__ import annotations

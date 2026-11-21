@@ -2,8 +2,8 @@
 File:   jobtasks.py
 Brief:  Child-process task handlers for the process-based JobQueue.
 Author: Mistress-Lukutar
-Date:   2026-11-19
-Version: v0.12.0
+Date:   2026-11-20
+Version: v0.13.0
 
 Each handler is invoked inside a child process; heavy modules (cadquery, pyvista,
 OCC) are imported lazily inside the handler so the first job pays the import cost.
@@ -172,6 +172,51 @@ def _handle_build_preview(payload: dict) -> dict:
     return arrays
 
 
+@handler('build_scene')
+def _handle_build_scene(payload: dict) -> dict:
+    '''Build meshed previews for every block of the scene.
+
+    Each block is built from its own BlockSettings and returned as picklable
+    arrays; points are NOT translated here -- the UI places meshes by setting
+    actor positions from the block payload.
+
+    Args:
+        payload: Dict with keys::
+
+            'blocks': list of block dicts, each::
+
+                'settings': BlockSettings-compatible dict (model_dump).
+                'position_x': float scene offset of the block center, mm.
+                'position_y': float scene offset of the block center, mm.
+
+            'tolerance': float tessellation tolerance in mm (optional, 0.15).
+            'angular': float angular tolerance in rad (optional, 0.1).
+
+    Returns:
+        ``{'blocks': [mesh_to_arrays(mesh), ...]}`` aligned with the payload
+        block order; arrays carry ``points``/``faces``/``part``.
+    '''
+    from brickgen.core.builder import build_block
+    from brickgen.core.models import BlockSettings
+    from brickgen.gui.preview import (
+        make_face_classifier,
+        mesh_to_arrays,
+        solid_to_mesh,
+    )
+
+    tolerance = payload.get('tolerance', 0.15)
+    angular = payload.get('angular', 0.1)
+    blocks_data: list[dict] = []
+    for entry in payload['blocks']:
+        settings = BlockSettings.model_validate(entry['settings'])
+        model = build_block(settings)
+        shape = cast(cq.Shape, model.val())
+        classifier = make_face_classifier(settings)
+        mesh = solid_to_mesh(shape, tolerance, angular, classifier)
+        blocks_data.append(mesh_to_arrays(mesh))
+    return {'blocks': blocks_data}
+
+
 @handler('thumbnail')
 def _handle_thumbnail(payload: dict) -> dict:
     '''Build a meshed thumbnail without caching the model.
@@ -239,5 +284,58 @@ def _handle_export(payload: dict) -> dict:
         payload['format'],
         tolerance=payload.get('tolerance', 0.1),
         angular_tolerance=payload.get('angular', 0.1),
+    )
+    return {'written': str(written)}
+
+
+@handler('export_scene')
+def _handle_export_scene(payload: dict) -> dict:
+    '''Build every block, translate it to its scene position and export the
+    whole scene as one compound model file.
+
+    Args:
+        payload: Dict with keys::
+
+            'blocks': list of block dicts (same shape as build_scene).
+            'path': str output file path.
+            'format': str export format (e.g. 'STEP').
+            'tolerance': float tessellation tolerance in mm (optional, 0.1).
+            'angular': float angular tolerance in rad (optional, 0.1).
+
+    Returns:
+        ``{'written': <str>}`` with the resolved output path.
+
+    Raises:
+        ValueError: If 'blocks' is empty.
+    '''
+    from brickgen.core.builder import build_block
+    from brickgen.core.models import BlockSettings
+    from brickgen.services.export_service import export_model as _export_model
+
+    tolerance = payload.get('tolerance', 0.1)
+    angular = payload.get('angular', 0.1)
+    blocks_list = payload['blocks']
+
+    if not blocks_list:
+        raise ValueError('scene has no blocks')
+
+    solids: list[cq.Shape] = []
+    for entry in blocks_list:
+        settings = BlockSettings.model_validate(entry['settings'])
+        model = build_block(settings)
+        shape = cast(cq.Shape, model.val())
+        px = entry.get('position_x', 0.0)
+        py = entry.get('position_y', 0.0)
+        translated = shape.translate((px, py, 0.0))
+        solids.append(translated)
+
+    compound = cq.Compound.makeCompound(solids)
+    wrapper = cq.Workplane(obj=compound)
+    written = _export_model(
+        wrapper,
+        Path(payload['path']),
+        payload['format'],
+        tolerance=tolerance,
+        angular_tolerance=angular,
     )
     return {'written': str(written)}
