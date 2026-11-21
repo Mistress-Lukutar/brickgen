@@ -156,7 +156,7 @@ class BlockSettings(BaseModel):
     unit_size: float = Field(default=4.0, gt=0)
     wall_thickness: float = Field(default=0.8, gt=0)
     block_height: float = Field(default=3.0, gt=0)
-    clearance_xy: float = Field(default=0.2)
+    clearance_xy: float = Field(default=-0.25)
     clearance_z: float = Field(default=0.2)
     pins_enabled: bool = True
     tubes_enabled: bool = True

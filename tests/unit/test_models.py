@@ -21,10 +21,10 @@ def test_defaults_match_specification(default_settings: BlockSettings) -> None:
     assert default_settings.unit_size == 4.0
     assert default_settings.wall_thickness == 0.8
     assert default_settings.block_height == 3.0
-    assert default_settings.clearance_xy == 0.2
+    assert default_settings.clearance_xy == -0.25
     assert default_settings.clearance_z == 0.2
     # Derived values from clearance fields
-    assert default_settings.pin_diameter == pytest.approx(2.2, abs=1e-9)
+    assert default_settings.pin_diameter == pytest.approx(2.65, abs=1e-9)
     assert default_settings.pin_height == pytest.approx(2.0, abs=1e-9)
     tube_od = (math.sqrt(2.0) - 1.0) * 4.0 + 2.0 * 0.8
     tube_id = tube_od - 2.0 * 0.8

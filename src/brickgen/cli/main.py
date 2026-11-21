@@ -95,7 +95,7 @@ def generate(
     wall: float = typer.Option(0.8, "--wall", help="Wall thickness, mm."),
     height: float = typer.Option(3.0, "--height", help="Block height, mm."),
     clearance_xy: float = typer.Option(
-        0.2,
+        -0.25,
         "--clearance-xy",
         help=(
             "Fit clearance X/Y, mm: positive shrinks the stud for a sliding "
