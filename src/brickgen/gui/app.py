@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.13.0
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -62,6 +62,7 @@ from brickgen.gui.preview import (
     mesh_from_arrays,
 )
 from brickgen.services.app_settings import (
+    GRID_SCALE_PRESETS,
     QUANTITY_LABEL_POSITIONS,
     load_app_settings,
     save_app_settings,
@@ -151,6 +152,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
         # Menus after the preview pane: the View actions bind to the preview.
         self._build_menus()
+        # Floor grid: unit size from the shared settings, the rest persisted.
+        self._preview.set_grid_unit(self._project.settings.unit_size)
+        self._preview.set_grid_scale(self._app_settings.grid_scale)
+        self._preview.set_snap_enabled(self._app_settings.grid_snap)
+        self._preview.set_grid_enabled(self._app_settings.grid_enabled)
 
         # Auto-generation: debounced rebuild after any parameter change.
         self._regen_timer = QTimer(self)
@@ -220,11 +226,6 @@ class MainWindow(QMainWindow):
             mode_group.addAction(act_mode)
             view_menu.addAction(act_mode)
         view_menu.addSeparator()
-        act_grid = QAction("Show &grid", self)
-        act_grid.setCheckable(True)
-        act_grid.toggled.connect(self._preview.set_grid_enabled)
-        view_menu.addAction(act_grid)
-        view_menu.addSeparator()
         self._act_qty_labels = QAction("Show &block quantities", self)
         self._act_qty_labels.setCheckable(True)
         self._act_qty_labels.setChecked(self._app_settings.quantity_labels_enabled)
@@ -241,6 +242,34 @@ class MainWindow(QMainWindow):
             )
             position_group.addAction(act_pos)
             position_menu.addAction(act_pos)
+
+        grid_menu = self.menuBar().addMenu("&Grid")
+        act_show_grid = QAction("Show &grid", self)
+        act_show_grid.setCheckable(True)
+        act_show_grid.setChecked(self._app_settings.grid_enabled)
+        act_show_grid.toggled.connect(self._on_grid_show)
+        grid_menu.addAction(act_show_grid)
+        grid_menu.addSeparator()
+        scale_menu = grid_menu.addMenu("Cell &scale")
+        scale_group = QActionGroup(self)
+        for scale in GRID_SCALE_PRESETS:
+            act_scale = QAction(self._grid_scale_label(scale), self)
+            act_scale.setCheckable(True)
+            act_scale.setChecked(scale == self._app_settings.grid_scale)
+            act_scale.triggered.connect(
+                lambda checked=False, s=scale: self._on_grid_scale(s)
+            )
+            scale_group.addAction(act_scale)
+            scale_menu.addAction(act_scale)
+        grid_menu.addSeparator()
+        act_snap = QAction("&Snap to grid", self)
+        act_snap.setCheckable(True)
+        act_snap.setChecked(self._app_settings.grid_snap)
+        act_snap.setToolTip(
+            "Gizmo and G-grab moves round to the grid step (unit size x cell scale)."
+        )
+        act_snap.toggled.connect(self._on_grid_snap)
+        grid_menu.addAction(act_snap)
 
     # ------------------------------------------------------------------ layout
     def _build_sidebar(self) -> QWidget:
@@ -528,6 +557,7 @@ class MainWindow(QMainWindow):
         self._pins.toggled.connect(self._on_pins_toggled)
         self._tubes.toggled.connect(self._on_shared_param_changed)
         self._preview.selection_changed.connect(self._on_scene_selection)
+        self._preview.blocks_moved.connect(self._on_preview_blocks_moved)
         self._block_cells_x.valueChanged.connect(self._on_block_cells_changed)
         self._block_cells_y.valueChanged.connect(self._on_block_cells_changed)
         self._block_quantity.valueChanged.connect(self._on_block_quantity_changed)
@@ -684,10 +714,13 @@ class MainWindow(QMainWindow):
         return str(documents) if documents.is_dir() else str(Path.home())
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        '''Prompt about unsaved changes before closing the window.'''
+        '''Prompt about unsaved changes, then stop the background queue.'''
         if self._dirty and not self._confirm_discard():
             event.ignore()
             return
+        # Non-blocking worker shutdown: without it the interpreter exit can
+        # hang joining a live ProcessPoolExecutor worker.
+        self._jobs.close()
         event.accept()
 
     # -------------------------------------------------------- block actions
@@ -913,6 +946,27 @@ class MainWindow(QMainWindow):
             self._preview.set_block_position(index, x, y)
         self._inspector_pos = (new_x, new_y)
         self._mark_dirty()
+
+    def _on_preview_blocks_moved(self, positions: dict) -> None:
+        '''Commit the positions of a drag/grab move into the project.
+
+        Args:
+            positions: Mapping of block index to the final (x, y) position.
+        '''
+        moved = False
+        for index, (x, y) in positions.items():
+            if not 0 <= index < len(self._project.blocks):
+                continue
+            block = self._project.blocks[index]
+            if block.position_x != x or block.position_y != y:
+                moved = True
+            block.position_x = x
+            block.position_y = y
+        if not moved:
+            return
+        self._mark_dirty()
+        self._sync_block_inspector()
+        self._set_status(self._scene_summary())
 
     # ------------------------------------------------------- layout editing
     def _sync_layout_from_primary(self) -> None:
@@ -1270,6 +1324,29 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{name}[*] - BrickGen")
 
     # -------------------------------------------------------- view menu
+    @staticmethod
+    def _grid_scale_label(scale: float) -> str:
+        '''Menu label of a grid cell scale preset (e.g. ``50%``).'''
+        return f"{round(scale * 100)}%"
+
+    def _on_grid_show(self, checked: bool) -> None:
+        '''Toggle the floor grid and persist it.'''
+        self._app_settings.grid_enabled = checked
+        self._save_app_settings()
+        self._preview.set_grid_enabled(checked)
+
+    def _on_grid_scale(self, scale: float) -> None:
+        '''Set the grid cell scale factor and persist it.'''
+        self._app_settings.grid_scale = scale
+        self._save_app_settings()
+        self._preview.set_grid_scale(scale)
+
+    def _on_grid_snap(self, checked: bool) -> None:
+        '''Toggle snap-to-grid movement and persist it.'''
+        self._app_settings.grid_snap = checked
+        self._save_app_settings()
+        self._preview.set_snap_enabled(checked)
+
     def _on_view_qty_labels(self, checked: bool) -> None:
         '''Toggle the per-block BOM quantity labels and persist it.'''
         self._app_settings.quantity_labels_enabled = checked
@@ -1345,6 +1422,8 @@ class MainWindow(QMainWindow):
             self._set_status(f"Invalid settings: {exc}", error=True)
             return
         self._project.settings = shared
+        # The grid cells and the snap step follow the unit size.
+        self._preview.set_grid_unit(shared.unit_size)
 
         self._gen_seq += 1
         seq = self._gen_seq

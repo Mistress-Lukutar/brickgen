@@ -3,7 +3,7 @@ File:   test_preview_widget.py
 Brief:  Offscreen PreviewWidget tests: selection scheme, camera navigation, modes.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.13.0
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -422,3 +422,263 @@ def test_shift_mmb_pans_camera(preview: PreviewWidget) -> None:
     )
     # Dragging right moves the camera left along the world X (view +Y).
     assert focal_after[0] < focal_before[0]
+
+
+# ------------------------------------------------------------- move drag (LMB)
+
+
+def test_lmb_drag_on_block_moves_it(preview: PreviewWidget) -> None:
+    '''A left drag on a block moves the selection and commits on release.'''
+    received: list[dict] = []
+    preview.blocks_moved.connect(lambda payload: received.append(payload))
+    preview.set_selection({0}, 0)
+    _mouse_drag(preview, _CENTER, QPoint(_CENTER.x() + 40, _CENTER.y()))
+    meta = preview._scene_meta[0]
+    assert meta['pos_x'] > 30.0
+    assert meta['pos_y'] == pytest.approx(20.0)
+    assert received and set(received[-1]) == {0}
+    assert received[-1][0] == pytest.approx((meta['pos_x'], meta['pos_y']))
+    for actor in preview._block_actors[0]:
+        x, y, _ = actor.GetPosition()
+        assert x == pytest.approx(meta['pos_x'])
+        assert y == pytest.approx(20.0)
+    assert not preview._grabbing
+
+
+def test_lmb_press_on_block_selects_it(preview: PreviewWidget) -> None:
+    '''Pressing on an unselected block selects it before the drag starts.'''
+    QTest.mousePress(
+        preview, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, _CENTER
+    )
+    assert preview.selected_blocks() == {0}
+    QTest.mouseRelease(
+        preview, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, _CENTER
+    )
+
+
+def test_lmb_click_on_block_without_move_selects(preview: PreviewWidget) -> None:
+    '''A click on a block without a real move selects, never moves.'''
+    received: list[dict] = []
+    preview.blocks_moved.connect(lambda payload: received.append(payload))
+    QTest.mouseClick(
+        preview, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, _CENTER
+    )
+    assert received == []
+    assert preview.selected_blocks() == {0}
+    assert preview._scene_meta[0]['pos_x'] == pytest.approx(30.0)
+
+
+def test_lmb_subthreshold_jiggle_commits_nothing(preview: PreviewWidget) -> None:
+    '''A sub-threshold drag is undone and falls back to the click.'''
+    received: list[dict] = []
+    preview.blocks_moved.connect(lambda payload: received.append(payload))
+    preview.set_selection({0}, 0)
+    _mouse_drag(preview, _CENTER, QPoint(_CENTER.x() + 2, _CENTER.y()))
+    assert received == []
+    assert preview._scene_meta[0]['pos_x'] == pytest.approx(30.0)
+    assert preview.selected_blocks() == {0}
+
+
+def test_ctrl_click_on_block_does_not_move(preview: PreviewWidget) -> None:
+    '''Ctrl+click keeps the toggle semantics and never starts a move.'''
+    QTest.mouseClick(
+        preview,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.ControlModifier,
+        _CENTER,
+    )
+    assert preview.selected_blocks() == {0}
+    assert preview._scene_meta[0]['pos_x'] == pytest.approx(30.0)
+    QTest.mouseClick(
+        preview,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.ControlModifier,
+        _CENTER,
+    )
+    assert preview.selected_blocks() == set()
+    assert preview._scene_meta[0]['pos_x'] == pytest.approx(30.0)
+
+
+def test_lmb_drag_on_block_snap_rounds_to_step(preview: PreviewWidget) -> None:
+    '''With snap on, the dragged block lands on grid step multiples.'''
+    preview.set_selection({0}, 0)
+    preview.set_grid_unit(4.0)
+    preview.set_grid_scale(0.5)  # 2 mm step
+    preview.set_snap_enabled(True)
+    _mouse_drag(preview, _CENTER, QPoint(_CENTER.x() + 40, _CENTER.y()))
+    x = preview._scene_meta[0]['pos_x']
+    assert x == pytest.approx(round(x / 2.0) * 2.0, abs=1e-9)
+    assert x != pytest.approx(30.0)
+
+
+def test_lmb_drag_moves_whole_selection(preview_two: PreviewWidget) -> None:
+    '''Dragging a selected block shifts the whole selection by one delta.'''
+    # The fixture camera is level with the floor: floor-plane moves need a
+    # view raised above the horizon (see _FLOOR_RAY_MIN_SIN).
+    camera = preview_two.renderer.GetActiveCamera()
+    camera.SetPosition(50.0, -150.0, 60.0)
+    camera.SetFocalPoint(50.0, 0.0, 2.5)
+    camera.SetViewUp(0, 0, 1)
+    preview_two.renderer.ResetCameraClippingRange()
+    preview_two.set_selection({0, 1}, 0)
+    press = _world_to_qt(preview_two, 0.0, 0.0, 5.0)
+    _mouse_drag(preview_two, press, QPoint(press.x() + 30, press.y() - 10))
+    meta = preview_two._scene_meta
+    delta_x = meta[0]['pos_x'] - 0.0
+    delta_y = meta[0]['pos_y'] - 0.0
+    assert delta_x != 0.0
+    assert meta[1]['pos_x'] == pytest.approx(100.0 + delta_x)
+    assert meta[1]['pos_y'] == pytest.approx(0.0 + delta_y)
+    assert preview_two.selected_blocks() == {0, 1}
+
+
+def test_set_block_position_moves_outline(preview: PreviewWidget) -> None:
+    '''Inspector moves relocate the selection outline with the block.'''
+    preview.set_selection({0}, 0)
+    preview.set_block_position(0, 60.0, 40.0)
+    assert preview._outline_actors[0].GetPosition()[:2] == pytest.approx((60.0, 40.0))
+
+
+# ------------------------------------------------------------- grab (G key)
+
+
+def _hover_move(widget: PreviewWidget, pos: QPoint) -> None:
+    '''A plain mouse-move event (no buttons held) at *pos*.'''
+    move = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(pos),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, move)
+
+
+def test_g_key_starts_grab(preview: PreviewWidget) -> None:
+    '''Pressing G enters grab mode, Esc leaves it.'''
+    preview.set_selection({0}, 0)
+    QTest.keyClick(preview, Qt.Key.Key_G)
+    assert preview._grabbing
+    QTest.keyClick(preview, Qt.Key.Key_Escape)
+    assert not preview._grabbing
+
+
+def test_g_key_without_selection_is_noop(preview: PreviewWidget) -> None:
+    '''G with an empty selection does not enter grab mode.'''
+    QTest.keyClick(preview, Qt.Key.Key_G)
+    assert not preview._grabbing
+
+
+def test_grab_moves_selection_and_confirms_with_click(preview: PreviewWidget) -> None:
+    '''A grab follows the mouse; an LMB click commits the new positions.'''
+    received: list[dict] = []
+    preview.blocks_moved.connect(lambda payload: received.append(payload))
+    preview.set_selection({0}, 0)
+    assert preview.start_grab(_CENTER)
+    _hover_move(preview, QPoint(_CENTER.x() + 60, _CENTER.y() + 30))
+    assert preview._scene_meta[0]['pos_x'] != pytest.approx(30.0)
+    assert preview._scene_meta[0]['pos_y'] != pytest.approx(20.0)
+    QTest.mouseClick(
+        preview, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, _CENTER
+    )
+    assert not preview._grabbing
+    assert received and set(received[-1]) == {0}
+    assert received[-1][0] == (
+        pytest.approx(preview._scene_meta[0]['pos_x']),
+        pytest.approx(preview._scene_meta[0]['pos_y']),
+    )
+
+
+def test_grab_cancel_restores_original_positions(preview: PreviewWidget) -> None:
+    '''Esc during a grab restores the scene exactly as it was.'''
+    preview.set_selection({0}, 0)
+    assert preview.start_grab(_CENTER)
+    _hover_move(preview, QPoint(_CENTER.x() + 60, _CENTER.y() + 30))
+    assert preview._scene_meta[0]['pos_x'] != pytest.approx(30.0)
+    QTest.keyClick(preview, Qt.Key.Key_Escape)
+    assert not preview._grabbing
+    assert preview._scene_meta[0]['pos_x'] == pytest.approx(30.0)
+    assert preview._scene_meta[0]['pos_y'] == pytest.approx(20.0)
+    for actor in preview._block_actors[0]:
+        assert actor.GetPosition()[:2] == pytest.approx((30.0, 20.0))
+
+
+def test_grab_moves_whole_selection_by_same_delta(preview_two: PreviewWidget) -> None:
+    '''A grab of a multi-selection shifts every block by the same delta.'''
+    preview_two.set_selection({0, 1}, 1)
+    assert preview_two.start_grab(_CENTER)
+    _hover_move(preview_two, QPoint(_CENTER.x() + 50, _CENTER.y()))
+    meta = preview_two._scene_meta
+    delta_x = meta[1]['pos_x'] - 100.0
+    delta_y = meta[1]['pos_y'] - 0.0
+    assert meta[0]['pos_x'] == pytest.approx(0.0 + delta_x)
+    assert meta[0]['pos_y'] == pytest.approx(0.0 + delta_y)
+    QTest.keyClick(preview_two, Qt.Key.Key_Escape)
+
+
+def test_grab_snap_positions_on_grid(preview: PreviewWidget) -> None:
+    '''With snap on, both grabbed coordinates land on grid step multiples.'''
+    preview.set_selection({0}, 0)
+    preview.set_grid_unit(4.0)
+    preview.set_grid_scale(0.5)  # 2 mm step
+    preview.set_snap_enabled(True)
+    assert preview.start_grab(_CENTER)
+    _hover_move(preview, QPoint(_CENTER.x() + 37, _CENTER.y() - 13))
+    preview.confirm_grab()
+    x = preview._scene_meta[0]['pos_x']
+    y = preview._scene_meta[0]['pos_y']
+    assert x == pytest.approx(round(x / 2.0) * 2.0, abs=1e-9)
+    assert y == pytest.approx(round(y / 2.0) * 2.0, abs=1e-9)
+
+
+def test_grab_blocked_navigation(preview: PreviewWidget) -> None:
+    '''MMB orbit and the wheel are ignored while a grab is active.'''
+    preview.set_selection({0}, 0)
+    assert preview.start_grab(_CENTER)
+    camera = preview.renderer.GetActiveCamera()
+    position_before = list(camera.GetPosition())
+    _mouse_drag(
+        preview,
+        QPoint(200, 150),
+        QPoint(300, 150),
+        button=Qt.MouseButton.MiddleButton,
+    )
+    assert list(camera.GetPosition()) == position_before
+    QTest.keyClick(preview, Qt.Key.Key_Escape)
+
+
+# --------------------------------------------------------------- floor grid
+
+
+def test_grid_actors_created_and_cleared(preview: PreviewWidget) -> None:
+    '''Enabling the grid builds the line/axis/label actors, disabling clears.'''
+    preview.set_grid_unit(4.0)
+    preview.set_grid_scale(0.5)
+    assert preview.grid_step() == pytest.approx(2.0)
+    preview.set_grid_enabled(True)
+    # Minor lines, major lines, X axis, Y axis, X labels, Y labels.
+    assert len(preview._grid_actors) >= 6
+    preview.set_grid_enabled(False)
+    assert preview._grid_actors == []
+
+
+def test_grid_scale_extends_step(preview: PreviewWidget) -> None:
+    '''The grid step is the unit size times the cell scale factor.'''
+    preview.set_grid_unit(4.0)
+    preview.set_grid_scale(1.0)
+    assert preview.grid_step() == pytest.approx(4.0)
+    preview.set_grid_scale(10.0)
+    assert preview.grid_step() == pytest.approx(40.0)
+    preview.set_grid_scale(0.5)
+    assert preview.grid_step() == pytest.approx(2.0)
+
+
+def test_grid_recenters_on_far_pan(preview: PreviewWidget) -> None:
+    '''_maybe_regrid rebuilds the grid around the new focal point.'''
+    preview.set_grid_enabled(True)
+    camera = preview.renderer.GetActiveCamera()
+    camera.SetFocalPoint(2000.0, -1500.0, 0.0)
+    camera.SetPosition(2000.0, -1500.0, 300.0)
+    preview.renderer.ResetCameraClippingRange()
+    preview._maybe_regrid()
+    assert preview._grid_center == pytest.approx((2000.0, -1500.0))

@@ -2,8 +2,8 @@
 File:   library.py
 Brief:  Template library panel: thumbnail previews, select, save, refresh.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 from brickgen.core.exceptions import BrickGenError
 from brickgen.core.models import BlockSettings
 from brickgen.gui.jobs import SKIPPED, JobError, JobQueue
-from brickgen.gui.preview import BLOCK_COLOR, mesh_from_arrays
+from brickgen.gui.preview import BLOCK_COLOR, VIEWPORT_BG, mesh_from_arrays
 from brickgen.services.template_library import list_templates, save_template
 
 logger = logging.getLogger(__name__)
@@ -50,11 +50,11 @@ def render_thumbnail(mesh: pv.PolyData) -> QPixmap:
         mesh: Pre-tessellated PyVista PolyData to render.
 
     Returns:
-        Thumbnail pixmap (white background, iso camera view).
+        Thumbnail pixmap (dark background matching the viewport, iso view).
     '''
     plotter = pv.Plotter(off_screen=True, window_size=list(THUMBNAIL_SIZE))
     try:
-        plotter.set_background("white")  # type: ignore[arg-type]  # pyvista stub bug
+        plotter.set_background(VIEWPORT_BG)  # type: ignore[arg-type]  # pyvista stub bug
         # lighting="three lights" matches the preview shading (stub says bool).
         plotter.add_mesh(
             mesh,

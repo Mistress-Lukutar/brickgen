@@ -3,7 +3,7 @@ File:   preview.py
 Brief:  PyVista/VTK-based 3D scene preview: multi-block meshes, selection, navigation.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.13.0
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import pyvista as pv
 import vtk  # type: ignore[import-untyped]
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QRubberBand, QWidget
 from pyvistaqt import QtInteractor
 
@@ -32,17 +32,45 @@ PREVIEW_TESSELLATION_TOLERANCE = 0.15
 
 BLOCK_COLOR = "#3f7fbf"
 LINE_COLOR = "#111111"
-# Thin black outline around selected blocks.
-SELECTION_COLOR = "#000000"
+# Thin bright outline around selected blocks (readable on the dark viewport).
+SELECTION_COLOR = "#ff9d2e"
+# Viewport / thumbnail background (dark, 3D-editor style).
+VIEWPORT_BG = "#2e3338"
+# Floor grid: minor lines, every-10th major lines, X/Y axes and axis labels.
+GRID_MINOR_COLOR = "#454b53"
+GRID_MAJOR_COLOR = "#565e68"
+GRID_AXIS_X_COLOR = "#d86a6a"
+GRID_AXIS_Y_COLOR = "#6abf83"
+GRID_LABEL_X_COLOR = "#cf8d8d"
+GRID_LABEL_Y_COLOR = "#8dcfa4"
 
 # Turntable navigation: the model follows the cursor - horizontal drags
 # turn it around the world Z axis, vertical drags tip it up/down. Degrees
 # covered by a full-window drag, matched between the axes for a uniform feel.
 ORBIT_DEGREES_PER_AXIS = 200.0
-# LMB press-to-move distance (manhattan, px) before the rubber band appears.
+# LMB press-to-move distance (manhattan, px) before the rubber band appears
+# (and the drag distance a block move must exceed to count as a move, not a
+# click).
 RUBBER_BAND_THRESHOLD_PX = 4
 # World up vector of the scene (blocks sit on the XY plane).
 WORLD_UP = np.array([0.0, 0.0, 1.0])
+# Floor grid: lines are drawn a hair below z=0 so they never z-fight with
+# block bottoms; the grid half-extent adapts to the camera and recenters on
+# pan (practically infinite, XY plane only).
+GRID_Z_OFFSET = -0.05
+# Camera distance -> grid half-extent mapping: the extent covers several
+# viewports but the line count stays bounded (2*R/step <= ~5000 per axis).
+GRID_EXTENT_MIN_CELLS = 60
+GRID_EXTENT_MAX_CELLS = 2500
+GRID_RECENTER_FRACTION = 0.5  # rebuild when the focal point passes R/2
+GRID_ZOOM_REGRID_RATIO = 0.3  # rebuild when the camera distance changed 30%
+# One mm label per axis at most every LABEL_SPACING mm / one line in 10.
+GRID_LABEL_SPACING_MM = 16.0
+GRID_MAJOR_EVERY = 10
+# Snap: block move drags and G-grabs round to the grid step (Grid menu).
+# Floor-plane moves require the cursor ray to dip at least this sine below
+# the horizon (~5.7 deg); flatter views would explode pixel deltas.
+_FLOOR_RAY_MIN_SIN = 0.1
 
 # Display modes offered by the GUI. Wireframe lines are the edges of the
 # tessellated mesh itself, not separate B-Rep geometry.
@@ -386,34 +414,41 @@ class PreviewWidget(QtInteractor):
     '''Interactive 3D scene preview: one shaded actor per placed block.
 
     Wraps a pyvista QtInteractor. Each block of the project scene renders as
-    its own actor tinted with the block color; selection adds a thin black
+    its own actor tinted with the block color; selection adds a thin bright
     outline around the block. The mouse scheme is the common 3D-editor one:
-    the left button is selection only (a click picks the block under the
-    cursor, Ctrl+click toggles it, a drag draws a rubber band selecting every
-    block fully inside it), the middle button orbits the camera turntable
-    style (the model follows the cursor: horizontal drags turn it around the
-    world Z, vertical drags tip it up/down) and Shift+middle pans; the right
-    button and the wheel keep the
-    native VTK zoom. LMB/MMB events are consumed on the Qt level, so the VTK
-    interactor never arms its native rotate/pan/spin states. Blocks are moved
-    from the inspector position fields, not by dragging. The mesh is
-    tessellated once per block; display-mode/grid/label changes only touch
-    actors, not geometry. Quantity labels render the per-block BOM count next
-    to each block (View menu).
+    the left button pressed on a block picks it up (a drag moves the whole
+    selection on the floor plane, a release without a real move falls back
+    to the click semantics), a left drag on the background draws a rubber
+    band selecting every block fully inside it, Ctrl+click toggles a block;
+    the middle button orbits the camera turntable style (the model follows
+    the cursor) and Shift+middle pans; the right button and the wheel keep
+    the native VTK zoom. LMB/MMB events are consumed on the Qt level, so the
+    VTK interactor never arms its native rotate/pan/spin states. Blocks are
+    also moved by the G (grab) hotkey: the selection follows the cursor on
+    the floor plane until a click/Enter confirms or Esc/right-click cancels.
+    When snap is enabled every move rounds to the grid step. The floor grid
+    is an infinite XY plane with colored X/Y axes and mm coordinate labels;
+    its cell scale is ``unit_size * scale``. The mesh is tessellated once
+    per block; display-mode/grid/label changes only touch actors, not
+    geometry. Quantity labels render the per-block BOM count next to each
+    block (View menu).
     '''
 
     # Emitted when scene selection changed: (frozenset of indices, primary
     # index of the last-clicked block or None).
     selection_changed = Signal(object)
+    # Emitted after a move drag or a grab move committed: final scene
+    # positions {block index: (x, y)} of every moved block.
+    blocks_moved = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        '''Create the renderer with a white background.
+        '''Create the renderer with a dark background.
 
         Args:
             parent: Optional parent widget.
         '''
         super().__init__(parent=parent)
-        self.set_background("white")  # type: ignore[arg-type]  # pyvista stub bug
+        self.set_background(VIEWPORT_BG)  # type: ignore[arg-type]  # pyvista stub bug
         self._scene_meshes: list[pv.PolyData] = []
         self._scene_colors: list[str] = []
         self._scene_meta: list[dict] = []
@@ -428,12 +463,22 @@ class PreviewWidget(QtInteractor):
         self._qty_enabled = False
         self._qty_position = "right"
         self._mesh: pv.PolyData | None = None
-        self._grid_actor: pv.CubeAxesActor | None = None
         self._mode = MODE_SOLID
+        # Floor grid state: enabled flag, unit size of the shared block
+        # geometry (set by the window), cell scale factor, and the center /
+        # extent the actors were last built for (regrid triggers).
         self._grid_enabled = False
-        # Selection/navigation transient state. The left button is selection
-        # only (click or rubber band), the middle button orbits, Shift+middle
-        # pans; the right button and the wheel stay native VTK zoom.
+        self._grid_unit = 4.0
+        self._grid_scale = 0.5
+        self._grid_snap = False
+        self._grid_center = np.zeros(2)
+        self._grid_extent = 0.0
+        self._grid_distance = 0.0
+        self._grid_actors: list[pv.Actor] = []
+        # Selection/navigation transient state. The left button picks up a
+        # block (move drag) or draws the rubber band on the background, the
+        # middle button orbits, Shift+middle pans; the right button and the
+        # wheel stay native VTK zoom. G starts the keyboard grab move.
         self._picker = vtk.vtkCellPicker()
         self._picker.SetTolerance(0.01)
         self._left_down = False
@@ -444,6 +489,19 @@ class PreviewWidget(QtInteractor):
         self._orbiting = False
         self._panning = False
         self._last_mouse = QPoint()
+        # Active move drag (LMB pressed on a block, or the G grab): original
+        # positions of the moved blocks, the world anchor of the press on
+        # the floor plane, and whether a real move happened. *keyboard*
+        # marks the G grab (confirm/cancel via keys/clicks); the mouse drag
+        # commits on release or falls back to the click semantics.
+        self._grabbing = False
+        self._grab_keyboard = False
+        self._grab_moved = False
+        self._grab_press_pos = QPoint()
+        self._grab_orig: dict[int, tuple[float, float]] = {}
+        self._grab_anchor: np.ndarray | None = None
+        # Keyboard grabs (G) need the viewport to take and keep focus.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.enable_anti_aliasing("msaa")  # type: ignore[call-arg]  # pyvista stub bug
 
     # ------------------------------------------------------------- scene API
@@ -480,7 +538,6 @@ class PreviewWidget(QtInteractor):
         except Exception:  # noqa: BLE001 - SSAO is optional eye-candy; GL may lack it
             logger.warning("SSAO unavailable in this environment", exc_info=True)
         self._rebuild_actors()
-        self._update_grid()
         if camera_position is not None:
             self.camera_position = camera_position
             self.camera_set = True
@@ -491,6 +548,8 @@ class PreviewWidget(QtInteractor):
             # resets the camera on later actor additions whenever camera_set
             # is False, which would yank the view on the first selection.
             self.camera_set = True
+        # After the camera is in place: the grid extent follows the view.
+        self._update_grid()
         logger.debug(
             "Preview scene: %d blocks / %d points total",
             len(self._scene_meshes),
@@ -543,13 +602,253 @@ class PreviewWidget(QtInteractor):
         self.render()
 
     def set_grid_enabled(self, enabled: bool) -> None:
-        '''Show or hide the metric grid around the scene.
+        '''Show or hide the floor grid.
 
         Args:
             enabled: True to display the grid.
         '''
         self._grid_enabled = enabled
         self._update_grid()
+
+    def set_grid_unit(self, unit_size: float) -> None:
+        '''Set the shared block unit size the grid cells are derived from.
+
+        Args:
+            unit_size: Unit size in mm (grid step = unit size * scale).
+        '''
+        if unit_size > 0 and unit_size != self._grid_unit:
+            self._grid_unit = float(unit_size)
+            self._update_grid()
+
+    def set_grid_scale(self, scale: float) -> None:
+        '''Set the grid cell scale factor (Grid menu).
+
+        Args:
+            scale: Cells are drawn every ``unit_size * scale`` mm.
+        '''
+        if scale > 0 and scale != self._grid_scale:
+            self._grid_scale = float(scale)
+            self._update_grid()
+
+    def set_snap_enabled(self, enabled: bool) -> None:
+        '''Enable or disable snap-to-grid for block moves (Grid menu).
+
+        Args:
+            enabled: True rounds moves to the grid step multiples.
+        '''
+        self._grid_snap = bool(enabled)
+
+    def grid_step(self) -> float:
+        '''Current grid step in mm (unit size * cell scale).'''
+        return self._grid_unit * self._grid_scale
+
+    # ------------------------------------------------------------- floor grid
+    def _update_grid(self) -> None:
+        '''Rebuild or clear the floor-grid actors around the camera.'''
+        for actor in self._grid_actors:
+            try:
+                self.remove_actor(actor)
+            except Exception:  # noqa: BLE001 - actor may already be detached
+                pass
+        self._grid_actors.clear()
+        if self._grid_enabled and self._mesh is not None:
+            self._grid_center = self._camera_focal_xy()
+            self._grid_distance = self._camera_distance()
+            self._grid_extent = self._grid_extent_for(self._grid_distance)
+            self._add_grid_actors()
+        self.render()
+
+    def _grid_extent_for(self, distance: float) -> float:
+        '''Grid half-extent (mm) that covers the view at *distance*.
+
+        The extent follows the camera so the grid always reads as infinite,
+        while the line count stays bounded by the min/max cell clamps.
+
+        Args:
+            distance: Camera distance from its focal point, mm.
+
+        Returns:
+            Grid half-extent in mm.
+        '''
+        step = max(self.grid_step(), 1e-9)
+        extent = distance * 2.5
+        return float(
+            np.clip(extent, GRID_EXTENT_MIN_CELLS * step, GRID_EXTENT_MAX_CELLS * step)
+        )
+
+    def _maybe_regrid(self) -> None:
+        '''Rebuild the grid when the view left the built region.
+
+        Cheap check on every camera-affecting mouse move / wheel tick: when
+        the focal point approached the edge of the built area or the zoom
+        changed enough to alter the sensible extent, the actors are rebuilt
+        around the new focal point.
+        '''
+        if not self._grid_enabled or self._mesh is None or not self._grid_actors:
+            return
+        center = self._camera_focal_xy()
+        distance = self._camera_distance()
+        recentered = (
+            float(np.linalg.norm(center - self._grid_center))
+            > self._grid_extent * GRID_RECENTER_FRACTION
+        )
+        zoomed = (
+            self._grid_distance > 0.0
+            and abs(distance / self._grid_distance - 1.0) > GRID_ZOOM_REGRID_RATIO
+        )
+        if not (recentered or zoomed):
+            return
+        step = max(self.grid_step(), 1e-9)
+        self._grid_center = np.round(center / step) * step
+        self._grid_distance = distance
+        self._grid_extent = self._grid_extent_for(distance)
+        for actor in self._grid_actors:
+            try:
+                self.remove_actor(actor)
+            except Exception:  # noqa: BLE001 - actor may already be detached
+                pass
+        self._grid_actors.clear()
+        self._add_grid_actors()
+        self.render()
+
+    def _add_grid_actors(self) -> None:
+        '''Build the line/axis/label actors for the current center+extent.'''
+        step = max(self.grid_step(), 1e-9)
+        half = self._grid_extent
+        center_x, center_y = (float(self._grid_center[0]), float(self._grid_center[1]))
+        cells = int(round(half / step))
+        ks = np.arange(-cells, cells + 1, dtype=np.int64)
+        center_cells = int(round(center_x / step)), int(round(center_y / step))
+
+        def segments(coords: np.ndarray, vertical: bool) -> np.ndarray:
+            '''(N, 2, 3) segment array of full-length grid lines.'''
+            fixed = np.full_like(coords, half)
+            z = np.full_like(coords, GRID_Z_OFFSET)
+            if vertical:
+                first = np.stack([coords, -fixed, z], axis=1)
+                second = np.stack([coords, fixed, z], axis=1)
+            else:
+                first = np.stack([-fixed, coords, z], axis=1)
+                second = np.stack([fixed, coords, z], axis=1)
+            return np.stack([first, second], axis=1)
+
+        # Major lines sit on world-aligned multiples of 10 cells; the
+        # vertical/horizontal masks share the integer cell offsets.
+        vertical_major = (ks + center_cells[0]) % GRID_MAJOR_EVERY == 0
+        horizontal_major = (ks + center_cells[1]) % GRID_MAJOR_EVERY == 0
+        verticals = segments(center_x + ks * step, vertical=True)
+        horizontals = segments(center_y + ks * step, vertical=False)
+        minor = np.concatenate(
+            [verticals[~vertical_major], horizontals[~horizontal_major]]
+        )
+        major = np.concatenate(
+            [verticals[vertical_major], horizontals[horizontal_major]]
+        )
+        for mesh, color, width in (
+            (minor, GRID_MINOR_COLOR, 1.0),
+            (major, GRID_MAJOR_COLOR, 1.5),
+        ):
+            if len(mesh):
+                self._grid_actors.append(
+                    self._add_grid_lines(mesh, color=color, line_width=width)
+                )
+        # Colored world axes: X along y=0, Y along x=0, spanning the window.
+        axes = np.array(
+            [
+                [
+                    [center_x - half, 0.0, GRID_Z_OFFSET],
+                    [center_x + half, 0.0, GRID_Z_OFFSET],
+                ],
+                [
+                    [0.0, center_y - half, GRID_Z_OFFSET],
+                    [0.0, center_y + half, GRID_Z_OFFSET],
+                ],
+            ]
+        )
+        axis_x = self._add_grid_lines(axes[:1], color=GRID_AXIS_X_COLOR, line_width=2.5)
+        axis_y = self._add_grid_lines(axes[1:], color=GRID_AXIS_Y_COLOR, line_width=2.5)
+        self._grid_actors.extend([axis_x, axis_y])
+        self._add_grid_labels(step, center_x, center_y, half)
+
+    def _add_grid_lines(
+        self, segments: np.ndarray, color: str, line_width: float
+    ) -> pv.Actor:
+        '''Add one grid line mesh built from an (N, 2, 3) segment array.'''
+        points = segments.reshape(-1, 3)
+        index = np.arange(len(segments) * 2, dtype=np.int64).reshape(-1, 2)
+        lines = np.hstack([np.full((len(index), 1), 2), index]).ravel()
+        return self.add_mesh(
+            pv.PolyData(points, lines=lines),
+            color=color,
+            line_width=line_width,
+            lighting=False,
+            pickable=False,
+            reset_camera=False,
+        )
+
+    def _add_grid_labels(
+        self, step: float, center_x: float, center_y: float, half: float
+    ) -> None:
+        '''mm coordinate labels along the X and Y axes.
+
+        One label per ``label_step`` mm where the spacing adapts to the step
+        and the view extent, so the label count stays bounded at any zoom.
+
+        Args:
+            step: Grid step in mm.
+            center_x: Grid center X (mm) the window is built around.
+            center_y: Grid center Y (mm) the window is built around.
+            half: Grid half-extent in mm.
+        '''
+        spacing = max(GRID_LABEL_SPACING_MM, half / 100.0)
+        label_step = step * max(1, int(math.ceil(spacing / step)))
+        offset = max(1.0, min(step * 1.5, label_step * 0.35))
+        z = 0.2
+        for axis, low, high in (
+            ("x", center_x - half, center_x + half),
+            ("y", center_y - half, center_y + half),
+        ):
+            first = int(math.ceil(low / label_step))
+            last = int(math.floor(high / label_step))
+            values = np.arange(first, last + 1, dtype=np.int64) * label_step
+            if len(values) > 400:  # defensive cap: pathological zoom levels
+                values = values[:: int(math.ceil(len(values) / 400))]
+            if not len(values):
+                continue
+            zeros = np.zeros(len(values))
+            if axis == "x":
+                points = np.stack([values, zeros - offset, zeros + z], axis=1)
+                color = GRID_LABEL_X_COLOR
+            else:
+                points = np.stack([zeros - offset, values, zeros + z], axis=1)
+                color = GRID_LABEL_Y_COLOR
+            actor = self.add_point_labels(
+                points,
+                [f"{value:g}" for value in values],
+                always_visible=True,
+                show_points=False,
+                shape=None,
+                font_size=9,
+                text_color=color,
+                name=f"grid_labels_{axis}",
+                render=False,
+            )
+            if actor is not None:
+                self._grid_actors.append(actor)
+        self.render()
+
+    def _camera_focal_xy(self) -> np.ndarray:
+        '''Focal point XY of the active camera (grid recentering anchor).'''
+        camera = self.renderer.GetActiveCamera()
+        return np.asarray(camera.GetFocalPoint(), dtype=np.float64)[:2]
+
+    def _camera_distance(self) -> float:
+        '''Distance between the camera position and its focal point.'''
+        camera = self.renderer.GetActiveCamera()
+        offset = np.asarray(camera.GetPosition(), dtype=np.float64) - np.asarray(
+            camera.GetFocalPoint(), dtype=np.float64
+        )
+        return float(np.linalg.norm(offset))
 
     def set_selection(self, selection: set[int], primary: int | None = None) -> None:
         '''Replace the scene selection programmatically (no signal).
@@ -584,6 +883,9 @@ class PreviewWidget(QtInteractor):
         self._scene_meta[index]['pos_x'] = float(x)
         self._scene_meta[index]['pos_y'] = float(y)
         self._position_actor(index, float(x), float(y))
+        outline = self._outline_actors.get(index)
+        if outline is not None:
+            outline.SetPosition(float(x), float(y), 0.0)
         self._refresh_quantity_labels()
         self.render()
 
@@ -730,7 +1032,7 @@ class PreviewWidget(QtInteractor):
         )
 
     def _update_selection_outlines(self) -> None:
-        '''Rebuild the thin black outline actors around selected blocks.'''
+        '''Rebuild the thin bright outline actors around selected blocks.'''
         for actor in self._outline_actors.values():
             try:
                 self.remove_actor(actor)
@@ -751,6 +1053,234 @@ class PreviewWidget(QtInteractor):
             position = self._scene_meta[index]
             actor.SetPosition(position['pos_x'], position['pos_y'], 0.0)
             self._outline_actors[index] = actor
+
+    # ------------------------------------------------------- move drag & grab
+    def start_move_drag(self, pos: QPoint) -> bool:
+        '''Start dragging the selection with the mouse (LMB pressed on a block).
+
+        The selection follows the cursor on the floor plane; the release
+        commits the move, or falls back to the click semantics when nothing
+        really moved (a sub-threshold jiggle is undone first).
+
+        Args:
+            pos: Press position in Qt widget coordinates.
+
+        Returns:
+            True when the drag was started.
+        '''
+        if self._grabbing or not self._selection:
+            return False
+        self._grabbing = True
+        self._grab_keyboard = False
+        self._grab_moved = False
+        self._grab_press_pos = QPoint(pos)
+        self._grab_orig = {
+            index: (
+                float(self._scene_meta[index]['pos_x']),
+                float(self._scene_meta[index]['pos_y']),
+            )
+            for index in self._selection
+            if 0 <= index < len(self._scene_meta)
+        }
+        self._grab_anchor = None
+        self._update_grab(pos)
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        return True
+
+    def start_grab(self, pos: QPoint | None = None) -> bool:
+        '''Start the grab move of the whole selection (G hotkey).
+
+        The selection follows the cursor on the floor plane until a left
+        click or Enter confirms it, Esc or a right click cancels.
+
+        Args:
+            pos: Anchor position in Qt widget coordinates; the global
+                cursor position when None.
+
+        Returns:
+            True when grab mode was entered.
+        '''
+        if self._grabbing or not self._selection:
+            return False
+        self._grabbing = True
+        self._grab_keyboard = True
+        self._grab_moved = False
+        self._grab_press_pos = QPoint()
+        self._grab_orig = {
+            index: (
+                float(self._scene_meta[index]['pos_x']),
+                float(self._scene_meta[index]['pos_y']),
+            )
+            for index in self._selection
+            if 0 <= index < len(self._scene_meta)
+        }
+        self._grab_anchor = None
+        self._update_grab(self.mapFromGlobal(QCursor.pos()) if pos is None else pos)
+        if QWidget.mouseGrabber() is not self:
+            self.grabMouse()  # keep receiving moves outside the viewport
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        return True
+
+    def _update_grab(self, pos: QPoint) -> None:
+        '''Move the selection with the cursor; snap to the grid when enabled.'''
+        if not self._grabbing or not self._grab_orig:
+            return
+        world = self._cursor_on_floor(pos)
+        if world is None:
+            return
+        if self._grab_anchor is None:
+            self._grab_anchor = world[:2].copy()
+            return
+        primary = (
+            self._primary if self._primary in self._grab_orig else min(self._grab_orig)
+        )
+        original_x, original_y = self._grab_orig[primary]
+        target_x = original_x + float(world[0] - self._grab_anchor[0])
+        target_y = original_y + float(world[1] - self._grab_anchor[1])
+        if self._grid_snap:
+            step = max(self.grid_step(), 1e-9)
+            target_x = round(target_x / step) * step
+            target_y = round(target_y / step) * step
+        dx, dy = target_x - original_x, target_y - original_y
+        if dx != 0.0 or dy != 0.0:
+            self._grab_moved = True
+        self._apply_move(self._grab_orig, dx, dy)
+
+    def confirm_grab(self) -> None:
+        '''Finish the grab move and commit the new positions.'''
+        if not self._grabbing:
+            return
+        self._end_grab()
+        positions = {
+            index: (
+                float(self._scene_meta[index]['pos_x']),
+                float(self._scene_meta[index]['pos_y']),
+            )
+            for index in self._grab_orig
+        }
+        self._grab_orig.clear()
+        self._grab_anchor = None
+        self.blocks_moved.emit(positions)
+
+    def cancel_grab(self) -> None:
+        '''Finish the grab move and restore the original positions.'''
+        if not self._grabbing:
+            return
+        self._end_grab()
+        self._apply_move(self._grab_orig, 0.0, 0.0, restore=True)
+        self._grab_orig.clear()
+        self._grab_anchor = None
+
+    def _finish_move_drag(self, event: QMouseEvent) -> None:
+        '''Release of an LMB move drag: commit the move or apply the click.
+
+        A drag beyond the rubber-band threshold counts as a move and emits
+        the committed positions; anything shorter is undone and routed
+        through the regular click semantics.
+        '''
+        dragged = (
+            event.position().toPoint() - self._grab_press_pos
+        ).manhattanLength() > RUBBER_BAND_THRESHOLD_PX
+        moved = self._grab_moved
+        self._end_grab()
+        if moved and dragged:
+            positions = {
+                index: (
+                    float(self._scene_meta[index]['pos_x']),
+                    float(self._scene_meta[index]['pos_y']),
+                )
+                for index in self._grab_orig
+            }
+            self._grab_orig.clear()
+            self._grab_anchor = None
+            self.blocks_moved.emit(positions)
+            return
+        if moved:
+            self._apply_move(self._grab_orig, 0.0, 0.0, restore=True)
+        self._grab_orig.clear()
+        self._grab_anchor = None
+        self._finish_click(event)
+
+    def _end_grab(self) -> None:
+        '''Leave the move drag: drop the mouse grab and the drag cursor.'''
+        self._grabbing = False
+        self._grab_keyboard = False
+        self._grab_moved = False
+        if QWidget.mouseGrabber() is self:
+            self.releaseMouse()
+        self.unsetCursor()
+
+    # ------------------------------------------------------------- move helpers
+    def _apply_move(
+        self,
+        originals: dict[int, tuple[float, float]],
+        dx: float,
+        dy: float,
+        restore: bool = False,
+    ) -> None:
+        '''Shift (or restore) the moved blocks and their decorations.
+
+        Args:
+            originals: Block index -> (x, y) the move started from.
+            dx: Delta applied to every X coordinate.
+            dy: Delta applied to every Y coordinate.
+            restore: True writes the original coordinates back verbatim
+                (the deltas are ignored).
+        '''
+        for index, (original_x, original_y) in originals.items():
+            if not 0 <= index < len(self._scene_meta):
+                continue
+            if restore:
+                x, y = original_x, original_y
+            else:
+                x, y = original_x + dx, original_y + dy
+            self._scene_meta[index]['pos_x'] = x
+            self._scene_meta[index]['pos_y'] = y
+            self._position_actor(index, x, y)
+            outline = self._outline_actors.get(index)
+            if outline is not None:
+                outline.SetPosition(x, y, 0.0)
+        self._refresh_quantity_labels()
+        self.render()
+
+    def _cursor_on_floor(self, pos: QPoint) -> np.ndarray | None:
+        '''World point of the cursor ray on the z=0 floor plane.
+
+        The ray is reconstructed from the camera through the unprojected
+        cursor (at the focal-plane depth, reusing the pan projection path)
+        and intersected with the floor.
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+
+        Returns:
+            World (x, y, z) point, or None when the ray is too parallel to
+            the floor (side views would translate pixel deltas into huge
+            floor distances) or points away from the plane.
+        '''
+        renderer = self.renderer
+        camera = renderer.GetActiveCamera()
+        focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
+        renderer.SetWorldPoint(focal[0], focal[1], focal[2], 1.0)
+        renderer.WorldToDisplay()
+        depth = float(renderer.GetDisplayPoint()[2])
+        display_x, display_y = self._to_display(pos)
+        renderer.SetDisplayPoint(display_x, display_y, depth)
+        renderer.DisplayToWorld()
+        world = renderer.GetWorldPoint()
+        weight = float(world[3])
+        point = np.asarray(world[:3], dtype=np.float64)
+        if abs(weight) > 1e-12:
+            point = point / weight
+        origin = np.asarray(camera.GetPosition(), dtype=np.float64)
+        direction = point - origin
+        length = float(np.linalg.norm(direction))
+        if length < 1e-9 or abs(direction[2]) < _FLOOR_RAY_MIN_SIN * length:
+            return None
+        t = -origin[2] / direction[2]
+        if t <= 0.0:
+            return None
+        return origin + direction * t
 
     def _label_point(self, index: int) -> np.ndarray:
         '''World anchor point of the quantity label of block *index*.'''
@@ -783,42 +1313,64 @@ class PreviewWidget(QtInteractor):
                 show_points=False,
                 shape=None,
                 font_size=13,
-                text_color='black',
+                text_color='#d8dde2',
                 name=f'quantity_{index}',
                 reset_camera=False,
             )
             self._qty_actors[index] = actor
 
-    def _update_grid(self) -> None:
-        '''Recreate or remove the metric grid actor.'''
-        if self._grid_actor is not None:
-            self.remove_actor(self._grid_actor)
-            self._grid_actor = None
-        if self._grid_enabled and self._mesh is not None:
-            # show_grid: pyvista stub bug (decorated _Wrapped signature).
-            self._grid_actor = self.show_grid(font_size=8)  # type: ignore[call-arg]
-        self.render()
-
     # ------------------------------------------------ scene input (Qt events)
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
-        '''LMB arms a click/rubber-band selection, MMB orbits, Shift+MMB pans.
+        '''LMB picks up a block or arms the frame, MMB orbits, Shift+MMB pans.
 
-        Left/middle presses are consumed here so the VTK interactor never
-        arms its native rotate/pan/spin states; the right button falls
-        through to the native VTK zoom.
+        During a keyboard grab (G) the left button confirms and the right
+        button cancels; during a mouse move drag extra buttons are ignored.
+        Otherwise a left press on a block starts the move drag (unless Ctrl
+        is held: it keeps the plain toggle-click semantics) and a left press
+        on the background arms the rubber band. Left/middle presses are
+        consumed here so the VTK interactor never arms its native
+        rotate/pan/spin states; the right button falls through to the
+        native VTK zoom.
         '''
+        pos = event.position().toPoint()
         button = event.button()
+        if self._grabbing and self._grab_keyboard:
+            if button == Qt.MouseButton.LeftButton:
+                self.confirm_grab()
+            elif button == Qt.MouseButton.RightButton:
+                self.cancel_grab()
+            event.accept()
+            return
+        if self._grabbing:
+            event.accept()  # a move drag is already running on the LMB
+            return
         if button == Qt.MouseButton.LeftButton:
+            self.setFocus()
+            hit = self._pick_scene(pos)
+            if (
+                hit is not None
+                and hit[0] == "block"
+                and not event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            ):
+                index = hit[1]
+                if index not in self._selection:
+                    self._select_only(index)  # pick up the pressed block
+                elif self._primary != index:
+                    self._primary = index
+                    self._emit_selection()
+                self.start_move_drag(pos)
+                event.accept()
+                return
             self._left_down = True
             self._press_ctrl = bool(
                 event.modifiers() & Qt.KeyboardModifier.ControlModifier
             )
-            self._press_pos = event.position().toPoint()
+            self._press_pos = pos
             self._rubbing = False
             event.accept()
             return
         if button == Qt.MouseButton.MiddleButton:
-            self._last_mouse = event.position().toPoint()
+            self._last_mouse = pos
             self._panning = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             self._orbiting = not self._panning
             event.accept()
@@ -826,8 +1378,15 @@ class PreviewWidget(QtInteractor):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
-        '''Route moves to the rubber band, the camera orbit or the pan.'''
+        '''Route moves to the grab/drag, the rubber band, the camera orbit
+        or the pan.'''
         pos = event.position().toPoint()
+        if self._grabbing:
+            self._update_grab(pos)
+            event.accept()
+            return
+        # Camera-driven grid upkeep (cheap no-op most of the time).
+        self._maybe_regrid()
         if self._left_down:
             if (
                 not self._rubbing
@@ -855,8 +1414,16 @@ class PreviewWidget(QtInteractor):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
-        '''Finish the rubber-band selection or apply the click semantics.'''
+        '''Finish the move drag, the rubber band, or apply the click.'''
         button = event.button()
+        if self._grabbing and not self._grab_keyboard:
+            if button == Qt.MouseButton.LeftButton:
+                self._finish_move_drag(event)
+            event.accept()
+            return
+        if self._grabbing:
+            event.accept()  # press already confirmed/canceled the grab
+            return
         if button == Qt.MouseButton.LeftButton and self._left_down:
             self._left_down = False
             if self._rubbing:
@@ -875,6 +1442,33 @@ class PreviewWidget(QtInteractor):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt naming
+        '''G starts the grab move; Enter confirms and Esc cancels an active
+        move. Every other key falls through to the VTK interactor.'''
+        key = event.key()
+        if self._grabbing:
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.confirm_grab()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Escape:
+                self.cancel_grab()
+                event.accept()
+                return
+        elif key == Qt.Key.Key_G:
+            self.start_grab()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt naming
+        '''Zoom natively (except during a move) and keep the grid infinite.'''
+        if self._grabbing:
+            event.accept()
+            return
+        super().wheelEvent(event)
+        self._maybe_regrid()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         '''Route a rapid second click through the press handler.
@@ -954,12 +1548,21 @@ class PreviewWidget(QtInteractor):
         self.render()
 
     # ------------------------------------------------------ scene selection
-    def _pick_block_at(self, pos: QPoint) -> int | None:
-        '''Block index under the Qt cursor position, or None.'''
+    def _pick_scene(self, pos: QPoint) -> tuple[str, int] | None:
+        '''Depth-sorted block pick under the Qt cursor position.
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+
+        Returns:
+            ``("block", index)`` when a block surface is hit, or None for
+            empty space.
+        '''
         x, y = self._to_display(pos)
         if not self._picker.Pick(x, y, 0, self.renderer):
             return None
-        return self._actor_map.get(self._picker.GetActor())
+        index = self._actor_map.get(self._picker.GetActor())
+        return ("block", index) if index is not None else None
 
     def _finish_click(self, event: QMouseEvent) -> None:
         '''Apply the click semantics of an LMB press without a drag.
@@ -970,15 +1573,15 @@ class PreviewWidget(QtInteractor):
         ctrl = self._press_ctrl or bool(
             event.modifiers() & Qt.KeyboardModifier.ControlModifier
         )
-        index = self._pick_block_at(event.position().toPoint())
-        if index is None:
+        hit = self._pick_scene(event.position().toPoint())
+        if hit is None:
             if not ctrl:
                 self._select_clear()
             return
         if ctrl:
-            self._toggle_selection(index)
+            self._toggle_selection(hit[1])
         else:
-            self._select_only(index)
+            self._select_only(hit[1])
 
     def _select_from_rubber(self, rect: QRect, add: bool) -> None:
         '''Select every block fully inside the rubber-band rect (Qt coords).

@@ -2,8 +2,8 @@
 File:   app_settings.py
 Brief:  Persistent application preferences (precisions, default format).
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 QuantityLabelPosition = Literal["left", "right", "top", "bottom"]
 QUANTITY_LABEL_POSITIONS: tuple[str, ...] = ("left", "right", "top", "bottom")
 
+# Grid cell scale presets offered by the Grid menu: the actual grid step is
+# ``unit_size * grid_scale`` mm (1.0 = one cell per Unit Size).
+GRID_SCALE_PRESETS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
+
 
 class AppSettings(BaseModel):
     '''Application-level preferences persisted across sessions.
@@ -38,6 +42,10 @@ class AppSettings(BaseModel):
             placed block in the preview (View menu toggle).
         quantity_label_position: Anchor side of the quantity label,
             relative to each block.
+        grid_enabled: Show the XY floor grid in the preview (Grid menu).
+        grid_scale: Grid cell scale factor; the grid step is
+            ``unit_size * grid_scale`` mm (1.0 = one cell per Unit Size).
+        grid_snap: Snap block movement to the grid step (Grid menu).
     '''
 
     preview_tolerance: float = Field(default=0.15, gt=0, le=1.0)
@@ -47,6 +55,9 @@ class AppSettings(BaseModel):
     default_format: str = "STEP"
     quantity_labels_enabled: bool = False
     quantity_label_position: QuantityLabelPosition = "right"
+    grid_enabled: bool = False
+    grid_scale: float = Field(default=0.5, gt=0, le=1000.0)
+    grid_snap: bool = False
 
     model_config = {"extra": "forbid"}
 

@@ -2,8 +2,8 @@
 File:   test_app_settings.py
 Brief:  Unit tests for persistent application preferences.
 Author: Mistress-Lukutar
-Date:   2026-11-20
-Version: v0.13.0
+Date:   2026-11-21
+Version: v0.14.0
 '''
 
 from __future__ import annotations
@@ -82,3 +82,24 @@ def test_angular_tolerance_defaults_and_bounds() -> None:
         AppSettings(preview_angular_tolerance=0.0)
     with pytest.raises(ValueError):
         AppSettings(export_angular_tolerance=2.0)
+
+
+def test_grid_preferences_defaults_and_persistence(isolated_settings: Path) -> None:
+    '''Grid toggles persist; the scale defaults to 0.5 and must be positive.'''
+    assert load_app_settings().grid_enabled is False
+    assert load_app_settings().grid_scale == 0.5
+    assert load_app_settings().grid_snap is False
+    settings = AppSettings(grid_enabled=True, grid_scale=2.0, grid_snap=True)
+    save_app_settings(settings)
+    loaded = load_app_settings()
+    assert loaded.grid_enabled is True
+    assert loaded.grid_scale == 2.0
+    assert loaded.grid_snap is True
+    with pytest.raises(ValueError):
+        AppSettings(grid_scale=0.0)
+
+
+def test_grid_scale_presets_include_defaults() -> None:
+    '''The Grid menu offers the documented scale presets incl. 0.5 / 1 / 10.'''
+    for scale in (0.25, 0.5, 1.0, 2.0, 5.0, 10.0):
+        assert scale in asm.GRID_SCALE_PRESETS
