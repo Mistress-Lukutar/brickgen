@@ -481,7 +481,12 @@ class PreviewWidget(QtInteractor):
         # middle button orbits, Shift+middle pans; the right button and the
         # wheel stay native VTK zoom. G starts the keyboard grab move.
         self._picker = vtk.vtkCellPicker()
-        self._picker.SetTolerance(0.01)
+        # CellPicker tolerance is a FRACTION of the viewport diagonal, not
+        # world units: 0.01 thickens the pick ray into a cylinder ~1% of
+        # the visible scene diagonal wide (tens of px), so clicks outside
+        # a block's silhouette still selected it. Keep it sub-pixel: the
+        # ray itself must pass through the mesh triangles.
+        self._picker.SetTolerance(1e-05)
         self._left_down = False
         self._press_ctrl = False
         self._press_pos = QPoint()
