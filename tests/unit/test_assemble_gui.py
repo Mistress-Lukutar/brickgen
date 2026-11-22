@@ -2,7 +2,7 @@
 File:   test_assemble_gui.py
 Brief:  Integration tests for the Assemble tab (MainWindow level).
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 
@@ -121,6 +121,29 @@ def test_place_piece_updates_everything(window: MainWindow) -> None:
     # The scene shows one actor.
     assert len(window._assemble_view._block_actors) == 1
 
+    _reset(window)
+
+
+def test_placed_piece_keeps_height_through_sync(window: MainWindow) -> None:
+    '''A piece placed at height renders at that height after scene syncs.
+
+    Regression: full actor rebuilds (piece drop, tab switch, block add)
+    hard-coded the surface actor z to 0, so stacked pieces sank into each
+    other while the selection outline kept the correct height.
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _place(window, z=3.0)
+    surface = window._assemble_view._block_actors[0][0]
+    assert surface.GetPosition()[2] == pytest.approx(3.0)
+
+    # Leaving and re-entering the tab, then a manual resync (the block-add
+    # path) rebuild the scene: the height must survive every rebuild.
+    window._tabs.setCurrentIndex(0)
+    window._tabs.setCurrentIndex(1)
+    window._sync_assemble()
+    surface = window._assemble_view._block_actors[0][0]
+    assert surface.GetPosition()[2] == pytest.approx(3.0)
     _reset(window)
 
 

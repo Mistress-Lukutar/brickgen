@@ -533,6 +533,34 @@ def test_lmb_drag_moves_whole_selection(preview_two: PreviewWidget) -> None:
     assert preview_two.selected_blocks() == {0, 1}
 
 
+def test_rebuild_actors_keep_meta_pos_z(preview: PreviewWidget) -> None:
+    '''A scene rebuild positions stacked pieces at their meta pos_z.
+
+    The assemble tab stores the piece bottom height in meta ``pos_z``; a
+    full rebuild (tab switch, block add, display-mode change) must not
+    drop the surface actors to the floor plane while the selection
+    outline keeps the height.
+    '''
+    meta = _scene_meta(30.0, 20.0)
+    meta['pos_z'] = 3.5
+    preview.update_scene([_cube_mesh()], [BLOCK_COLOR], [meta])
+    surface = preview._block_actors[0][0]
+    assert surface.GetPosition() == pytest.approx([30.0, 20.0, 3.5])
+    preview.set_selection({0}, 0)
+    outline = preview._outline_actors[0]
+    assert outline.GetPosition() == pytest.approx([30.0, 20.0, 3.5])
+
+
+def test_set_block_position_keeps_meta_pos_z(preview: PreviewWidget) -> None:
+    '''Inspector moves relocate the outline without losing its height.'''
+    meta = _scene_meta(30.0, 20.0)
+    meta['pos_z'] = 2.0
+    preview.update_scene([_cube_mesh()], [BLOCK_COLOR], [meta])
+    preview.set_selection({0}, 0)
+    preview.set_block_position(0, 60.0, 40.0)
+    assert preview._outline_actors[0].GetPosition() == pytest.approx([60.0, 40.0, 2.0])
+
+
 def test_set_block_position_moves_outline(preview: PreviewWidget) -> None:
     '''Inspector moves relocate the selection outline with the block.'''
     preview.set_selection({0}, 0)

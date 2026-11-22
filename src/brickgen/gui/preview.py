@@ -1085,7 +1085,9 @@ class PreviewWidget(QtInteractor):
         self._position_actor(index, float(x), float(y))
         outline = self._outline_actors.get(index)
         if outline is not None:
-            outline.SetPosition(float(x), float(y), 0.0)
+            outline.SetPosition(
+                float(x), float(y), float(self._scene_meta[index].get('pos_z', 0.0))
+            )
         self._move_quantity_labels([index])
         self.render()
 
@@ -1175,6 +1177,8 @@ class PreviewWidget(QtInteractor):
         mesh = self._scene_meshes[index]
         position = self._scene_meta[index]
         x, y = float(position['pos_x']), float(position['pos_y'])
+        # Stacked assemble pieces render above the floor (meta pos_z).
+        z = float(position.get('pos_z', 0.0))
         actors: list[pv.Actor] = []
         if mesh.n_points == 0:
             # Empty placeholder mesh (e.g. a None entry with no previous
@@ -1202,7 +1206,7 @@ class PreviewWidget(QtInteractor):
                     self._add_wireframe_actor(mesh, line_width=2.5, tubes=True)
                 )
         for actor in actors:
-            actor.SetPosition(x, y, 0.0)
+            actor.SetPosition(x, y, z)
         return actors
 
     def _rebuild_actors(self, changed: list[bool] | None = None) -> None:
