@@ -2,7 +2,7 @@
 File:   test_placement_view.py
 Brief:  Offscreen PlacementView tests: zone overlays, scene updates, camera.
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 
@@ -273,3 +273,25 @@ def test_snap_move_target_is_zone_relative(
     x, y = view._snap_move_target(-226.6, 240.0)
     assert x == pytest.approx(-226.0)
     assert y == pytest.approx(240.0)
+
+
+def test_snap_move_target_corners_hit_zone_grid(
+    placement_view_three_beds: PlacementView,
+) -> None:
+    '''With half extents, the footprint corner lands on the zone grid.
+
+    Same geometry as :func:`test_snap_move_target_is_zone_relative`; a
+    piece with half extents (5, 3) keeps its min corner on the bed's
+    zone-local step multiples.
+    '''
+    view = placement_view_three_beds
+    # Bed 1 origin (240, 240): corner x 253.4-5 -> 248 (local 8), so the
+    # center is 253; corner y 246.6-3 -> 244 (local 4), center 247.
+    x, y = view._snap_move_target(253.4, 246.6, 5.0, 3.0)
+    assert x == pytest.approx(253.0)
+    assert y == pytest.approx(247.0)
+    # Staging origin (-240, 240): corner x -226.6-5 -> -232 (local 8);
+    # corner y 246.6-3 -> 244 (local 4).
+    x, y = view._snap_move_target(-226.6, 246.6, 5.0, 3.0)
+    assert x == pytest.approx(-227.0)
+    assert y == pytest.approx(247.0)

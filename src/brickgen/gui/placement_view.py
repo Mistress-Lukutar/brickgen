@@ -2,8 +2,8 @@
 File:   placement_view.py
 Brief:  Print-placement viewport: piece actors plus per-bed grids and zone overlays.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations
@@ -120,18 +120,25 @@ class PlacementView(PreviewWidget):
 
     # ---------------------------------------------------------------- snap
 
-    def _snap_move_target(self, x: float, y: float) -> tuple[float, float]:
+    def _snap_move_target(
+        self, x: float, y: float, hx: float = 0.0, hy: float = 0.0
+    ) -> tuple[float, float]:
         '''Snap a move target to the grid of the zone under the target.
 
         Pieces live in zone-local coordinates; snapping to world-origin
         multiples would fight the per-bed grids drawn inside each zone.
+        The footprint minimum corner (not the center) lands on the
+        zone-local grid multiples, so pieces fill the bed cells.
 
         Args:
-            x: Unsnapped world X of the move target.
-            y: Unsnapped world Y of the move target.
+            x: Unsnapped world X of the move target (footprint center).
+            y: Unsnapped world Y of the move target (footprint center).
+            hx: Half footprint extent along X, mm.
+            hy: Half footprint extent along Y, mm.
 
         Returns:
-            The ``(x, y)`` target snapped to zone-local grid multiples.
+            The ``(x, y)`` center with its minimum corner snapped to
+            zone-local grid multiples.
         '''
         step = max(self.grid_step(), 1e-9)
         zone = zone_for_world(x, y, self._beds)
@@ -140,8 +147,8 @@ class PlacementView(PreviewWidget):
         else:
             ox, oy = bed_origin(zone, self._beds)
         return (
-            round((x - ox) / step) * step + ox,
-            round((y - oy) / step) * step + oy,
+            round((x - hx - ox) / step) * step + ox + hx,
+            round((y - hy - oy) / step) * step + oy + hy,
         )
 
     # ---------------------------------------------------------- overlay drawing

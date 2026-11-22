@@ -2,8 +2,8 @@
 File:   preview.py
 Brief:  PyVista/VTK-based 3D scene preview: multi-block meshes, selection, navigation.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations
@@ -803,21 +803,35 @@ class PreviewWidget(QtInteractor):
         '''Current grid step in mm (unit size * cell scale).'''
         return self._grid_unit * self._grid_scale
 
-    def _snap_move_target(self, x: float, y: float) -> tuple[float, float]:
-        '''Snap a move target to world-origin multiples of the grid step.
+    def _snap_move_target(
+        self, x: float, y: float, hx: float = 0.0, hy: float = 0.0
+    ) -> tuple[float, float]:
+        '''Snap a move target so the footprint minimum corner hits the grid.
+
+        Scene positions are footprint centers (the meshes are centered at
+        the origin); rounding the center itself would center unit blocks
+        on the grid lines. Subtracting the half extents before rounding
+        and adding them back puts the bottom-left corner on a grid-step
+        multiple, so a unit block fills exactly one grid cell.
 
         Hook for subclasses: PlacementView snaps relative to the zone under
         the target instead, so pieces align with the per-bed grids.
 
         Args:
-            x: Unsnapped world X of the move target.
-            y: Unsnapped world Y of the move target.
+            x: Unsnapped world X of the move target (footprint center).
+            y: Unsnapped world Y of the move target (footprint center).
+            hx: Half footprint extent along X, mm.
+            hy: Half footprint extent along Y, mm.
 
         Returns:
-            The ``(x, y)`` target snapped to grid-step multiples.
+            The ``(x, y)`` center with its minimum corner snapped to
+            grid-step multiples.
         '''
         step = max(self.grid_step(), 1e-9)
-        return (round(x / step) * step, round(y / step) * step)
+        return (
+            round((x - hx) / step) * step + hx,
+            round((y - hy) / step) * step + hy,
+        )
 
     # ------------------------------------------------------------- floor grid
     def _update_grid(self) -> None:
@@ -1415,7 +1429,13 @@ class PreviewWidget(QtInteractor):
         target_x = original_x + float(world[0] - self._grab_anchor[0])
         target_y = original_y + float(world[1] - self._grab_anchor[1])
         if self._grid_snap:
-            target_x, target_y = self._snap_move_target(target_x, target_y)
+            meta = self._scene_meta[primary]
+            target_x, target_y = self._snap_move_target(
+                target_x,
+                target_y,
+                float(meta.get('half_x', 0.0)),
+                float(meta.get('half_y', 0.0)),
+            )
         dx, dy = target_x - original_x, target_y - original_y
         if dx != 0.0 or dy != 0.0:
             self._grab_moved = True

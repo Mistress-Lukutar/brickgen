@@ -2,7 +2,7 @@
 File:   test_preview_widget.py
 Brief:  Offscreen PreviewWidget tests: selection scheme, camera navigation, modes.
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 
@@ -500,14 +500,15 @@ def test_ctrl_click_on_block_does_not_move(preview: PreviewWidget) -> None:
 
 
 def test_lmb_drag_on_block_snap_rounds_to_step(preview: PreviewWidget) -> None:
-    '''With snap on, the dragged block lands on grid step multiples.'''
+    '''With snap on, the dragged block corner lands on grid step multiples.'''
     preview.set_selection({0}, 0)
     preview.set_grid_unit(4.0)
     preview.set_grid_scale(0.5)  # 2 mm step
     preview.set_snap_enabled(True)
     _mouse_drag(preview, _CENTER, QPoint(_CENTER.x() + 40, _CENTER.y()))
     x = preview._scene_meta[0]['pos_x']
-    assert x == pytest.approx(round(x / 2.0) * 2.0, abs=1e-9)
+    # The footprint min corner (center - half 5) sits on a step multiple.
+    assert x - 5.0 == pytest.approx(round((x - 5.0) / 2.0) * 2.0, abs=1e-9)
     assert x != pytest.approx(30.0)
 
 
@@ -617,7 +618,7 @@ def test_grab_moves_whole_selection_by_same_delta(preview_two: PreviewWidget) ->
 
 
 def test_grab_snap_positions_on_grid(preview: PreviewWidget) -> None:
-    '''With snap on, both grabbed coordinates land on grid step multiples.'''
+    '''With snap on, both grabbed corners land on grid step multiples.'''
     preview.set_selection({0}, 0)
     preview.set_grid_unit(4.0)
     preview.set_grid_scale(0.5)  # 2 mm step
@@ -627,8 +628,9 @@ def test_grab_snap_positions_on_grid(preview: PreviewWidget) -> None:
     preview.confirm_grab()
     x = preview._scene_meta[0]['pos_x']
     y = preview._scene_meta[0]['pos_y']
-    assert x == pytest.approx(round(x / 2.0) * 2.0, abs=1e-9)
-    assert y == pytest.approx(round(y / 2.0) * 2.0, abs=1e-9)
+    # The footprint min corner (center - half 5) sits on a step multiple.
+    assert x - 5.0 == pytest.approx(round((x - 5.0) / 2.0) * 2.0, abs=1e-9)
+    assert y - 5.0 == pytest.approx(round((y - 5.0) / 2.0) * 2.0, abs=1e-9)
 
 
 def test_grab_blocked_navigation(preview: PreviewWidget) -> None:

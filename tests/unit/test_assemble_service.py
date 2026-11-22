@@ -2,7 +2,7 @@
 File:   test_assemble_service.py
 Brief:  Unit tests for the pure Assemble-tab service (groups, counts, snapping).
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 
@@ -69,19 +69,33 @@ def test_placed_counts() -> None:
 
 
 def test_support_top_z_none_and_stack() -> None:
-    '''Empty space returns None; overlap returns the highest top; a pure
-    edge touch is not an overlap.'''
+    '''Empty space returns None; overlap returns the highest stacking
+    plane; a pure edge touch is not an overlap.'''
     supports = [
-        Support(x=0.0, y=0.0, z=0.0, hx=10.0, hy=10.0, height=8.0),
-        Support(x=30.0, y=0.0, z=8.0, hx=10.0, hy=10.0, height=8.0),
+        Support(x=0.0, y=0.0, z=0.0, hx=10.0, hy=10.0, height=8.0, stack_top=8.0),
+        Support(x=30.0, y=0.0, z=8.0, hx=10.0, hy=10.0, height=8.0, stack_top=16.0),
     ]
     assert support_top_z(supports, 100.0, 100.0, 5.0, 5.0) is None
-    # Inside the first piece: top 8; the second starts at x=20 (30-10), so
-    # a footprint touching x=20 exactly does not count.
+    # Inside the first piece: stacking plane 8; the second starts at x=20
+    # (30-10), so a footprint touching x=20 exactly does not count.
     assert support_top_z(supports, 5.0, 0.0, 5.0, 5.0) == pytest.approx(8.0)
     assert support_top_z(supports, 20.0, 0.0, 0.0, 5.0) is None
-    # Overlapping both pieces: the higher top wins.
+    # Overlapping both pieces: the higher stacking plane wins.
     assert support_top_z(supports, 15.0, 0.0, 6.0, 5.0) == pytest.approx(16.0)
+
+
+def test_assemble_supports_stack_top_by_flip_state() -> None:
+    '''Normal pieces stack at block_height; flipped ones rim-to-rim.'''
+    project = Project(blocks=[BlockInstance(uid="a", cells_x=2, cells_y=2)])
+    settings = project.blocks[0].to_settings(project.settings)
+    project.assemble.pieces = [
+        AssembledPiece(uid="p1", block_uid="a"),
+        AssembledPiece(uid="p2", block_uid="a", flipped=True, position_z=3.0),
+    ]
+    normal, flipped = assemble_supports(project)
+    assert normal.stack_top == pytest.approx(settings.block_height)
+    assert normal.height == pytest.approx(settings.total_height)
+    assert flipped.stack_top == pytest.approx(3.0 + settings.total_height)
 
 
 def test_assemble_supports_swap_halves_on_odd_rotation() -> None:
@@ -115,10 +129,11 @@ def test_assemble_supports_exclude_and_missing_block() -> None:
 
 
 def test_snap_target_grid_only() -> None:
-    '''Without part snapping the target is the grid-rounded cursor, z=0.'''
+    '''Without part snapping the corner-rounded cursor target, z=0.'''
     x, y, z = assemble_snap_target(
         3.0, 7.0, 4.0, 4.0, [], 4.0, snap_to_grid=True, snap_to_parts=False
     )
+    # Corners at 0/4: the footprint fills one grid cell per axis.
     assert (x, y, z) == (4.0, 8.0, 0.0)
 
 
@@ -131,18 +146,18 @@ def test_snap_target_no_snapping() -> None:
 
 
 def test_snap_target_stacks_on_overlap() -> None:
-    '''A footprint overlapping a piece drops onto its top at the cursor.'''
-    supports = [Support(x=0.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8)]
+    '''A footprint overlapping a piece drops onto its stacking plane.'''
+    supports = [Support(x=0.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8, stack_top=3.0)]
     x, y, z = assemble_snap_target(
         3.0, 3.0, 4.0, 4.0, supports, 4.0, snap_to_grid=True, snap_to_parts=True
     )
-    assert (x, y) == (4.0, 4.0)  # grid-rounded cursor
-    assert z == pytest.approx(8.8)  # on top of the support
+    assert (x, y) == (4.0, 4.0)  # corner-rounded cursor
+    assert z == pytest.approx(3.0)  # block_height above the support bottom
 
 
 def test_snap_target_side_flush_wins_when_closer() -> None:
     '''A cursor near a piece side snaps flush to that side at its height.'''
-    supports = [Support(x=0.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8)]
+    supports = [Support(x=0.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8, stack_top=3.0)]
     # Cursor just outside the +X side (side contact needs 8 + 4 = 12).
     x, y, z = assemble_snap_target(
         13.0, 0.5, 4.0, 4.0, supports, 4.0, snap_to_grid=True, snap_to_parts=True
@@ -154,20 +169,22 @@ def test_snap_target_side_flush_wins_when_closer() -> None:
 
 def test_snap_target_stacking_preferred_on_tie() -> None:
     '''When stacking and side distances tie, stacking wins.'''
-    supports = [Support(x=0.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8)]
-    # The grid-rounded cursor (8, 0) overlaps the piece edge strip; the
-    # side-flush candidate (12, 0) is the same XY distance away. Equal
-    # scores prefer the stacking candidate (higher z, same XY distance).
+    # Support spans x in [-10, 6]: the corner-rounded cursor (9, 0) drops
+    # at (8, 0) — overlapping the support (stacking candidate) and exactly
+    # as far from the +X flush side (10, 0).
+    supports = [
+        Support(x=-2.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8, stack_top=3.0)
+    ]
     x, y, z = assemble_snap_target(
-        10.0, 0.0, 4.0, 4.0, supports, 4.0, snap_to_grid=True, snap_to_parts=True
+        9.0, 0.0, 4.0, 4.0, supports, 4.0, snap_to_grid=True, snap_to_parts=True
     )
-    assert z == pytest.approx(8.8)
+    assert z == pytest.approx(3.0)
     assert (x, y) == (8.0, 0.0)
 
 
 def test_snap_target_far_from_parts_falls_back_to_grid() -> None:
-    '''No nearby pieces: the plain grid-rounded floor position.'''
-    supports = [Support(x=0.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8)]
+    '''No nearby pieces: the plain corner-rounded floor position.'''
+    supports = [Support(x=0.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8, stack_top=3.0)]
     x, y, z = assemble_snap_target(
         200.0, 100.0, 4.0, 4.0, supports, 4.0, snap_to_grid=True, snap_to_parts=True
     )

@@ -2,8 +2,8 @@
 File:   assemble_service.py
 Brief:  Pure Assemble-tab domain logic: part grouping, counts, snap and stacking.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations
@@ -65,6 +65,10 @@ class Support(NamedTuple):
         z: Bottom height of the piece, mm.
         hx, hy: Half extents of the (rotation-applied) footprint, mm.
         height: Piece height (bottom to top), mm.
+        stack_top: Absolute height a piece dropped on top rests at, mm.
+            Normal pieces stack at ``z + block_height`` — the studs of
+            this piece enter the bottom cavities of the dropped one —
+            while flipped pieces rest rim-to-rim at ``z + total_height``.
     '''
 
     x: float
@@ -73,11 +77,7 @@ class Support(NamedTuple):
     hx: float
     hy: float
     height: float
-
-    @property
-    def top(self) -> float:
-        '''Height of the piece top face, mm.'''
-        return self.z + self.height
+    stack_top: float
 
 
 # Block fields that are NOT part of the geometry signature.
@@ -163,7 +163,7 @@ def assemble_supports(
 
     Returns:
         One :class:`Support` per assembled piece (rotation applied to the
-        footprint halves).
+        footprint halves; ``stack_top`` per the piece flip state).
     '''
     skip = exclude_uids or set()
     blocks_by_uid = {block.uid: block for block in project.blocks}
@@ -179,6 +179,9 @@ def assemble_supports(
         hy = settings.outer_length_y / 2
         if piece.rot_z % 2:
             hx, hy = hy, hx
+        # Normal pieces stack at block_height (studs into the bottom
+        # cavities of the dropped piece); flipped pieces rest rim-to-rim.
+        stack_offset = settings.total_height if piece.flipped else settings.block_height
         supports.append(
             Support(
                 x=piece.position_x,
@@ -187,6 +190,7 @@ def assemble_supports(
                 hx=hx,
                 hy=hy,
                 height=settings.total_height,
+                stack_top=piece.position_z + stack_offset,
             )
         )
     return supports
@@ -195,7 +199,7 @@ def assemble_supports(
 def support_top_z(
     supports: list[Support], cx: float, cy: float, hx: float, hy: float
 ) -> float | None:
-    '''Top height of the highest piece overlapping the given footprint.
+    '''Stacking height of the highest piece overlapping the given footprint.
 
     Args:
         supports: Candidate pieces (the dragged ones must be excluded).
@@ -203,8 +207,8 @@ def support_top_z(
         hx, hy: Half extents of the queried footprint, mm.
 
     Returns:
-        The top height of the highest overlapping piece, or None when the
-        footprint overlaps nothing.
+        The :attr:`Support.stack_top` of the highest overlapping piece,
+        or None when the footprint overlaps nothing.
     '''
     best: float | None = None
     for support in supports:
@@ -212,7 +216,7 @@ def support_top_z(
             abs(cx - support.x) < hx + support.hx - _OVERLAP_EPS
             and abs(cy - support.y) < hy + support.hy - _OVERLAP_EPS
         ):
-            top = support.top
+            top = support.stack_top
             if best is None or top > best:
                 best = top
     return best
@@ -235,7 +239,8 @@ def assemble_snap_target(
 ) -> tuple[float, float, float]:
     '''Resolve the drop position of a piece from the cursor point.
 
-    The base target is the cursor point (rounded to the grid step when
+    The base target is the cursor point (rounded so the footprint minimum
+    corner — not the center — lands on a grid-step multiple when
     ``snap_to_grid``). With ``snap_to_parts`` two extra candidate kinds
     compete by their XY distance to the raw cursor: dropping ON TOP of
     the highest piece under the footprint, and aligning FLUSH to the
@@ -247,7 +252,8 @@ def assemble_snap_target(
         hx, hy: Half extents of the (rotation-applied) footprint, mm.
         supports: Footprints of the other pieces.
         step: Grid step in mm (> 0).
-        snap_to_grid: Round the base target to grid-step multiples.
+        snap_to_grid: Round the base target so the footprint corner hits
+            grid-step multiples.
         snap_to_parts: Enable the stacking / side-flush candidates.
 
     Returns:
@@ -255,8 +261,8 @@ def assemble_snap_target(
         the height of the piece bottom.
     '''
     step = max(step, 1e-9)
-    base_x = _grid_round(cursor_x, step) if snap_to_grid else cursor_x
-    base_y = _grid_round(cursor_y, step) if snap_to_grid else cursor_y
+    base_x = _grid_round(cursor_x - hx, step) + hx if snap_to_grid else cursor_x
+    base_y = _grid_round(cursor_y - hy, step) + hy if snap_to_grid else cursor_y
 
     best: tuple[float, float, float] | None = None
     best_score: tuple[float, int] | None = None
