@@ -2,8 +2,8 @@
 File:   test_placement_service.py
 Brief:  Unit tests for print-placement layout engine.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -751,9 +751,7 @@ def test_auto_place_rotates_to_fit() -> None:
 
 def test_auto_place_prefers_unrotated() -> None:
     '''A piece that fits unrotated is NOT turned by the packing.'''
-    proj = _make_project(
-        BlockInstance(uid="a", cells_x=4, cells_y=2, quantity=1)
-    )
+    proj = _make_project(BlockInstance(uid="a", cells_x=4, cells_y=2, quantity=1))
     sync_pieces(proj)
     auto_place(proj, [0])
     piece = proj.print_layout.pieces[0]

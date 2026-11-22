@@ -2,8 +2,8 @@
 File:   placement_service.py
 Brief:  Print-placement layout engine: zone geometry, sync, auto-place, distribute.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -400,9 +400,7 @@ def _shelf_pack(
     leftovers: list[str] = []
 
     def _fit(cw: float, cd: float) -> bool:
-        return (
-            cursor_x + cw <= beds.width - gap and cursor_y + cd <= beds.depth - gap
-        )
+        return cursor_x + cw <= beds.width - gap and cursor_y + cd <= beds.depth - gap
 
     for uid, w, d in items:
         candidates = [(w, d, False), (d, w, True)]

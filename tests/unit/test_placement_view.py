@@ -2,8 +2,8 @@
 File:   test_placement_view.py
 Brief:  Offscreen PlacementView tests: zone overlays, scene updates, camera.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ def _scene_meta(pos_x: float, pos_y: float) -> dict:
 
 # ------------------------------------------------------------------- fixtures
 
+
 @pytest.fixture()
 def placement_view_default() -> Iterator[PlacementView]:
     '''A PlacementView with default PrintBedSettings (count=1).'''
@@ -94,6 +95,7 @@ def placement_view_three_beds() -> Iterator[PlacementView]:
 
 
 # ------------------------------------------------------------------ tests
+
 
 def test_default_view_has_zone_overlays(
     placement_view_default: PlacementView,

@@ -3,7 +3,7 @@ File:   print_export.py
 Brief:  Assembly and export of print-bed compounds from the placement layout.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.15.0
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -136,9 +136,7 @@ def collect_all_beds(project: Project) -> tuple[list[dict], int]:
         entries, skipped = collect_bed_entries(project, index)
         total_skipped += skipped
         if entries:
-            beds_payload.append(
-                {'index': index, 'pieces': entries, 'skipped': skipped}
-            )
+            beds_payload.append({'index': index, 'pieces': entries, 'skipped': skipped})
     return (beds_payload, total_skipped)
 
 

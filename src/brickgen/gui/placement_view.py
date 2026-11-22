@@ -2,8 +2,8 @@
 File:   placement_view.py
 Brief:  Print-placement viewport: piece actors plus static bed/staging zone overlays.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -77,13 +77,15 @@ class PlacementView(PreviewWidget):
         # --- Draw one frame per bed ---
         for i in range(beds.count):
             ox, oy = bed_origin(i, beds)
-            corners = np.array([
-                [ox, oy, GRID_Z_OFFSET],
-                [ox + beds.width, oy, GRID_Z_OFFSET],
-                [ox + beds.width, oy + beds.depth, GRID_Z_OFFSET],
-                [ox, oy + beds.depth, GRID_Z_OFFSET],
-                [ox, oy, GRID_Z_OFFSET],  # close the loop
-            ])
+            corners = np.array(
+                [
+                    [ox, oy, GRID_Z_OFFSET],
+                    [ox + beds.width, oy, GRID_Z_OFFSET],
+                    [ox + beds.width, oy + beds.depth, GRID_Z_OFFSET],
+                    [ox, oy + beds.depth, GRID_Z_OFFSET],
+                    [ox, oy, GRID_Z_OFFSET],  # close the loop
+                ]
+            )
             frame = pv.lines_from_points(corners)
             actor = self.add_mesh(
                 frame,
@@ -116,13 +118,15 @@ class PlacementView(PreviewWidget):
 
         # --- Draw the staging zone frame (always present) ---
         sx, sy = staging_origin(beds)
-        corners = np.array([
-            [sx, sy, GRID_Z_OFFSET],
-            [sx + beds.width, sy, GRID_Z_OFFSET],
-            [sx + beds.width, sy + beds.depth, GRID_Z_OFFSET],
-            [sx, sy + beds.depth, GRID_Z_OFFSET],
-            [sx, sy, GRID_Z_OFFSET],  # close the loop
-        ])
+        corners = np.array(
+            [
+                [sx, sy, GRID_Z_OFFSET],
+                [sx + beds.width, sy, GRID_Z_OFFSET],
+                [sx + beds.width, sy + beds.depth, GRID_Z_OFFSET],
+                [sx, sy + beds.depth, GRID_Z_OFFSET],
+                [sx, sy, GRID_Z_OFFSET],  # close the loop
+            ]
+        )
         frame = pv.lines_from_points(corners)
         actor = self.add_mesh(
             frame,

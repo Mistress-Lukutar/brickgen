@@ -3,8 +3,8 @@ File:   placement_panel.py
 Brief:  Left-sidebar panel for the print-placement tab: bed configuration,
         placement tools and the selected-piece inspector.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -36,12 +36,12 @@ class PlacementPanel(QWidget):
     '''Left-sidebar panel for the print-placement tab: bed configuration,
     placement tools and the selected-piece inspector.'''
 
-    beds_changed = Signal(object)           # PrintBedSettings
-    auto_place_requested = Signal(object)   # list[int] 0-based bed indices
+    beds_changed = Signal(object)  # PrintBedSettings
+    auto_place_requested = Signal(object)  # list[int] 0-based bed indices
     distribute_requested = Signal(str, object)  # mode str, list[int]
-    piece_bed_changed = Signal(int)         # target bed index or PRINT_STAGING_BED
+    piece_bed_changed = Signal(int)  # target bed index or PRINT_STAGING_BED
     piece_position_changed = Signal(float, float)  # delta for primary's zone-local pos
-    piece_flip_changed = Signal(bool)       # flip state for ALL selected pieces
+    piece_flip_changed = Signal(bool)  # flip state for ALL selected pieces
     flip_selection_requested = Signal()
     stage_selection_requested = Signal()
 
@@ -350,9 +350,7 @@ class PlacementPanel(QWidget):
 
             # The piece's block is found by uid — piece indices are unrelated
             # to block indices.
-            block_instance = next(
-                (b for b in blocks if b.uid == piece.block_uid), None
-            )
+            block_instance = next((b for b in blocks if b.uid == piece.block_uid), None)
             cx, cy = (
                 (block_instance.cells_x, block_instance.cells_y)
                 if block_instance is not None

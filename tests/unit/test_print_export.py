@@ -2,8 +2,8 @@
 File:   test_print_export.py
 Brief:  Unit tests for print-bed entry collection and compound assembly.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -105,9 +105,7 @@ def test_collect_bed_entries_ignores_staged_pieces() -> None:
         BlockInstance(uid="a", cells_x=1, cells_y=1),
         beds=PrintBedSettings(count=1),
     )
-    proj.print_layout.pieces.append(
-        _piece("a", 4.0, 4.0, bed=PRINT_STAGING_BED)
-    )
+    proj.print_layout.pieces.append(_piece("a", 4.0, 4.0, bed=PRINT_STAGING_BED))
     entries, skipped = collect_bed_entries(proj, 0)
     assert entries == []
     assert skipped == 0
@@ -232,8 +230,15 @@ def test_bed_compound_rotated_bbox_swaps() -> None:
     height = settings.total_height
 
     compound = bed_compound(
-        [{'settings': settings.model_dump(), 'position_x': 10.0,
-          'position_y': 20.0, 'flipped': False, 'rotated90': True}]
+        [
+            {
+                'settings': settings.model_dump(),
+                'position_x': 10.0,
+                'position_y': 20.0,
+                'flipped': False,
+                'rotated90': True,
+            }
+        ]
     )
     bbox = compound.val().BoundingBox()
     assert bbox.xmin == pytest.approx(10.0 - 4.0, abs=1e-3)
@@ -264,6 +269,4 @@ def test_bed_compound_flipped_and_rotated_volume_invariant() -> None:
         assert getattr(bbox_combo, attr) == pytest.approx(
             getattr(bbox_rotated, attr), abs=1e-3
         )
-    assert combo.val().Volume() == pytest.approx(
-        rotated.val().Volume(), rel=1e-6
-    )
+    assert combo.val().Volume() == pytest.approx(rotated.val().Volume(), rel=1e-6)
