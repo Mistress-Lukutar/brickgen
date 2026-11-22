@@ -1020,11 +1020,25 @@ class MainWindow(QMainWindow):
         '''Rebuild the placed-blocks list and highlight the primary row.'''
         self._blocks_list.blockSignals(True)
         try:
+            expected = [
+                f"{index + 1}. {block.cells_x}x{block.cells_y} ×{block.quantity}"
+                for index, block in enumerate(self._project.blocks)
+            ]
+            if self._blocks_list.count() == len(expected) and all(
+                self._blocks_list.item(row).text() == text
+                for row, text in enumerate(expected)
+            ):
+                # Content unchanged: only the selection moved. Keep the
+                # items (rebuilding a long list on every scene click stalls
+                # the UI) and just move the highlighted row.
+                if self._primary is not None and self._primary in self._selection:
+                    self._blocks_list.setCurrentRow(self._primary)
+                else:
+                    self._blocks_list.setCurrentRow(-1)
+                return
             self._blocks_list.clear()
-            for index, block in enumerate(self._project.blocks):
-                self._blocks_list.addItem(
-                    f"{index + 1}. {block.cells_x}x{block.cells_y} ×{block.quantity}"
-                )
+            for text in expected:
+                self._blocks_list.addItem(text)
             if self._primary is not None and self._primary in self._selection:
                 self._blocks_list.setCurrentRow(self._primary)
             else:

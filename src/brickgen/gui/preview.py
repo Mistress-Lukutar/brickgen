@@ -315,6 +315,7 @@ def add_surface_actor(plotter, mesh: pv.PolyData, color: str = BLOCK_COLOR) -> p
         lighting="three lights",
         backface_params={"color": INTERIOR_COLOR, "specular": 0.1},
         reset_camera=False,
+        render=False,  # batched: callers render once after the actor batch
     )
 
 
@@ -644,6 +645,10 @@ class PreviewWidget(QtInteractor):
             # is False, which would yank the view on the first selection.
             self.camera_set = True
         self._refresh_grid_labels()
+        # Single render for the whole batch: the actor add/remove calls run
+        # with render=False (one pyvista render per actor would stall the UI
+        # on large scenes), so the batch needs this explicit draw.
+        self.render()
         logger.debug(
             "Preview scene: %d blocks / %d points total",
             len(self._scene_meshes),
@@ -745,7 +750,7 @@ class PreviewWidget(QtInteractor):
         '''
         for actor in (*self._grid_actors, *self._grid_label_actors):
             try:
-                self.remove_actor(actor)
+                self.remove_actor(actor, reset_camera=False, render=False)
             except Exception:  # noqa: BLE001 - actor may already be detached
                 pass
         self._grid_actors.clear()
@@ -852,7 +857,7 @@ class PreviewWidget(QtInteractor):
         self._label_multipliers = multipliers
         for actor in self._grid_label_actors:
             try:
-                self.remove_actor(actor)
+                self.remove_actor(actor, reset_camera=False, render=False)
             except Exception:  # noqa: BLE001 - actor may already be detached
                 pass
         self._grid_label_actors.clear()
@@ -964,8 +969,8 @@ class PreviewWidget(QtInteractor):
         self._primary = (
             primary if primary is not None and primary in self._selection else None
         )
+        # Renders itself once when the outline set changed.
         self._update_selection_outlines()
-        self.render()
 
     def selected_blocks(self) -> set[int]:
         '''Set of currently selected block indices.'''
@@ -1039,18 +1044,23 @@ class PreviewWidget(QtInteractor):
                 actor.SetPosition(float(x), float(y), 0.0)
 
     def _clear_scene_actors(self) -> None:
-        '''Remove every surface/edge/wireframe/outline/label actor.'''
+        '''Remove every surface/edge/wireframe/outline/label actor.
+
+        Batched with ``render=False``: a scene rebuild removes up to several
+        actors per block, and one render per removal would multiply into a
+        visible stall. The caller renders once after the batch.
+        '''
+        for index in list(self._outline_actors):
+            self._drop_outline(index)
         for actor in (
             *(actor for actors in self._block_actors for actor in actors),
-            *self._outline_actors.values(),
             *self._qty_actors.values(),
         ):
             try:
-                self.remove_actor(actor)
+                self.remove_actor(actor, reset_camera=False, render=False)
             except Exception:  # noqa: BLE001 - actor may already be detached
                 pass
         self._block_actors.clear()
-        self._outline_actors.clear()
         self._qty_actors.clear()
         self._qty_points.clear()
         self._actor_map.clear()
@@ -1128,11 +1138,16 @@ class PreviewWidget(QtInteractor):
         else:
             for index, do_build in enumerate(changed):
                 if do_build:
-                    # Remove existing actors for this block.
+                    # Remove existing actors for this block (batched with
+                    # render=False - the caller renders once afterwards;
+                    # pyvista's remove_actor would render per actor). The
+                    # outline is dropped too: the rebuilt mesh may have new
+                    # bounds, so the delta update must recreate it.
+                    self._drop_outline(index)
                     old_actors = self._block_actors[index]
                     for actor in old_actors:
                         try:
-                            self.remove_actor(actor)
+                            self.remove_actor(actor, reset_camera=False, render=False)
                         except Exception:  # noqa: BLE001 - may be detached
                             pass
                         self._actor_map.pop(actor, None)
@@ -1158,6 +1173,7 @@ class PreviewWidget(QtInteractor):
             render_lines_as_tubes=True,
             pickable=False,
             reset_camera=False,
+            render=False,  # batched: _rebuild_actors renders once afterwards
         )
 
     def _add_wireframe_actor(
@@ -1182,19 +1198,28 @@ class PreviewWidget(QtInteractor):
             render_lines_as_tubes=tubes,
             pickable=False,
             reset_camera=False,
+            render=False,  # batched: _rebuild_actors renders once afterwards
         )
 
     def _update_selection_outlines(self) -> None:
-        '''Rebuild the thin bright outline actors around selected blocks.'''
-        for actor in self._outline_actors.values():
-            try:
-                self.remove_actor(actor)
-            except Exception:  # noqa: BLE001 - actor may already be detached
-                pass
-        self._outline_actors.clear()
-        for index in sorted(self._selection):
-            if not 0 <= index < len(self._scene_meshes):
-                continue
+        '''Sync the thin bright outline actors with the current selection.
+
+        Outlines are updated incrementally: only the delta between the
+        rendered actors and the selection is added/removed. Everything is
+        batched with ``render=False`` and followed by ONE render - pyvista's
+        ``add_mesh``/``remove_actor`` render by default, which would cost
+        one full viewport render per selected block per change (seconds of
+        lag when selecting or deselecting many blocks).
+        '''
+        count = len(self._scene_meshes)
+        wanted = {index for index in self._selection if 0 <= index < count}
+        stale = sorted(index for index in self._outline_actors if index not in wanted)
+        fresh = sorted(index for index in wanted if index not in self._outline_actors)
+        if not stale and not fresh:
+            return
+        for index in stale:
+            self._drop_outline(index)
+        for index in fresh:
             actor = self.add_mesh(
                 self._scene_meshes[index].outline(),
                 color=SELECTION_COLOR,
@@ -1202,10 +1227,22 @@ class PreviewWidget(QtInteractor):
                 lighting=False,
                 pickable=False,
                 reset_camera=False,
+                render=False,
             )
             position = self._scene_meta[index]
             actor.SetPosition(position['pos_x'], position['pos_y'], 0.0)
             self._outline_actors[index] = actor
+        self.render()
+
+    def _drop_outline(self, index: int) -> None:
+        '''Remove one selection outline actor (batched, no render).'''
+        actor = self._outline_actors.pop(index, None)
+        if actor is None:
+            return
+        try:
+            self.remove_actor(actor, reset_camera=False, render=False)
+        except Exception:  # noqa: BLE001 - actor may already be detached
+            pass
 
     # ------------------------------------------------------- move drag & grab
     def start_move_drag(self, pos: QPoint) -> bool:
@@ -1820,7 +1857,6 @@ class PreviewWidget(QtInteractor):
         self._primary = None  # no clicked block: let the window pick one
         self._update_selection_outlines()
         self._emit_selection()
-        self.render()
 
     def _blocks_in_rect(self, rect: QRect) -> set[int]:
         '''Indices of blocks whose screen bounding box lies fully in *rect*.'''
@@ -1891,4 +1927,3 @@ class PreviewWidget(QtInteractor):
         self._primary = None
         self._update_selection_outlines()
         self._emit_selection()
-        self.render()
