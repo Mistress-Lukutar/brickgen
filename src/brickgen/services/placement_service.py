@@ -3,7 +3,7 @@ File:   placement_service.py
 Brief:  Print-placement layout engine: zone geometry, sync and auto-place.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -20,15 +20,40 @@ from brickgen.core.project import (
 )
 
 # World-space layout of the placement scene: identical zones (beds and the
-# staging area) sit side by side along X, separated by this gap. The staging
-# zone is to the LEFT of bed 0.
+# staging area) are arranged on a near-square grid, separated by this gap.
+# The staging zone sits to the LEFT of bed 0 (row 0).
 BED_GAP_MM = 20.0
 
 # This module stays pure logic: no cadquery / pyvista / Qt imports allowed.
 
 
+def bed_grid_shape(count: int) -> tuple[int, int]:
+    '''Near-square ``(columns, rows)`` bed arrangement for *count* beds.
+
+    The column count is ``ceil(sqrt(count))`` and the rows fill the rest,
+    so 2 beds form a 2x1 grid, 3-4 beds a 2x2 grid, 5-6 beds a 3x2 grid,
+    7-9 beds a 3x3 grid and so on. Bed indices fill the grid row by row,
+    left to right.
+
+    Args:
+        count: Number of beds (>= 1).
+
+    Returns:
+        ``(columns, rows)`` with ``columns * rows >= count``.
+    '''
+    columns = max(1, int(np.ceil(np.sqrt(max(1, count)))))
+    rows = max(1, int(np.ceil(count / columns)))
+    return (columns, rows)
+
+
 def bed_origin(index: int, beds: PrintBedSettings) -> tuple[float, float]:
     '''World position (bottom-left corner) of *index* bed.
+
+    The beds sit on a near-square grid (see :func:`bed_grid_shape`) and
+    are numbered in READING order: left to right, TOP to BOTTOM — bed 0
+    is the top-left cell (the grid's highest-Y row, since the world Y
+    axis points up), higher indices continue to the right, then wrap to
+    the next row below.
 
     Args:
         index: Zero-based bed index.
@@ -37,11 +62,20 @@ def bed_origin(index: int, beds: PrintBedSettings) -> tuple[float, float]:
     Returns:
         ``(x, y)`` world coordinates of the bottom-left corner of that bed.
     '''
-    return (index * (beds.width + BED_GAP_MM), 0.0)
+    columns, rows = bed_grid_shape(beds.count)
+    column = index % columns
+    row = index // columns
+    return (
+        column * (beds.width + BED_GAP_MM),
+        (rows - 1 - row) * (beds.depth + BED_GAP_MM),
+    )
 
 
 def staging_origin(beds: PrintBedSettings) -> tuple[float, float]:
     '''World position (bottom-left corner) of the staging zone.
+
+    The staging zone always sits to the LEFT of bed 0 (which occupies the
+    top-left cell of the bed grid), in the same top row.
 
     Args:
         beds: The project's ``PrintBedSettings``.
@@ -49,25 +83,55 @@ def staging_origin(beds: PrintBedSettings) -> tuple[float, float]:
     Returns:
         ``(x, y)`` world coordinates of the staging zone origin.
     '''
-    return (-(beds.width + BED_GAP_MM), 0.0)
+    _columns, rows = bed_grid_shape(beds.count)
+    return (
+        -(beds.width + BED_GAP_MM),
+        (rows - 1) * (beds.depth + BED_GAP_MM),
+    )
 
 
-def zone_for_world_x(x: float, beds: PrintBedSettings) -> int:
-    '''Map a world-space *x* coordinate to a zone index.
+def zone_for_world(x: float, y: float, beds: PrintBedSettings) -> int:
+    '''Map a world-space point to a zone index.
 
     Args:
         x: World X coordinate.
+        y: World Y coordinate.
         beds: The project's ``PrintBedSettings``.
 
     Returns:
-        ``PRINT_STAGING_BED`` when *x* falls in the staging gap, otherwise
-        a bed index clamped to ``[0, beds.count - 1]``.
+        ``PRINT_STAGING_BED`` when the point falls in the staging zone
+        (with a half-gap tolerance around its rect), otherwise the bed
+        index containing the point; when the point lies in no zone rect
+        (in the gap between beds or far outside), the nearest bed by
+        center distance.
     '''
-    boundary = -(BED_GAP_MM / 2.0)
-    if x < boundary:
+    half = BED_GAP_MM / 2.0
+    sx, sy = staging_origin(beds)
+    if (
+        sx - half <= x <= sx + beds.width + half
+        and sy - half <= y <= sy + beds.depth + half
+    ):
         return PRINT_STAGING_BED
-    idx = int((x + BED_GAP_MM / 2.0) // (beds.width + BED_GAP_MM))
-    return max(0, min(idx, beds.count - 1))
+    for index in range(beds.count):
+        ox, oy = bed_origin(index, beds)
+        if (
+            ox - half <= x <= ox + beds.width + half
+            and oy - half <= y <= oy + beds.depth + half
+        ):
+            return index
+    # Far outside every zone: fall back to the nearest bed center so the
+    # caller always receives a usable zone (matches the old clamping).
+    centers = [
+        (
+            bed_origin(index, beds)[0] + beds.width / 2.0,
+            bed_origin(index, beds)[1] + beds.depth / 2.0,
+        )
+        for index in range(beds.count)
+    ]
+    return min(
+        range(beds.count),
+        key=lambda index: (x - centers[index][0]) ** 2 + (y - centers[index][1]) ** 2,
+    )
 
 
 def world_position(piece: PrintPiece, beds: PrintBedSettings) -> tuple[float, float]:
@@ -361,7 +425,7 @@ def resolve_manual_moves(
     '''Commit dropped piece positions with collision resolution.
 
     Each moved piece is assigned to the zone under its dropped world
-    center (:func:`zone_for_world_x`), clamped into the zone margins
+    center (:func:`zone_for_world`), clamped into the zone margins
     (:func:`clamp_into_zone`) and conflict-repaired via
     :func:`resolve_piece_placements`.
 
@@ -376,7 +440,7 @@ def resolve_manual_moves(
         if not 0 <= index < len(pieces):
             continue
         piece = pieces[index]
-        zone = zone_for_world_x(wx, beds)
+        zone = zone_for_world(wx, wy, beds)
         piece.bed = zone
         piece.position_x, piece.position_y = local_position(wx, wy, zone, beds)
         clamp_into_zone(piece, footprints, beds)

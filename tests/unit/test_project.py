@@ -3,7 +3,7 @@ File:   test_project.py
 Brief:  Unit tests for Project and BlockInstance models.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from brickgen.core.project import (
     PRINT_STAGING_BED,
     QUANTITY_LABEL_POSITIONS,
     BlockInstance,
+    ExportSettings,
     PrintBedSettings,
     PrintLayout,
     PrintPiece,
@@ -453,3 +454,41 @@ def test_project_view_default_and_custom() -> None:
     proj2 = Project(view=ViewSettings(grid_snap=True, grid_scale=2.0))
     assert proj2.view.grid_snap is True
     assert proj2.view.grid_scale == 2.0
+
+
+# ================================================================== ExportSettings
+
+
+def test_export_settings_defaults() -> None:
+    '''Factory export settings: STL, 0.1 mm tolerance, one file per bed.'''
+    export = ExportSettings()
+    assert export.format == "STL"
+    assert export.tolerance == pytest.approx(0.1)
+    assert export.per_bed_files is True
+
+
+def test_export_settings_format_normalized() -> None:
+    '''The format is upper-cased and must be one of EXPORT_FORMATS.'''
+    export = ExportSettings(format="step")
+    assert export.format == "STEP"
+    with pytest.raises(SettingsValidationError, match="format must be one of"):
+        ExportSettings(format="OBJ")
+    with pytest.raises(SettingsValidationError, match="format must be one of"):
+        ExportSettings(format="")
+
+
+def test_export_settings_tolerance_bounds() -> None:
+    '''The mesh tolerance must be a positive value within 1 mm.'''
+    with pytest.raises(Exception):
+        ExportSettings(tolerance=0.0)
+    with pytest.raises(Exception):
+        ExportSettings(tolerance=1.5)
+    assert ExportSettings(tolerance=0.01).tolerance == pytest.approx(0.01)
+
+
+def test_project_has_export_settings() -> None:
+    '''Every project carries export settings; replacing one works.'''
+    proj = Project(blocks=[BlockInstance()])
+    assert proj.export == ExportSettings()
+    proj.export = ExportSettings(format="BREP", tolerance=0.3)
+    assert proj.export.format == "BREP"

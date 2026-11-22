@@ -3,7 +3,7 @@ File:   test_print_export.py
 Brief:  Unit tests for print-bed entry collection and compound assembly.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from brickgen.services.print_export import (
     bed_compound,
     collect_all_beds,
     collect_bed_entries,
+    collect_world_entries,
 )
 
 
@@ -270,3 +271,53 @@ def test_bed_compound_flipped_and_rotated_volume_invariant() -> None:
             getattr(bbox_rotated, attr), abs=1e-3
         )
     assert combo.val().Volume() == pytest.approx(rotated.val().Volume(), rel=1e-6)
+
+
+# ===========================================================================
+# collect_world_entries
+# ===========================================================================
+
+
+def test_collect_world_entries_offsets_by_bed_grid() -> None:
+    '''Single-file collection adds each bed's grid origin to local positions.
+
+    3 beds form a 2x2 grid numbered top-down (BED_GAP_MM=20, W=D=220):
+    bed 0 at (0, 240), bed 1 at (240, 240), bed 2 at (0, 0). Staged
+    pieces are never collected.
+    '''
+    proj = _make_project(
+        BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=1),
+        BlockInstance(uid="b", cells_x=3, cells_y=1, quantity=1),
+        beds=PrintBedSettings(width=220.0, depth=220.0, count=3, gap=4.0),
+    )
+    proj.print_layout.pieces = [
+        _piece("a", 110.0, 110.0, bed=0),
+        _piece("b", 110.0, 110.0, bed=1),
+        _piece("a", 50.0, 50.0, bed=2),
+        _piece("b", 30.0, 30.0, bed=PRINT_STAGING_BED),
+    ]
+
+    entries, skipped = collect_world_entries(proj)
+    assert skipped == 0
+    assert len(entries) == 3
+    # Bed 0: X kept, Y offset by one grid step (top row at y=240).
+    assert (entries[0]["position_x"], entries[0]["position_y"]) == (110.0, 350.0)
+    # Bed 1: offset by one step along X and Y (top-right cell).
+    assert (entries[1]["position_x"], entries[1]["position_y"]) == (350.0, 350.0)
+    # Bed 2: bottom row, no offset.
+    assert (entries[2]["position_x"], entries[2]["position_y"]) == (50.0, 50.0)
+
+
+def test_collect_world_entries_skips_outside_pieces() -> None:
+    '''Pieces hanging over their bed edge are skipped like per-bed export.'''
+    proj = _make_project(
+        BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=1),
+        beds=PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0),
+    )
+    proj.print_layout.pieces = [
+        _piece("a", 110.0, 110.0, bed=0),
+        _piece("a", 218.0, 110.0, bed=0),  # footprint crosses the right edge
+    ]
+    entries, skipped = collect_world_entries(proj)
+    assert len(entries) == 1
+    assert skipped == 1

@@ -3,7 +3,7 @@ File:   test_project_io.py
 Brief:  Unit tests for JSON save/load of multi-block projects.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from brickgen.core.models import BlockSettings
 from brickgen.core.project import (
     LAYOUT_FIELDS,
     BlockInstance,
+    ExportSettings,
     PrintBedSettings,
     PrintLayout,
     PrintPiece,
@@ -697,3 +698,53 @@ def test_load_v8_payload_defaults_tools(tmp_path: Path) -> None:
         "distribute_by_color": True,
         "distribute_evenly": True,
     }
+
+
+def test_export_settings_roundtrip(tmp_path: Path) -> None:
+    '''The per-project export settings survive a save/load roundtrip.'''
+    proj = Project(blocks=[BlockInstance()])
+    proj.export = ExportSettings(format="3MF", tolerance=0.25, per_bed_files=False)
+    path = save_project(proj, tmp_path / "project.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["export"] == {
+        "format": "3MF",
+        "tolerance": 0.25,
+        "per_bed_files": False,
+    }
+
+    loaded = load_project(path)
+    assert loaded.export == proj.export
+
+
+def test_v9_payload_without_export_key_loads_defaults(tmp_path: Path) -> None:
+    '''A v9 payload has no "export" key; it loads with factory defaults.
+
+    v10 added the per-project export settings; the next save writes the
+    current schema version plus the default export dict.
+    '''
+    proj = Project(blocks=[BlockInstance()])
+    payload = {
+        "schema": {"name": PROJECT_SCHEMA_NAME, "version": 9},
+        "settings": {
+            field: getattr(BlockSettings(), field)
+            for field in (
+                "unit_size",
+                "wall_thickness",
+                "block_height",
+                "clearance_xy",
+                "clearance_z",
+            )
+        },
+        "blocks": [b.model_dump() for b in proj.blocks],
+        "print_layout": {"beds": {}, "pieces": []},
+        "view": {},
+    }
+    path = tmp_path / "v9.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    loaded = load_project(path)
+    assert loaded.export == ExportSettings()
+
+    resaved = save_project(loaded, tmp_path / "resaved.json")
+    resaved_payload = json.loads(resaved.read_text(encoding="utf-8"))
+    assert resaved_payload["schema"]["version"] == PROJECT_SCHEMA_VERSION
+    assert resaved_payload["export"] == ExportSettings().model_dump()

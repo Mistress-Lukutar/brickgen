@@ -3,7 +3,7 @@ File:   print_export.py
 Brief:  Assembly and export of print-bed compounds from the placement layout.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import cadquery as cq
 from brickgen.core.builder import build_block
 from brickgen.core.models import BlockSettings
 from brickgen.core.project import Project
-from brickgen.services.placement_service import piece_dims
+from brickgen.services.placement_service import bed_origin, piece_dims
 
 
 def collect_bed_entries(project: Project, bed_index: int) -> tuple[list[dict], int]:
@@ -140,8 +140,44 @@ def collect_all_beds(project: Project) -> tuple[list[dict], int]:
     return (beds_payload, total_skipped)
 
 
+def collect_world_entries(project: Project) -> tuple[list[dict], int]:
+    '''Collect export entries for every bed in ONE world-space scene.
+
+    Single-file export: pieces from all beds keep their zone-local
+    positions converted to world mm (each bed's origin offset added), so
+    the whole layout lands in one compound exactly as the placement
+    viewport shows it. Staged pieces are never exported.
+
+    Args:
+        project: The active project.
+
+    Returns:
+        ``(entries, skipped)`` where *entries* is one flat list of
+        picklable piece dicts with world positions, ordered by bed index
+        then piece order, and *skipped* counts every piece not fully
+        inside its bed.
+    '''
+    beds = project.print_layout.beds
+    entries: list[dict] = []
+    total_skipped = 0
+    for index in range(beds.count):
+        bed_entries, skipped = collect_bed_entries(project, index)
+        total_skipped += skipped
+        ox, oy = bed_origin(index, beds)
+        for entry in bed_entries:
+            entries.append(
+                {
+                    **entry,
+                    'position_x': entry['position_x'] + ox,
+                    'position_y': entry['position_y'] + oy,
+                }
+            )
+    return (entries, total_skipped)
+
+
 __all__ = [
     'collect_all_beds',
     'collect_bed_entries',
+    'collect_world_entries',
     'bed_compound',
 ]

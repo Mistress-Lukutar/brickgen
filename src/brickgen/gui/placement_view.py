@@ -3,7 +3,7 @@ File:   placement_view.py
 Brief:  Print-placement viewport: piece actors plus per-bed grids and zone overlays.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from brickgen.gui.preview import (
 from brickgen.services.placement_service import (
     bed_origin,
     staging_origin,
-    zone_for_world_x,
+    zone_for_world,
 )
 
 # Visual palette for print-placement zone overlays.
@@ -134,7 +134,7 @@ class PlacementView(PreviewWidget):
             The ``(x, y)`` target snapped to zone-local grid multiples.
         '''
         step = max(self.grid_step(), 1e-9)
-        zone = zone_for_world_x(x, self._beds)
+        zone = zone_for_world(x, y, self._beds)
         if zone == PRINT_STAGING_BED:
             ox, oy = staging_origin(self._beds)
         else:

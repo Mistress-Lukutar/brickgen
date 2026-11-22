@@ -3,7 +3,7 @@ File:   test_placement_service.py
 Brief:  Unit tests for print-placement layout engine.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from brickgen.core.project import (
 )
 from brickgen.services.placement_service import (
     auto_place,
+    bed_grid_shape,
     bed_origin,
     block_colors,
     block_footprints,
@@ -35,7 +36,7 @@ from brickgen.services.placement_service import (
     staging_origin,
     sync_pieces,
     world_position,
-    zone_for_world_x,
+    zone_for_world,
 )
 
 # ------------------------------------------------------------------ helpers
@@ -106,57 +107,95 @@ def _assert_bed_invariants(proj: Project, beds: PrintBedSettings) -> None:
 # ================================================================== zone geometry
 
 
-def test_bed_origin_exact_values() -> None:
-    '''bed_origin returns exact world coords for every bed index.
+def test_bed_grid_shape() -> None:
+    '''bed_grid_shape returns the near-square arrangement column counts.
 
-    With the default W=220, GAP=20 (BED_GAP_MM):
-      step = 240 mm per zone.
+    1 → 1x1, 2 → 2x1, 3-4 → 2x2, 5-6 → 3x2, 7-9 → 3x3, 10 → 4x3.
+    '''
+    assert bed_grid_shape(1) == (1, 1)
+    assert bed_grid_shape(2) == (2, 1)
+    assert bed_grid_shape(3) == (2, 2)
+    assert bed_grid_shape(4) == (2, 2)
+    assert bed_grid_shape(5) == (3, 2)
+    assert bed_grid_shape(6) == (3, 2)
+    assert bed_grid_shape(7) == (3, 3)
+    assert bed_grid_shape(9) == (3, 3)
+    assert bed_grid_shape(10) == (4, 3)
+
+
+def test_bed_origin_exact_values() -> None:
+    '''bed_origin returns exact world coords on the near-square grid.
+
+    With W=D=220 and BED_GAP_MM=20 the zone step is 240 mm; 3 beds form a
+    2x2 grid numbered in READING order: beds 0-1 on the TOP row (highest
+    Y), bed 2 on the bottom row below bed 0.
     '''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=3, gap=4.0)
 
-    assert bed_origin(0, beds) == (0.0, 0.0)
-    assert bed_origin(1, beds) == (240.0, 0.0)
-    assert bed_origin(2, beds) == (480.0, 0.0)
+    assert bed_origin(0, beds) == (0.0, 240.0)
+    assert bed_origin(1, beds) == (240.0, 240.0)
+    assert bed_origin(2, beds) == (0.0, 0.0)
 
 
 def test_staging_origin_exact_value() -> None:
-    '''staging_origin is to the left of bed 0 by one full step.
+    '''staging_origin is left of bed 0 in the same (top) row.
 
-    W=220 → step = 240 → staging at (-240.0, 0.0).
+    W=220 → step = 240; 3 beds form a 2x2 grid whose top row sits at
+    y = 240 → staging at (-240.0, 240.0).
     '''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=3, gap=4.0)
-    assert staging_origin(beds) == (-240.0, 0.0)
+    assert staging_origin(beds) == (-240.0, 240.0)
 
 
-def test_zone_for_world_x() -> None:
-    '''zone_for_world_x maps world X to the correct zone index.
+def test_zone_for_world() -> None:
+    '''zone_for_world maps a world point to the correct zone index.
 
     Uses W=225 so that bed 0 spans [0, 225) and step = BED_GAP_MM + W = 245 mm.
-    The global boundary is -(BED_GAP_MM/2) = -10.0.
+    Zone rects carry a half-gap (10 mm) tolerance around them; a point in
+    no rect falls back to the nearest bed center. Adjacent tolerance rects
+    touch (never overlap), so boundaries resolve deterministically:
+    staging is checked first, then beds in index order.
     '''
     beds = PrintBedSettings(width=225.0, depth=220.0, count=2, gap=20.0)
 
     # Staging zone (x < -10).
-    assert zone_for_world_x(-241, beds) == PRINT_STAGING_BED
+    assert zone_for_world(-241, 100, beds) == PRINT_STAGING_BED
 
-    # Exact boundary: x = -BED_GAP_MM/2 = -10 is NOT strictly less → bed 0.
-    assert zone_for_world_x(-10.0, beds) == 0
+    # Boundary: the staging tolerance rect ends at -10 (inclusive) → staging;
+    # x = -9 is already inside bed 0's tolerance rect.
+    assert zone_for_world(-10.0, 0, beds) == PRINT_STAGING_BED
+    assert zone_for_world(-9.0, 0, beds) == 0
 
     # Bed 0 range.
-    assert zone_for_world_x(0, beds) == 0
+    assert zone_for_world(0, 0, beds) == 0
 
-    # Edge between beds: (230+10)//245 = 0 → bed 0; (235+10)//245 = 1 → bed 1.
-    assert zone_for_world_x(230, beds) == 0
-    assert zone_for_world_x(235, beds) == 1
+    # Edge between beds: bed 0's rect ends at 235, bed 1's starts there.
+    assert zone_for_world(230, 0, beds) == 0
+    assert zone_for_world(235, 0, beds) == 0
+    assert zone_for_world(236, 0, beds) == 1
 
-    # Beyond last bed clamped to count-1.
-    assert zone_for_world_x(9999, beds) == 1
+    # Beyond every bed: nearest center → bed 1.
+    assert zone_for_world(9999, 0, beds) == 1
 
 
-def test_zone_for_world_x_staging_boundary() -> None:
+def test_zone_for_world_rows() -> None:
+    '''zone_for_world distinguishes grid rows (3 beds = 2x2 grid, top-down).'''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=3, gap=4.0)
+
+    # Bed 0 sits on the top row at (0, 240).
+    assert zone_for_world(50, 250, beds) == 0
+    # Same X but inside bed 2's row (bottom, (0, 0)).
+    assert zone_for_world(50, 100, beds) == 2
+    # The row tolerance rects touch at y=230: the top row's bottom edge
+    # (bed 0) wins the tie; below belongs to bed 2.
+    assert zone_for_world(50, 230, beds) == 0
+    assert zone_for_world(50, 229, beds) == 2
+
+
+def test_zone_for_world_staging_boundary() -> None:
     '''With BED_GAP_MM=20 the boundary is always -10; x=-11 → staging.'''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
-    assert zone_for_world_x(-11, beds) == PRINT_STAGING_BED
+    assert zone_for_world(-11, 0, beds) == PRINT_STAGING_BED
 
 
 def test_world_position_and_local_position_round_trip() -> None:

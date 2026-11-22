@@ -4,7 +4,7 @@ Brief:  Left-sidebar panel for the print-placement tab: bed configuration,
         placement tools and the selected-piece inspector.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -344,11 +344,19 @@ class PlacementPanel(QWidget):
     # --- Public sync methods ---
 
     def set_beds(self, beds: PrintBedSettings) -> None:
-        '''Sync the bed spinboxes (and from/to ranges) from the project.'''
+        '''Sync the bed spinboxes (gap, size, count) and the from/to ranges
+        from the project.
+
+        The piece-gap spin MUST be synced here too: without it a loaded
+        project's gap never reaches the widget, and the next bed edit
+        rebuilds ``PrintBedSettings`` from the stale widget value —
+        silently resetting the project's persisted gap.
+        '''
         self._syncing = True
         try:
             self._spin_bed_width.setValue(beds.width)
             self._spin_bed_depth.setValue(beds.depth)
+            self._spin_piece_gap.setValue(beds.gap)
             self._spin_bed_count.setRange(1, 64)
             self._spin_bed_count.setValue(beds.count)
             # Clamp the bed count value if it exceeded the new max.

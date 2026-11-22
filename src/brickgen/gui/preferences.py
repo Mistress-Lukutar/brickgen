@@ -3,7 +3,7 @@ File:   preferences.py
 Brief:  Modal preferences dialog: precisions and default export format.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QMessageBox,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -73,6 +74,15 @@ class PreferencesDialog(QDialog):
         self._format.setCurrentText(settings.default_format)
         form.addRow("Default export format", self._format)
 
+        self._undo_depth = QSpinBox()
+        self._undo_depth.setRange(1, 500)
+        self._undo_depth.setSingleStep(10)
+        self._undo_depth.setValue(settings.undo_depth)
+        self._undo_depth.setToolTip(
+            "How many edit steps the shared Ctrl+Z / Ctrl+Y history keeps."
+        )
+        form.addRow("Undo depth (steps)", self._undo_depth)
+
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(
@@ -94,6 +104,7 @@ class PreferencesDialog(QDialog):
             "export_tolerance": self._export_tol.value(),
             "export_angular_tolerance": self._export_ang.value(),
             "default_format": self._format.currentText(),
+            "undo_depth": self._undo_depth.value(),
         }
         try:
             return AppSettings.model_validate(values)

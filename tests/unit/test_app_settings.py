@@ -3,7 +3,7 @@ File:   test_app_settings.py
 Brief:  Unit tests for persistent application preferences.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -104,3 +104,21 @@ def test_legacy_view_keys_are_ignored(isolated_settings: Path) -> None:
     )
     isolated_settings.write_text(json.dumps(payload), encoding="utf-8")
     assert load_app_settings() == AppSettings()
+
+
+def test_undo_depth_default_and_bounds() -> None:
+    '''undo_depth defaults to 50 steps and must stay within 1..500.'''
+    settings = AppSettings()
+    assert settings.undo_depth == 50
+    with pytest.raises(ValueError):
+        AppSettings(undo_depth=0)
+    with pytest.raises(ValueError):
+        AppSettings(undo_depth=501)
+    assert AppSettings(undo_depth=1).undo_depth == 1
+    assert AppSettings(undo_depth=500).undo_depth == 500
+
+
+def test_undo_depth_roundtrip(isolated_settings: Path) -> None:
+    '''A saved undo depth is restored verbatim by load_app_settings.'''
+    save_app_settings(AppSettings(undo_depth=123))
+    assert load_app_settings().undo_depth == 123

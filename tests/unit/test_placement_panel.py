@@ -4,7 +4,7 @@ Brief:  Offscreen PlacementPanel tests: bed-range signals, tools state,
         tri-state flip checkbox and sizing.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -220,3 +220,30 @@ def test_set_tools_clamped_by_bed_count(panel: PlacementPanel) -> None:
     panel.set_beds(PrintBedSettings(count=2))
     assert panel._spin_from.value() == 2
     assert panel._spin_to.value() == 2
+
+
+def test_set_beds_syncs_piece_gap(panel: PlacementPanel) -> None:
+    '''Regression: set_beds must sync the piece-gap spinbox.
+
+    Without the sync a loaded project's gap never reached the widget, and
+    the next bed edit rebuilt PrintBedSettings from the stale widget value
+    (0.0), silently resetting the persisted gap.
+    '''
+    panel.set_beds(PrintBedSettings(gap=3.5))
+    assert panel._spin_piece_gap.value() == pytest.approx(3.5)
+
+    # Any subsequent bed edit now keeps the synced gap.
+    seen: list[PrintBedSettings] = []
+    panel.beds_changed.connect(seen.append)
+    panel._spin_bed_width.setValue(180.0)
+    assert seen[-1].gap == pytest.approx(3.5)
+
+
+def test_bed_change_emits_project_gap(panel: PlacementPanel) -> None:
+    '''Editing the gap spinbox alone emits PrintBedSettings with the gap.'''
+    panel.set_beds(PrintBedSettings(gap=1.0))
+    seen: list[PrintBedSettings] = []
+    panel.beds_changed.connect(seen.append)
+    panel._spin_piece_gap.setValue(2.5)
+    assert seen[-1].gap == pytest.approx(2.5)
+    assert seen[-1].width == pytest.approx(PrintBedSettings().width)

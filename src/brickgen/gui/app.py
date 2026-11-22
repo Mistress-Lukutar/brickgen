@@ -3,14 +3,16 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
 
 import logging
 import sys
+import uuid
 from collections.abc import Iterable
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
 
@@ -28,7 +30,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QListWidget,
     QMainWindow,
@@ -58,11 +59,13 @@ from brickgen.core.project import (
     QUANTITY_LABEL_POSITIONS,
     BlockInstance,
     BlockLayout,
+    ExportSettings,
     PrintBedSettings,
     PrintPiece,
     PrintToolsSettings,
     Project,
 )
+from brickgen.gui.export_panel import ExportPanel
 from brickgen.gui.grid_editor import CellGridEditor, CellState
 from brickgen.gui.jobs import SKIPPED, JobError, JobQueue
 from brickgen.gui.library import TemplateLibraryPanel
@@ -77,7 +80,6 @@ from brickgen.gui.preview import (
     piece_variant_mesh,
 )
 from brickgen.services.app_settings import load_app_settings, save_app_settings
-from brickgen.services.export_service import SUPPORTED_FORMATS
 from brickgen.services.placement_service import (
     auto_place,
     block_colors,
@@ -91,7 +93,7 @@ from brickgen.services.placement_service import (
     sync_pieces,
     world_position,
 )
-from brickgen.services.print_export import collect_all_beds
+from brickgen.services.print_export import collect_all_beds, collect_world_entries
 from brickgen.services.project_io import load_project, save_project
 from brickgen.services.template_library import Template
 
@@ -102,6 +104,10 @@ _SIDE_OFFSETS = {"+X": (1, 0), "-X": (-1, 0), "+Y": (0, 1), "-Y": (0, -1)}
 
 # Debounce for automatic regeneration after any parameter change, ms.
 AUTO_GENERATE_DELAY_MS = 250
+
+# Same-label undo coalescing window, ms: continuous edits (spinboxes, grid
+# tweaks) arriving closer than this share one undo step.
+UNDO_BURST_MS = 800
 
 
 class MainWindow(QMainWindow):
@@ -121,7 +127,27 @@ class MainWindow(QMainWindow):
         self._primary: int | None = 0
         self._loading_layout = False
         self._syncing_inspector = False
+        self._syncing_ui = False
         self._inspector_pos: tuple[float, float] = (0.0, 0.0)
+
+        # Shared edit history (Edit menu: Ctrl+Z / Ctrl+Y). Snapshot-based:
+        # every mutating handler calls ``_begin_edit`` FIRST, which stores a
+        # deep copy of the pre-edit project. Continuous sources (spinboxes,
+        # grid edits) coalesce same-label edits inside the burst window into
+        # one undo step.
+        self._undo_stack: list[Project] = []
+        self._redo_stack: list[Project] = []
+        self._edit_burst: str | None = None
+        self._burst_timer = QTimer(self)
+        self._burst_timer.setSingleShot(True)
+        self._burst_timer.setInterval(UNDO_BURST_MS)
+        self._burst_timer.timeout.connect(self._close_edit_burst)
+
+        # Edit-menu clipboards (block dumps for the planning tab, piece dumps
+        # for the placement tab) and the cross-select toggle.
+        self._clip_blocks: list[dict] = []
+        self._clip_pieces: list[dict] = []
+        self._cross_select = False
         self.setWindowTitle("Untitled[*] - BrickGen")
         self.resize(1400, 760)
         self.setMinimumSize(1100, 600)
@@ -171,9 +197,19 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self._sidebar_stack)
         splitter.addWidget(self._tabs)
+        # Right panel stack: page 0 = template library (planning), page 1 =
+        # export panel (placement).
         self._library = TemplateLibraryPanel(self._selected_block_layout, self._jobs)
         self._library.apply_requested.connect(self._on_template_selected)
-        splitter.addWidget(self._library)
+        self._export_panel = ExportPanel()
+        self._export_panel.export_requested.connect(self._on_export_print)
+        self._export_panel.export_settings_changed.connect(
+            self._on_export_settings_changed
+        )
+        self._right_stack = QStackedWidget()
+        self._right_stack.addWidget(self._library)
+        self._right_stack.addWidget(self._export_panel)
+        splitter.addWidget(self._right_stack)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
@@ -212,9 +248,9 @@ class MainWindow(QMainWindow):
         return self._placement_view
 
     def _on_tab_changed(self, index: int) -> None:
-        '''Switch the sidebar page, library visibility and view-menu state.'''
+        '''Switch the sidebar page, right panel and view-menu state.'''
         self._sidebar_stack.setCurrentIndex(index)
-        self._library.setVisible(index == 0)
+        self._right_stack.setCurrentIndex(index)
 
         # Enable/disable quantity actions only on planning tab.
         self._act_qty_labels.setEnabled(index == 0)
@@ -224,6 +260,10 @@ class MainWindow(QMainWindow):
 
         # When entering tab 1: push shared settings into placement view.
         if index == 1:
+            # Cross-select mode: the pieces of every block selected on the
+            # planning tab become the placement selection.
+            if self._cross_select:
+                self._apply_cross_selection()
             self._placement_view.set_grid_unit(self._project.settings.unit_size)
             self._placement_view.set_grid_scale(self._project.view.grid_scale)
             self._placement_view.set_snap_enabled(self._project.view.grid_snap)
@@ -295,6 +335,58 @@ class MainWindow(QMainWindow):
         act_exit.setShortcut(QKeySequence.StandardKey.Quit)
         act_exit.triggered.connect(self.close)
         file_menu.addAction(act_exit)
+
+        # --- Edit menu: shared undo/redo + clipboard commands for BOTH tabs,
+        # plus the cross-select toggle. The QActions are window-level
+        # shortcuts; line edits (spinboxes) keep their own Ctrl+A/C/V/Z/Y
+        # text handling via Qt's ShortcutOverride.
+        edit_menu = self.menuBar().addMenu("&Edit")
+        self._act_undo = QAction("&Undo", self)
+        self._act_undo.setShortcut(QKeySequence.StandardKey.Undo)
+        self._act_undo.setToolTip("Undo the last edit on the active tab (Ctrl+Z).")
+        self._act_undo.setEnabled(False)
+        self._act_undo.triggered.connect(self._on_undo)
+        edit_menu.addAction(self._act_undo)
+        self._act_redo = QAction("&Redo", self)
+        self._act_redo.setShortcuts(
+            [QKeySequence("Ctrl+Y"), QKeySequence(QKeySequence.StandardKey.Redo)]
+        )
+        self._act_redo.setToolTip("Redo the last undone edit (Ctrl+Y).")
+        self._act_redo.setEnabled(False)
+        self._act_redo.triggered.connect(self._on_redo)
+        edit_menu.addAction(self._act_redo)
+        edit_menu.addSeparator()
+        self._act_copy = QAction("&Copy", self)
+        self._act_copy.setShortcut(QKeySequence.StandardKey.Copy)
+        self._act_copy.setToolTip(
+            "Copy the selected blocks (planning) or pieces (placement) (Ctrl+C)."
+        )
+        self._act_copy.triggered.connect(self._on_copy)
+        edit_menu.addAction(self._act_copy)
+        self._act_paste = QAction("&Paste", self)
+        self._act_paste.setShortcut(QKeySequence.StandardKey.Paste)
+        self._act_paste.setToolTip(
+            "Paste the copied blocks (planning) or pieces (placement) (Ctrl+V)."
+        )
+        self._act_paste.triggered.connect(self._on_paste)
+        edit_menu.addAction(self._act_paste)
+        edit_menu.addSeparator()
+        self._act_select_all = QAction("Select &All", self)
+        self._act_select_all.setShortcut(QKeySequence.StandardKey.SelectAll)
+        self._act_select_all.setToolTip(
+            "Select every block (planning) or piece (placement) (Ctrl+A)."
+        )
+        self._act_select_all.triggered.connect(self._on_select_all)
+        edit_menu.addAction(self._act_select_all)
+        edit_menu.addSeparator()
+        self._act_cross_select = QAction("&Cross-select mode", self)
+        self._act_cross_select.setCheckable(True)
+        self._act_cross_select.setToolTip(
+            "When switching to Print placement with blocks selected on "
+            "Planning, select all placement pieces of those blocks."
+        )
+        self._act_cross_select.toggled.connect(self._on_cross_select_toggled)
+        edit_menu.addAction(self._act_cross_select)
 
         view_menu = self.menuBar().addMenu("&View")
         mode_group = QActionGroup(self)
@@ -634,9 +726,13 @@ class MainWindow(QMainWindow):
             self._placement_panel.minimumWidth(),
         )
         self._sidebar_stack.setMinimumWidth(sidebar_w)
-        library_w = self._library.minimumWidth()
-        preview_w = max(self._splitter.width() - sidebar_w - library_w, 200)
-        self._splitter.setSizes([sidebar_w, preview_w, library_w])
+        # Same for the right-side stack (library / export panel).
+        right_w = max(
+            self._library.minimumWidth(),
+            self._export_panel.minimumWidth(),
+        )
+        preview_w = max(self._splitter.width() - sidebar_w - right_w, 200)
+        self._splitter.setSizes([sidebar_w, preview_w, right_w])
         # Deferred: run once more after the whole geometry pass has settled.
         QTimer.singleShot(0, self._library.force_relayout)
         self._library.force_relayout()
@@ -703,7 +799,14 @@ class MainWindow(QMainWindow):
         self._regen_timer.start()
 
     def _on_shared_param_changed(self) -> None:
-        '''A shared geometry control changed: mark dirty and regenerate.'''
+        '''A shared geometry control changed: mark dirty and regenerate.
+
+        Programmatic syncs (open/new/restore) are guarded by
+        ``_syncing_ui``: they must not create undo steps or dirty flags.
+        '''
+        if self._syncing_ui:
+            return
+        self._begin_edit("shared-params", coalesce=True)
         self._mark_scene_dirty()
         self._mark_dirty()
         self._schedule_rebuild()
@@ -831,11 +934,16 @@ class MainWindow(QMainWindow):
         self._block_meshes = []
         self._mesh_variants = {}
         self._mark_clean()
-        self._apply_view_settings()
-        self._sync_all()
-        self._placement_view.set_print_beds(self._project.print_layout.beds)
-        self._placement_panel.set_beds(self._project.print_layout.beds)
-        self._placement_panel.set_tools(self._project.print_layout.tools)
+        self._reset_edit_history()
+        self._syncing_ui = True
+        try:
+            self._apply_view_settings()
+            self._sync_all()
+            self._placement_view.set_print_beds(self._project.print_layout.beds)
+            self._placement_panel.set_beds(self._project.print_layout.beds)
+            self._placement_panel.set_tools(self._project.print_layout.tools)
+        finally:
+            self._syncing_ui = False
         self._on_generate()
         self._set_status("New project created.")
 
@@ -865,12 +973,17 @@ class MainWindow(QMainWindow):
         self._block_meshes = []
         self._mesh_variants = {}
         self._mark_clean()
+        self._reset_edit_history()
         # Restore the project's own view state (grids, snap, labels).
-        self._apply_view_settings()
-        self._sync_all()
-        self._placement_view.set_print_beds(self._project.print_layout.beds)
-        self._placement_panel.set_beds(self._project.print_layout.beds)
-        self._placement_panel.set_tools(self._project.print_layout.tools)
+        self._syncing_ui = True
+        try:
+            self._apply_view_settings()
+            self._sync_all()
+            self._placement_view.set_print_beds(self._project.print_layout.beds)
+            self._placement_panel.set_beds(self._project.print_layout.beds)
+            self._placement_panel.set_tools(self._project.print_layout.tools)
+        finally:
+            self._syncing_ui = False
         self._on_generate()
         self._set_status(f"Project opened: {Path(path).name}")
 
@@ -929,9 +1042,279 @@ class MainWindow(QMainWindow):
         self._jobs.close()
         event.accept()
 
+    # ----------------------------------------------------------- undo/redo
+    def _begin_edit(self, label: str, coalesce: bool = False) -> None:
+        '''Snapshot the project state before a user edit (undo boundary).
+
+        MUST be called at the START of every mutating handler: the snapshot
+        captures the pre-edit state. Continuous sources (spinboxes, grid
+        edits) pass ``coalesce=True`` — same-label edits inside the burst
+        window share one undo step; discrete commands (add/remove/
+        auto-place/...) never coalesce.
+
+        Args:
+            label: Edit kind used for burst coalescing.
+            coalesce: True to merge same-label edits inside the burst window.
+        '''
+        if self._syncing_ui:
+            return
+        if coalesce and self._edit_burst == label:
+            self._burst_timer.start()
+            return
+        self._close_edit_burst()
+        self._push_undo_snapshot()
+        self._edit_burst = label
+        self._burst_timer.start()
+
+    def _close_edit_burst(self) -> None:
+        '''End the coalescing window: the next edit opens a new undo step.'''
+        self._edit_burst = None
+        self._burst_timer.stop()
+
+    def _push_undo_snapshot(self) -> None:
+        '''Store the current project on the undo stack (trimmed by depth).'''
+        self._undo_stack.append(deepcopy(self._project))
+        self._trim_undo()
+        self._redo_stack.clear()
+        self._update_undo_actions()
+
+    def _trim_undo(self) -> None:
+        '''Cap the undo stack at the configured depth (app settings).'''
+        depth = self._app_settings.undo_depth
+        if len(self._undo_stack) > depth:
+            del self._undo_stack[: len(self._undo_stack) - depth]
+
+    def _update_undo_actions(self) -> None:
+        '''Enable the Edit-menu undo/redo actions from the stack states.'''
+        self._act_undo.setEnabled(bool(self._undo_stack))
+        self._act_redo.setEnabled(bool(self._redo_stack))
+
+    def _reset_edit_history(self) -> None:
+        '''Clear the undo/redo stacks (new/open boundaries).'''
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._close_edit_burst()
+        self._update_undo_actions()
+
+    def _on_undo(self) -> None:
+        '''Restore the pre-edit snapshot of the last undo step.'''
+        if not self._undo_stack:
+            return
+        self._close_edit_burst()
+        snapshot = self._undo_stack.pop()
+        self._redo_stack.append(deepcopy(self._project))
+        self._restore_project(snapshot)
+        self._update_undo_actions()
+        self._set_status("Undo.")
+
+    def _on_redo(self) -> None:
+        '''Restore the post-edit snapshot of the last undone step.'''
+        if not self._redo_stack:
+            return
+        self._close_edit_burst()
+        snapshot = self._redo_stack.pop()
+        self._undo_stack.append(deepcopy(self._project))
+        self._trim_undo()
+        self._restore_project(snapshot)
+        self._update_undo_actions()
+        self._set_status("Redo.")
+
+    def _restore_project(self, project: Project) -> None:
+        '''Replace the whole project and re-sync every widget (undo/redo).
+
+        Selections are reset like on project open; the placement meshes are
+        rebuilt by the generation triggered at the end.
+        '''
+        self._project = project
+        self._applied_context = None
+        self._mark_scene_dirty()
+        count = len(self._project.blocks)
+        self._selection = {0} if count else set()
+        self._primary = 0 if count else None
+        self._pselection = set()
+        self._pprimary = None
+        self._block_meshes = []
+        self._mesh_variants = {}
+        self._syncing_ui = True
+        try:
+            self._apply_view_settings()
+            self._sync_all()
+            self._placement_view.set_print_beds(self._project.print_layout.beds)
+            self._placement_panel.set_beds(self._project.print_layout.beds)
+            self._placement_panel.set_tools(self._project.print_layout.tools)
+        finally:
+            self._syncing_ui = False
+        self._on_generate()
+        self._mark_dirty()
+
+    # ------------------------------------------------------------- clipboard
+    def _on_copy(self) -> None:
+        '''Copy the active tab's selection into its per-tab clipboard.'''
+        if self._tabs.currentIndex() == 0:
+            if not self._selection:
+                self._set_status("Nothing to copy: no blocks selected.")
+                return
+            self._clip_blocks = [
+                deepcopy(self._project.blocks[index].model_dump())
+                for index in sorted(self._selection)
+            ]
+            self._set_status(f"Copied {len(self._clip_blocks)} block(s).")
+        else:
+            pieces = self._project.print_layout.pieces
+            if not self._pselection:
+                self._set_status("Nothing to copy: no pieces selected.")
+                return
+            self._clip_pieces = [
+                deepcopy(pieces[index].model_dump())
+                for index in sorted(self._pselection)
+                if index < len(pieces)
+            ]
+            self._set_status(f"Copied {len(self._clip_pieces)} piece(s).")
+
+    def _on_paste(self) -> None:
+        '''Paste the active tab's clipboard: blocks on planning, pieces on
+        the placement tab.'''
+        if self._tabs.currentIndex() == 0:
+            self._paste_blocks()
+        else:
+            self._paste_pieces()
+
+    def _paste_blocks(self) -> None:
+        '''Paste the copied block definitions as new blocks (new uids,
+        auto-placed next to the scene bounds).'''
+        if not self._clip_blocks:
+            self._set_status("Clipboard is empty: copy blocks first (Ctrl+C).")
+            return
+        self._begin_edit("paste-blocks")
+        pasted: list[int] = []
+        for values in self._clip_blocks:
+            block = BlockInstance.model_validate({**values, "uid": uuid.uuid4().hex})
+            merged = block.to_settings(self._project.settings)
+            position = self._auto_place_position(
+                merged.outer_length_x / 2, merged.outer_length_y / 2
+            )
+            block = block.model_copy(
+                update={"position_x": position[0], "position_y": position[1]}
+            )
+            self._project.blocks.append(block)
+            pasted.append(len(self._project.blocks) - 1)
+        self._selection = set(pasted)
+        self._primary = pasted[-1]
+        self._preview.set_selection(self._selection, self._primary)
+        self._on_scene_selection((frozenset(self._selection), self._primary))
+        self._mark_scene_dirty()
+        self._mark_dirty()
+        self._sync_all()
+        self._on_generate()
+        self._set_status(f"Pasted {len(pasted)} block(s).")
+
+    def _paste_pieces(self) -> None:
+        '''Paste the copied pieces as new physical copies.
+
+        Every pasted piece increments its block's BOM quantity by one (the
+        placement scene always mirrors "one piece per block x quantity");
+        the new piece starts near the copied one and is shifted to the
+        nearest conflict-free spot by the no-overlap repair.
+        '''
+        if not self._clip_pieces:
+            self._set_status("Clipboard is empty: copy pieces first (Ctrl+C).")
+            return
+        pieces = self._project.print_layout.pieces
+        blocks_by_uid = {block.uid: block for block in self._project.blocks}
+        if not any(
+            str(values.get("block_uid", "")) in blocks_by_uid
+            for values in self._clip_pieces
+        ):
+            self._set_status("Nothing to paste: copied blocks no longer exist.")
+            return
+        self._begin_edit("paste-pieces")
+        beds = self._project.print_layout.beds
+        pasted = 0
+        for values in self._clip_pieces:
+            block = blocks_by_uid.get(str(values.get("block_uid", "")))
+            if block is None:
+                continue  # The source block was removed since the copy.
+            block.quantity += 1
+            bed = int(values.get("bed", PRINT_STAGING_BED))
+            if not (PRINT_STAGING_BED <= bed < beds.count):
+                bed = PRINT_STAGING_BED
+            piece = PrintPiece.model_validate(
+                {
+                    **values,
+                    "uid": uuid.uuid4().hex,
+                    "bed": bed,
+                    "position_x": float(values.get("position_x", 0.0)) + 10.0,
+                    "position_y": float(values.get("position_y", 0.0)),
+                }
+            )
+            pieces.append(piece)
+            pasted += 1
+        if not pasted:
+            return
+        self._sync_placement()
+        self._mark_dirty()
+        self._set_status(f"Pasted {pasted} piece(s) (+{pasted} BOM quantity).")
+
+    # ------------------------------------------------------------ select all
+    def _on_select_all(self) -> None:
+        '''Select every block (planning) or every piece (placement).'''
+        if self._tabs.currentIndex() == 0:
+            count = len(self._project.blocks)
+            if not count:
+                return
+            self._selection = set(range(count))
+            self._primary = 0
+            self._preview.set_selection(self._selection, self._primary)
+            self._on_scene_selection((frozenset(self._selection), self._primary))
+        else:
+            count = len(self._project.print_layout.pieces)
+            if not count:
+                return
+            self._pselection = set(range(count))
+            self._pprimary = 0
+            self._placement_view.set_selection(self._pselection, self._pprimary)
+            self._on_placement_selection((frozenset(self._pselection), self._pprimary))
+
+    # ----------------------------------------------------------- cross-select
+    def _on_cross_select_toggled(self, checked: bool) -> None:
+        '''Store the cross-select toggle (session-level, not persisted).'''
+        self._cross_select = bool(checked)
+
+    def _apply_cross_selection(self) -> None:
+        '''Select every placement piece whose block is selected on planning.
+
+        The primary piece is the first piece of the primary block (falls
+        back to the lowest selected piece index).
+        '''
+        block_uids = {
+            self._project.blocks[index].uid
+            for index in self._selection
+            if 0 <= index < len(self._project.blocks)
+        }
+        pieces = self._project.print_layout.pieces
+        self._pselection = {
+            index for index, piece in enumerate(pieces) if piece.block_uid in block_uids
+        }
+        primary_uid = (
+            self._project.blocks[self._primary].uid
+            if self._primary is not None
+            and 0 <= self._primary < len(self._project.blocks)
+            else None
+        )
+        self._pprimary = next(
+            (
+                index
+                for index, piece in enumerate(pieces)
+                if piece.block_uid == primary_uid
+            ),
+            min(self._pselection) if self._pselection else None,
+        )
+        self._placement_view.set_selection(self._pselection, self._pprimary)
+
     # -------------------------------------------------------- block actions
     def _on_add_block(self) -> None:
         '''Append a default block to the scene and select it.'''
+        self._begin_edit("add-block")
         merged = BlockInstance().to_settings(self._project.settings)
         half_x = merged.outer_length_x / 2
         half_y = merged.outer_length_y / 2
@@ -950,6 +1333,7 @@ class MainWindow(QMainWindow):
         '''Duplicate the primary block next to it and select the copy.'''
         if self._primary is None:
             return
+        self._begin_edit("duplicate-block")
         source = self._project.blocks[self._primary]
         merged = source.to_settings(self._project.settings)
         gap = self._project.settings.unit_size
@@ -969,6 +1353,7 @@ class MainWindow(QMainWindow):
         '''Remove every selected block from the scene.'''
         if not self._selection:
             return
+        self._begin_edit("remove-blocks")
         for index in sorted(self._selection, reverse=True):
             del self._project.blocks[index]
         self._selection = set()
@@ -1101,6 +1486,7 @@ class MainWindow(QMainWindow):
         '''Resize the selected blocks' grids and push the edited layout.'''
         if self._syncing_inspector or self._primary is None:
             return
+        self._begin_edit("block-cells", coalesce=True)
         cells_x = self._block_cells_x.value()
         cells_y = self._block_cells_y.value()
         self._loading_layout = True
@@ -1125,6 +1511,7 @@ class MainWindow(QMainWindow):
         )
         if not color.isValid():
             return
+        self._begin_edit("block-color")
         hex_color = color.name()
         changed: dict[int, str] = {}
         for index in sorted(self._selection):
@@ -1138,6 +1525,7 @@ class MainWindow(QMainWindow):
         '''Apply the edited BOM quantity to every selected block.'''
         if self._syncing_inspector or self._primary is None:
             return
+        self._begin_edit("block-quantity", coalesce=True)
         quantity = self._block_quantity.value()
         changed: dict[int, int] = {}
         for index in sorted(self._selection):
@@ -1151,6 +1539,7 @@ class MainWindow(QMainWindow):
         '''Apply the block-level inner-tubes toggle to every selected block.'''
         if self._syncing_inspector or self._primary is None:
             return
+        self._begin_edit("block-tubes")
         for index in sorted(self._selection):
             self._project.blocks[index].tubes_enabled = bool(checked)
         self._mark_blocks_dirty(sorted(self._selection))
@@ -1166,6 +1555,7 @@ class MainWindow(QMainWindow):
         '''
         if self._syncing_inspector or self._primary is None:
             return
+        self._begin_edit("block-position", coalesce=True)
         new_x = self._block_pos_x.value()
         new_y = self._block_pos_y.value()
         old_x, old_y = self._inspector_pos
@@ -1193,17 +1583,22 @@ class MainWindow(QMainWindow):
         Args:
             positions: Mapping of block index to the final (x, y) position.
         '''
-        moved = False
-        for index, (x, y) in positions.items():
-            if not 0 <= index < len(self._project.blocks):
-                continue
+        valid_moves = {
+            index: (x, y)
+            for index, (x, y) in positions.items()
+            if 0 <= index < len(self._project.blocks)
+        }
+        if not any(
+            self._project.blocks[index].position_x != x
+            or self._project.blocks[index].position_y != y
+            for index, (x, y) in valid_moves.items()
+        ):
+            return
+        self._begin_edit("scene-move")
+        for index, (x, y) in valid_moves.items():
             block = self._project.blocks[index]
-            if block.position_x != x or block.position_y != y:
-                moved = True
             block.position_x = x
             block.position_y = y
-        if not moved:
-            return
         self._mark_dirty()
         self._sync_block_inspector()
         self._set_status(self._scene_summary())
@@ -1235,6 +1630,7 @@ class MainWindow(QMainWindow):
         '''Push the edited grid layout into every selected block.'''
         if self._loading_layout or not self._selection:
             return
+        self._begin_edit("layout-edit", coalesce=True)
         self._apply_layout_to_selection()
         self._mark_dirty()
         self._schedule_rebuild()
@@ -1524,6 +1920,7 @@ class MainWindow(QMainWindow):
         self._sync_block_inspector()
         self._sync_layout_from_primary()
         self._sync_inspector()
+        self._export_panel.set_settings(self._project.export)
         self._update_title()
 
     def _sync_shared_form(self) -> None:
@@ -1656,6 +2053,8 @@ class MainWindow(QMainWindow):
             return
         self._app_settings = updated
         self._save_app_settings()
+        self._trim_undo()
+        self._update_undo_actions()
         self._mark_scene_dirty()  # the tessellation tolerances changed
         self._on_generate()  # re-render the preview with the new precision
         self._set_status("Preferences saved.")
@@ -1668,6 +2067,7 @@ class MainWindow(QMainWindow):
         shared settings, auto-places it, appends and selects it; the shared
         geometry is never replaced by the template.
         '''
+        self._begin_edit("template")
         merged = template.layout.to_settings(self._project.settings)
         position = self._auto_place_position(
             merged.outer_length_x / 2, merged.outer_length_y / 2
@@ -1847,53 +2247,72 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- export
     def _on_export_print(self) -> None:
-        '''Ask for a destination folder and format, then queue the layout
-        export: one compound file per print bed.
+        '''Ask for a destination folder, then queue the layout export using
+        the project's export settings (placement export panel): one
+        compound file per print bed, or every bed combined into a single
+        file at world positions.
 
         Only pieces fully inside their bed are exported (a piece hanging
         over the edge would not print); skipped pieces are reported in the
         status afterwards.
         '''
-        beds, _skipped = collect_all_beds(self._project)
-        if not beds:
-            QMessageBox.information(
-                self, "Nothing to export", "Place pieces on a bed first."
-            )
-            return
+        cfg = self._project.export
+        bed_payloads: list[dict] = []
+        world_entries: list[dict] = []
+        if cfg.per_bed_files:
+            bed_payloads, _skipped = collect_all_beds(self._project)
+            if not bed_payloads:
+                QMessageBox.information(
+                    self, "Nothing to export", "Place pieces on a bed first."
+                )
+                return
+        else:
+            world_entries, _skipped = collect_world_entries(self._project)
+            if not world_entries:
+                QMessageBox.information(
+                    self, "Nothing to export", "Place pieces on a bed first."
+                )
+                return
         folder = QFileDialog.getExistingDirectory(
             self, "Select export folder", self._default_project_dir()
         )
         if not folder:
             return
-        formats = list(SUPPORTED_FORMATS)
-        file_format, ok = QInputDialog.getItem(
-            self,
-            "Export print layout",
-            "Format:",
-            formats,
-            formats.index(self._app_settings.default_format),
-            False,
-        )
-        if not ok:
-            return
-
         stem = self._project_path.stem if self._project_path else "brickgen-layout"
-        payload_beds = []
-        for bed in beds:
-            name = f"{stem}_bed{bed['index'] + 1:02d}.{file_format.lower()}"
-            path = Path(folder) / name
-            payload_beds.append(
-                {'index': bed['index'], 'path': str(path), 'pieces': bed['pieces']}
-            )
-
-        payload = {
-            'beds': payload_beds,
-            'format': file_format,
-            'tolerance': self._app_settings.export_tolerance,
-            'angular': self._app_settings.export_angular_tolerance,
-        }
-
-        self._set_status(f"Exporting {len(payload_beds)} bed file(s)…")
+        ext = cfg.format.lower()
+        payload: dict[str, Any]
+        if cfg.per_bed_files:
+            payload_beds = [
+                {
+                    'index': bed['index'],
+                    'path': str(
+                        Path(folder) / f"{stem}_bed{bed['index'] + 1:02d}.{ext}"
+                    ),
+                    'pieces': bed['pieces'],
+                }
+                for bed in bed_payloads
+            ]
+            payload = {
+                'beds': payload_beds,
+                'format': cfg.format,
+                'tolerance': cfg.tolerance,
+                'angular': self._app_settings.export_angular_tolerance,
+            }
+            self._set_status(f"Exporting {len(payload_beds)} bed file(s)…")
+        else:
+            payload = {
+                'beds': [
+                    {
+                        'index': 0,
+                        'path': str(Path(folder) / f"{stem}.{ext}"),
+                        'pieces': world_entries,
+                    }
+                ],
+                'format': cfg.format,
+                'tolerance': cfg.tolerance,
+                'angular': self._app_settings.export_angular_tolerance,
+            }
+            self._set_status("Exporting single file…")
 
         job_id = self._jobs.submit('export_print', payload)
         self._export_meta[job_id] = folder
@@ -1927,6 +2346,7 @@ class MainWindow(QMainWindow):
             self._status.setText(text)
         else:
             self._placement_panel.set_status(text, error)
+            self._export_panel.set_status(text, error)
 
     # ------------------------------------------------------- placement sync
 
@@ -2115,6 +2535,7 @@ class MainWindow(QMainWindow):
         Drops past a zone edge are clamped into the zone; drops onto other
         pieces shift to the nearest conflict-free spot instead.
         '''
+        self._begin_edit("piece-move")
         resolve_manual_moves(
             self._project.print_layout.pieces,
             block_footprints(self._project),
@@ -2144,6 +2565,7 @@ class MainWindow(QMainWindow):
         staging (packed into the free staging space), so no piece ever
         stays out of bounds after a bed resize.
         '''
+        self._begin_edit("bed-settings", coalesce=True)
         old = self._project.print_layout.beds
         self._project.print_layout.beds = beds
         if (beds.width, beds.depth, beds.count) == (old.width, old.depth, old.count):
@@ -2194,6 +2616,7 @@ class MainWindow(QMainWindow):
         even: bool = True,
     ) -> None:
         '''Handle auto-place request (modifiers from the panel checkboxes).'''
+        self._begin_edit("auto-place")
         report = auto_place(self._project, indices, by_color=by_color, even=even)
         self._enforce_no_overlap()
         self._mark_dirty()
@@ -2215,6 +2638,7 @@ class MainWindow(QMainWindow):
         '''Move selected pieces to a different bed (collision-safe).'''
         if not self._pselection:
             return
+        self._begin_edit("piece-bed", coalesce=True)
         beds = self._project.print_layout.beds
         fps = block_footprints(self._project)
         moved: list[PrintPiece] = []
@@ -2236,6 +2660,7 @@ class MainWindow(QMainWindow):
         '''Apply delta position to selected pieces (collision-safe).'''
         if not self._pselection or self._pprimary is None:
             return
+        self._begin_edit("piece-position", coalesce=True)
         beds = self._project.print_layout.beds
         fps = block_footprints(self._project)
         primary = self._project.print_layout.pieces[self._pprimary]
@@ -2256,6 +2681,9 @@ class MainWindow(QMainWindow):
 
     def _on_piece_flip_changed(self, flipped: bool) -> None:
         '''Set flip state on all selected pieces.'''
+        if not self._pselection:
+            return
+        self._begin_edit("piece-flip")
         for idx in sorted(self._pselection):
             if idx >= len(self._project.print_layout.pieces):
                 continue
@@ -2265,11 +2693,21 @@ class MainWindow(QMainWindow):
 
     def _on_placement_tools_changed(self, tools: PrintToolsSettings) -> None:
         '''Store the placement tools state in the project (persisted JSON).'''
+        self._begin_edit("tools", coalesce=True)
         self._project.print_layout.tools = tools
+        self._mark_dirty()
+
+    def _on_export_settings_changed(self, settings: ExportSettings) -> None:
+        '''Store the placement export settings in the project (persisted JSON).'''
+        self._begin_edit("export-settings", coalesce=True)
+        self._project.export = settings
         self._mark_dirty()
 
     def _on_stage_selection(self) -> None:
         '''Move selected pieces to staging (packed into the free space).'''
+        if not self._pselection:
+            return
+        self._begin_edit("stage-pieces")
         pieces = [
             self._project.print_layout.pieces[idx]
             for idx in sorted(self._pselection)

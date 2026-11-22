@@ -3,7 +3,7 @@ File:   test_app_tabs.py
 Brief:  Integration tests for the MainWindow tab integration (S4).
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -11,15 +11,17 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Iterator
+from typing import Any
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import pytest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
 
 from brickgen.core.project import (  # noqa: E402
     PRINT_STAGING_BED,
     BlockInstance,
+    ExportSettings,
     PrintBedSettings,
     ViewSettings,
 )
@@ -101,7 +103,8 @@ def _reset_state(win: MainWindow) -> None:
 
 def test_tabs_switch_sidebar_and_library(window: MainWindow) -> None:
     '''2 tabs with correct titles; switch to 1 -> sidebar stack index 1,
-    library hidden, quantity actions disabled; back to 0 restores.'''
+    right panel shows the export panel, quantity actions disabled; back to
+    0 restores library + planning state.'''
     QApplication.processEvents()
 
     # Verify tab structure.
@@ -113,14 +116,16 @@ def test_tabs_switch_sidebar_and_library(window: MainWindow) -> None:
     window._tabs.setCurrentIndex(1)
     QApplication.processEvents()
     assert window._sidebar_stack.currentIndex() == 1
-    assert window._library.isHidden()
+    assert window._right_stack.currentIndex() == 1
+    assert window._right_stack.currentWidget() is window._export_panel
     assert not window._act_qty_labels.isEnabled()
 
     # Switch back to tab 0 (planning).
     window._tabs.setCurrentIndex(0)
     QApplication.processEvents()
     assert window._sidebar_stack.currentIndex() == 0
-    assert not window._library.isHidden()
+    assert window._right_stack.currentIndex() == 0
+    assert window._right_stack.currentWidget() is window._library
     assert window._act_qty_labels.isEnabled()
 
 
@@ -445,3 +450,239 @@ def test_enforce_no_overlap_repairs_packed_state(window: MainWindow) -> None:
     )
     assert separated_x or separated_y
     assert pieces[1].bed == 0
+
+
+def _wait_export_done(win: MainWindow, timeout_s: float = 120.0) -> None:
+    '''Pump Qt events until the export job queue drains.'''
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if not win._export_meta:
+            return
+        time.sleep(0.05)
+    pytest.fail(f"Export did not finish within {timeout_s}s")
+
+
+def test_edit_menu_structure(window: MainWindow) -> None:
+    '''The menu bar is File, Edit, View, Grid; Edit carries the shared
+    commands with their shortcuts.'''
+    menubar = window.menuBar()
+    titles = [action.text() for action in menubar.actions()]
+    assert titles == ["&File", "&Edit", "&View", "&Grid"]
+
+    assert window._act_undo.shortcut().toString() == "Ctrl+Z"
+    assert any(s.toString() == "Ctrl+Y" for s in window._act_redo.shortcuts())
+    assert window._act_copy.shortcut().toString() == "Ctrl+C"
+    assert window._act_paste.shortcut().toString() == "Ctrl+V"
+    assert window._act_select_all.shortcut().toString() == "Ctrl+A"
+
+    # A pristine window has no history: undo/redo disabled.
+    window._reset_edit_history()
+    assert window._act_undo.isEnabled() is False
+    assert window._act_redo.isEnabled() is False
+    # Cross-select is a checkable toggle, off by default.
+    assert window._act_cross_select.isCheckable() is True
+    assert window._act_cross_select.isChecked() is False
+
+
+def test_undo_redo_add_block(window: MainWindow) -> None:
+    '''Add block pushes an undo step; undo/redo restore both sides.'''
+    window._tabs.setCurrentIndex(0)
+    _reset_state(window)
+    window._reset_edit_history()
+    window._dirty = False
+    count0 = len(window._project.blocks)
+
+    window._on_add_block()
+    assert len(window._project.blocks) == count0 + 1
+    assert window._act_undo.isEnabled() is True
+    assert window._act_redo.isEnabled() is False
+
+    window._on_undo()
+    assert len(window._project.blocks) == count0
+    assert window._act_redo.isEnabled() is True
+
+    window._on_redo()
+    assert len(window._project.blocks) == count0 + 1
+
+    window._reset_edit_history()
+    window._dirty = False
+
+
+def test_copy_paste_blocks(window: MainWindow) -> None:
+    '''Planning copy/paste appends independent block copies (new uids).'''
+    window._tabs.setCurrentIndex(0)
+    _reset_state(window)
+    window._reset_edit_history()
+    window._dirty = False
+    count0 = len(window._project.blocks)
+
+    window._selection = {0}
+    window._primary = 0
+    window._on_copy()
+    window._on_paste()
+
+    assert len(window._project.blocks) == count0 + 1
+    source = window._project.blocks[0]
+    pasted = window._project.blocks[-1]
+    assert pasted.uid != source.uid
+    assert pasted.cells_x == source.cells_x
+    assert pasted.cells_y == source.cells_y
+    assert pasted.color == source.color
+    assert window._selection == {count0}
+    assert window._primary == count0
+
+    window._reset_edit_history()
+    window._dirty = False
+
+
+def test_copy_paste_pieces_increments_quantity(window: MainWindow) -> None:
+    '''Placement paste adds a physical copy: quantity +1, one new piece.'''
+    window._tabs.setCurrentIndex(1)
+    _reset_state(window)
+    window._reset_edit_history()
+    window._dirty = False
+    pieces0 = len(window._project.print_layout.pieces)
+    qty0 = window._project.blocks[0].quantity
+
+    window._pselection = {0}
+    window._pprimary = 0
+    window._on_copy()
+    window._on_paste()
+
+    pieces = window._project.print_layout.pieces
+    assert window._project.blocks[0].quantity == qty0 + 1
+    assert len(pieces) == pieces0 + 1
+    assert pieces[-1].uid != pieces[0].uid
+    assert pieces[-1].block_uid == pieces[0].block_uid
+
+    window._reset_edit_history()
+    window._dirty = False
+
+
+def test_select_all_blocks_and_pieces(window: MainWindow) -> None:
+    '''Ctrl+A selects every block on planning and every piece on placement.'''
+    _reset_state(window)
+    window._reset_edit_history()
+    window._dirty = False
+
+    # Planning: add one more block, then select all.
+    window._tabs.setCurrentIndex(0)
+    window._project.blocks.append(BlockInstance(cells_x=3, cells_y=2))
+    window._on_select_all()
+    assert window._selection == {0, 1}
+    assert window._primary == 0
+
+    # Placement: two pieces now (one per block), select all.
+    window._tabs.setCurrentIndex(1)
+    window._sync_placement()
+    window._on_select_all()
+    n_pieces = len(window._project.print_layout.pieces)
+    assert n_pieces == 2
+    assert window._pselection == {0, 1}
+    assert window._pprimary == 0
+
+    _reset_state(window)
+    window._dirty = False
+
+
+def test_cross_select_mode(window: MainWindow) -> None:
+    '''Cross-select maps planning block selection to ALL its piece copies.'''
+    _reset_state(window)
+    window._reset_edit_history()
+    window._dirty = False
+    # Two copies of block 0 -> two pieces.
+    window._project.blocks[0].quantity = 2
+    window._sync_placement()
+    assert len(window._project.print_layout.pieces) == 2
+
+    window._tabs.setCurrentIndex(0)
+    window._act_cross_select.setChecked(True)
+    window._selection = {0}
+    window._primary = 0
+
+    window._tabs.setCurrentIndex(1)
+    QApplication.processEvents()
+    assert window._pselection == {0, 1}
+    assert window._pprimary == 0
+
+    # Disabled toggle: switching tabs no longer forces the selection.
+    window._tabs.setCurrentIndex(0)
+    window._act_cross_select.setChecked(False)
+    window._pselection = set()
+    window._pprimary = None
+    window._tabs.setCurrentIndex(1)
+    assert window._pselection == set()
+
+    _reset_state(window)
+    window._dirty = False
+
+
+def test_export_settings_persist_in_project(window: MainWindow) -> None:
+    '''Export panel edits land in the project model (persisted JSON).'''
+    window._tabs.setCurrentIndex(1)
+    _reset_state(window)
+    window._dirty = False
+
+    window._export_panel.set_settings(
+        ExportSettings(format="3MF", tolerance=0.25, per_bed_files=False)
+    )
+    assert window._project.export == ExportSettings()
+    # Panel -> project only via the change signal handler (widget edits):
+    window._export_panel._combo_format.setCurrentText("BREP")
+    assert window._project.export.format == "BREP"
+    assert window._dirty is True
+
+    # Programmatic project sync (open/new/undo path).
+    window._project.export = ExportSettings(format="AMF", tolerance=0.3)
+    window._export_panel.set_settings(window._project.export)
+    assert window._export_panel.collect_settings() == window._project.export
+
+    window._project.export = ExportSettings()
+    window._dirty = False
+
+
+def test_export_print_per_bed_files(
+    window: MainWindow, tmp_path: Any, monkeypatch: Any
+) -> None:
+    '''Per-bed export writes <stem>_bedNN.<ext> using project settings.'''
+    window._tabs.setCurrentIndex(1)
+    _reset_state(window)
+    window._dirty = False
+    window._project.export = ExportSettings(
+        format="STL", tolerance=0.05, per_bed_files=True
+    )
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path)
+    )
+    window._on_export_print()
+    _wait_export_done(window)
+
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["brickgen-layout_bed01.stl"]
+
+    window._project.export = ExportSettings()
+    window._dirty = False
+
+
+def test_export_print_single_file(
+    window: MainWindow, tmp_path: Any, monkeypatch: Any
+) -> None:
+    '''Single-file export writes <stem>.<ext> with all beds combined.'''
+    window._tabs.setCurrentIndex(1)
+    _reset_state(window)
+    window._dirty = False
+    window._project.export = ExportSettings(
+        format="STL", tolerance=0.05, per_bed_files=False
+    )
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path)
+    )
+    window._on_export_print()
+    _wait_export_done(window)
+
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["brickgen-layout.stl"]
+
+    window._project.export = ExportSettings()
+    window._dirty = False

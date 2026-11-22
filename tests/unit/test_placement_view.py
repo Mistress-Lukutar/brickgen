@@ -3,7 +3,7 @@ File:   test_placement_view.py
 Brief:  Offscreen PlacementView tests: zone overlays, scene updates, camera.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -260,15 +260,16 @@ def test_snap_move_target_is_zone_relative(
 ) -> None:
     '''Snap rounds to zone-local grid multiples, not world origin ones.
 
-    Bed 1 origin x = 220 + 20 (BED_GAP_MM) = 240; default step = 4 * 0.5
-    = 2 mm.  Staging origin x = -240.
+    3 beds form a 2x2 grid numbered top-down: bed 1 origin = (220 + 20,
+    220 + 20) = (240, 240); default step = 4 * 0.5 = 2 mm.  Staging sits
+    left of bed 0 in the top row: origin = (-240, 240).
     '''
     view = placement_view_three_beds
-    # Bed 1: local 13.4 -> 14 (world 254); y 6.6 -> 6.
-    x, y = view._snap_move_target(253.4, 6.6)
+    # Bed 1: local 13.4 -> 14 (world 254); y 6.6 -> 6 (world 246).
+    x, y = view._snap_move_target(253.4, 246.6)
     assert x == pytest.approx(254.0)
-    assert y == pytest.approx(6.0)
-    # Staging: local 13.4 -> 14 (world -226).
-    x, y = view._snap_move_target(-226.6, 0.0)
+    assert y == pytest.approx(246.0)
+    # Staging: local 13.4 -> 14 (world -226); y stays on the row origin.
+    x, y = view._snap_move_target(-226.6, 240.0)
     assert x == pytest.approx(-226.0)
-    assert y == pytest.approx(0.0)
+    assert y == pytest.approx(240.0)

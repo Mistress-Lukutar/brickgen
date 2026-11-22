@@ -3,7 +3,7 @@ File:   project.py
 Brief:  Project and placed-block models for the multi-block GUI scene.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -56,6 +56,12 @@ QUANTITY_LABEL_POSITIONS: tuple[str, ...] = ("left", "right", "top", "bottom")
 GRID_SCALE_PRESETS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
 
 _GRID_SCALE_MAX = 1000.0
+
+# Export format names offered by the placement-tab export panel. Plain
+# strings only: the cadquery ExportTypes mapping lives in
+# ``services.export_service.SUPPORTED_FORMATS`` and must stay keyed by
+# exactly these names (core never imports services).
+EXPORT_FORMATS: tuple[str, ...] = ("STEP", "STL", "AMF", "3MF", "SVG", "VRML", "BREP")
 
 # Print-placement piece.bed value meaning "not placed on any bed".
 PRINT_STAGING_BED = -1
@@ -398,6 +404,53 @@ class PrintToolsSettings(BaseModel):
     )
 
 
+class ExportSettings(BaseModel):
+    '''Per-project print-layout export configuration (placement tab panel).
+
+    Everything the placement-tab export panel edits: the mesh precision,
+    the output file format and whether each bed is written to its own
+    file or every bed is combined into one file. The values travel inside
+    the project file, so every project restores its own export defaults
+    on open. The angular mesh tolerance stays application-level
+    (``AppSettings.export_angular_tolerance``).
+
+    Model config:
+        extra: "forbid" — rejects unknown keys to catch payload typos.
+    '''
+
+    model_config = {"extra": "forbid"}
+
+    format: str = Field(
+        default="STL",
+        description="Export file format (one of ``EXPORT_FORMATS``).",
+    )
+    tolerance: float = Field(
+        default=0.1,
+        gt=0,
+        le=1.0,
+        description="Mesh tessellation tolerance for tessellated formats, mm.",
+    )
+    per_bed_files: bool = Field(
+        default=True,
+        description=(
+            "True writes one file per bed (<stem>_bedNN.ext); False writes "
+            "every bed's pieces into a single file (<stem>.ext) at their "
+            "world positions."
+        ),
+    )
+
+    @field_validator("format")
+    @classmethod
+    def _validate_format(cls, value: str) -> str:
+        '''Restrict the export format to the supported name set.'''
+        normalized = value.strip().upper()
+        if normalized not in EXPORT_FORMATS:
+            raise SettingsValidationError(
+                f"format must be one of {', '.join(EXPORT_FORMATS)}"
+            )
+        return normalized
+
+
 class PrintLayout(BaseModel):
     '''Print-placement state of a project: bed configuration, pieces and
     the auto-place tools state.'''
@@ -525,6 +578,13 @@ class Project(BaseModel):
             "BOM quantity labels (View/Grid menu state)."
         ),
     )
+    export: ExportSettings = Field(
+        default_factory=ExportSettings,
+        description=(
+            "Per-project export configuration: mesh precision, file format "
+            "and per-bed vs single-file output (placement export panel)."
+        ),
+    )
 
     def block_settings(self, index: int) -> BlockSettings:
         '''Full BlockSettings of the placed block at *index*.
@@ -557,6 +617,8 @@ __all__ = [
     "PrintToolsSettings",
     "PrintLayout",
     "ViewSettings",
+    "ExportSettings",
+    "EXPORT_FORMATS",
     "QuantityLabelPosition",
     "QUANTITY_LABEL_POSITIONS",
     "GRID_SCALE_PRESETS",

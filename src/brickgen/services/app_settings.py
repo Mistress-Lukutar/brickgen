@@ -3,7 +3,7 @@ File:   app_settings.py
 Brief:  Persistent application preferences (precisions, default format).
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.18.0
+Version: v0.19.0
 '''
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ class AppSettings(BaseModel):
         export_tolerance: Mesh tolerance for tessellated export formats
             (STL/AMF/3MF), mm.
         default_format: Format preselected in the export dialog.
+        undo_depth: Maximum number of undo (Ctrl+Z) steps kept in the
+            edit history shared by the planning and placement tabs.
     '''
 
     preview_tolerance: float = Field(default=0.15, gt=0, le=1.0)
@@ -40,6 +42,7 @@ class AppSettings(BaseModel):
     export_tolerance: float = Field(default=0.1, gt=0, le=1.0)
     export_angular_tolerance: float = Field(default=0.1, gt=0, le=1.0)
     default_format: str = "STEP"
+    undo_depth: int = Field(default=50, ge=1, le=500)
 
     model_config = {"extra": "forbid"}
 
