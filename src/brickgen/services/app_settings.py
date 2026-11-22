@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
@@ -17,6 +18,8 @@ from pydantic import BaseModel, Field, field_validator
 from brickgen.services.export_service import SUPPORTED_FORMATS
 
 logger = logging.getLogger(__name__)
+
+MAX_RECENT_PROJECTS = 10
 
 
 class AppSettings(BaseModel):
@@ -35,6 +38,8 @@ class AppSettings(BaseModel):
         default_format: Format preselected in the export dialog.
         undo_depth: Maximum number of undo (Ctrl+Z) steps kept in the
             edit history shared by the planning and placement tabs.
+        recent_projects: Absolute paths of recently opened/saved project
+            files, newest first (start screen and File > Open Recent).
     '''
 
     preview_tolerance: float = Field(default=0.15, gt=0, le=1.0)
@@ -43,8 +48,37 @@ class AppSettings(BaseModel):
     export_angular_tolerance: float = Field(default=0.1, gt=0, le=1.0)
     default_format: str = "STEP"
     undo_depth: int = Field(default=50, ge=1, le=500)
+    recent_projects: list[str] = Field(default_factory=list)
 
-    model_config = {"extra": "forbid"}
+    # validate_assignment keeps recent_projects deduped/capped on direct
+    # field writes (e.g. _add_recent_project in the GUI), not just on load.
+    model_config = {"extra": "forbid", "validate_assignment": True}
+
+    @field_validator("recent_projects", mode="before")
+    @classmethod
+    def _clean_recent_projects(cls, value: object) -> list[str]:
+        '''Normalize the recent list: absolute paths, deduped, capped.
+
+        Empty or non-string entries are dropped, paths are made absolute,
+        duplicates are removed case-insensitively (first occurrence wins, so
+        the newest entry keeps its position) and the list is trimmed to
+        ``MAX_RECENT_PROJECTS``. Normalizing instead of rejecting keeps one
+        bad entry from invalidating the whole settings file.
+        '''
+        if not isinstance(value, list):
+            return []
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            path = str(Path(item).expanduser().resolve())
+            key = os.path.normcase(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(path)
+        return cleaned[:MAX_RECENT_PROJECTS]
 
     @field_validator("default_format")
     @classmethod

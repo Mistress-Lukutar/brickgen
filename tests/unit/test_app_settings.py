@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from brickgen.services import app_settings as asm
 from brickgen.services.app_settings import (
+    MAX_RECENT_PROJECTS,
     AppSettings,
     app_settings_path,
     load_app_settings,
@@ -122,3 +124,56 @@ def test_undo_depth_roundtrip(isolated_settings: Path) -> None:
     '''A saved undo depth is restored verbatim by load_app_settings.'''
     save_app_settings(AppSettings(undo_depth=123))
     assert load_app_settings().undo_depth == 123
+
+
+def test_recent_projects_default_empty_and_roundtrip(isolated_settings: Path) -> None:
+    '''recent_projects defaults to an empty list and persists verbatim.'''
+    assert AppSettings().recent_projects == []
+    paths = [str(Path.home() / "one.json"), str(Path.home() / "two.json")]
+    save_app_settings(AppSettings(recent_projects=paths))
+    assert load_app_settings().recent_projects == [
+        str(Path.home() / "one.json"),
+        str(Path.home() / "two.json"),
+    ]
+
+
+def test_recent_projects_normalized_deduped_capped(tmp_path: Path) -> None:
+    '''The validator makes paths absolute, drops junk, dedupes and caps.'''
+    entries: list[Any] = [
+        str(tmp_path / "a.json"),
+        str(tmp_path / "a.json"),  # exact duplicate -> dropped
+        str(tmp_path / "A.json"),  # case-insensitive duplicate -> dropped
+        "",  # empty -> dropped
+        "   ",  # whitespace-only -> dropped
+        42,  # non-string -> dropped
+        None,  # non-string -> dropped
+        str(tmp_path / "b.json"),
+    ]
+    result = AppSettings(recent_projects=entries).recent_projects
+    assert result == [str(tmp_path / "a.json"), str(tmp_path / "b.json")]
+
+    many = [str(tmp_path / f"p{i}.json") for i in range(12)]
+    capped = AppSettings(recent_projects=many).recent_projects
+    assert len(capped) == MAX_RECENT_PROJECTS == 10
+    assert [Path(p) for p in capped] == [tmp_path / f"p{i}.json" for i in range(10)]
+
+
+def test_recent_projects_relative_paths_made_absolute(tmp_path: Path) -> None:
+    '''Relative and non-list payloads still yield a sane list.'''
+    settings = AppSettings(recent_projects=["a.json"])
+    assert len(settings.recent_projects) == 1
+    assert Path(settings.recent_projects[0]).is_absolute()
+
+    assert AppSettings(recent_projects="oops").recent_projects == []  # type: ignore[arg-type]
+
+
+def test_recent_projects_junk_file_entries(
+    isolated_settings: Path, tmp_path: Path
+) -> None:
+    '''A settings file with junk recent entries loads with them cleaned.'''
+    save_app_settings(AppSettings())
+    payload = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    payload["recent_projects"] = [1, None, "", "   ", str(tmp_path / "p.json")]
+    isolated_settings.write_text(json.dumps(payload), encoding="utf-8")
+    loaded = load_app_settings()
+    assert [Path(p) for p in loaded.recent_projects] == [tmp_path / "p.json"]

@@ -79,6 +79,7 @@ from brickgen.gui.preview import (
     mesh_from_arrays,
     piece_variant_mesh,
 )
+from brickgen.gui.start_dialog import StartDialog
 from brickgen.services.app_settings import load_app_settings, save_app_settings
 from brickgen.services.placement_service import (
     auto_place,
@@ -116,10 +117,23 @@ class MainWindow(QMainWindow):
     regenerates automatically after any geometry change.
     '''
 
-    def __init__(self) -> None:
-        '''Build the layout and render the default one-block project.'''
+    def __init__(self, defer_start: bool = False) -> None:
+        '''Build the layout and render the default one-block project.
+
+        Args:
+            defer_start: Real-app startup mode. The initial scene
+                generation is paused until the startup modal resolves, so
+                the empty viewport (grid only) stays behind it; see
+                ``maybe_show_start_dialog``. Tests construct with the
+                default, which generates immediately.
+        '''
         super().__init__()
         self._app_settings = load_app_settings()
+        # Boot guard: the initial placement sync adds the default pieces and
+        # would flag the untouched project dirty (unsaved-changes prompt on
+        # close, [*] in the title) with zero user edits.
+        self._booting = True
+        self._generation_paused = defer_start
         self._project = Project(blocks=[BlockInstance()])
         self._project_path: Path | None = None
         self._dirty = False
@@ -231,13 +245,17 @@ class MainWindow(QMainWindow):
 
         self._sync_all()
         self._connect_auto_generate()
-        self._on_generate()
+        if not self._generation_paused:
+            self._on_generate()
 
         # Placement view init.
         self._placement_view.set_print_beds(self._project.print_layout.beds)
         self._placement_panel.set_beds(self._project.print_layout.beds)
         self._placement_panel.set_tools(self._project.print_layout.tools)
         self._tabs.currentChanged.connect(self._on_tab_changed)
+
+        self._booting = False
+        self._mark_clean()  # fresh start: an untouched project is clean
 
     # ------------------------------------------------------------------ tabs
 
@@ -302,6 +320,8 @@ class MainWindow(QMainWindow):
         act_open.setShortcut(QKeySequence.StandardKey.Open)
         act_open.triggered.connect(self._on_open_project)
         file_menu.addAction(act_open)
+        self._recent_menu = file_menu.addMenu("Open &Recent")
+        self._rebuild_recent_menu()
         act_save = QAction("&Save Project", self)
         act_save.setShortcut(QKeySequence.StandardKey.Save)
         act_save.triggered.connect(self._on_save_project)
@@ -947,20 +967,36 @@ class MainWindow(QMainWindow):
         self._on_generate()
         self._set_status("New project created.")
 
-    def _on_open_project(self) -> None:
-        '''Load a project file into the window and regenerate the scene.'''
+    def _on_open_project(self) -> bool:
+        '''Load a project file into the window and regenerate the scene.
+
+        Returns:
+            True when a project was loaded; False when the action was
+            cancelled or declined.
+        '''
         if not self._confirm_discard():
-            return
+            return False
         path, _ = QFileDialog.getOpenFileName(
             self, "Open project", self._default_project_dir(), _PROJECT_FILETYPES
         )
         if not path:
-            return
+            return False
+        return self._load_project_path(path)
+
+    def _load_project_path(self, path: str) -> bool:
+        '''Load *path* into the window and regenerate the scene.
+
+        Shared by the File > Open dialog, the File > Open Recent submenu and
+        the startup dialog's recent list.
+
+        Returns:
+            True when the project was loaded successfully.
+        '''
         try:
             project = load_project(Path(path))
         except BrickGenError as exc:
             QMessageBox.critical(self, "Open failed", str(exc))
-            return
+            return False
         self._project = project
         self._project_path = Path(path)
         self._applied_context = None
@@ -985,7 +1021,69 @@ class MainWindow(QMainWindow):
         finally:
             self._syncing_ui = False
         self._on_generate()
+        self._add_recent_project(Path(path))
         self._set_status(f"Project opened: {Path(path).name}")
+        return True
+
+    def _add_recent_project(self, path: Path) -> None:
+        '''Record *path* as the newest recent project and persist settings.'''
+        self._app_settings.recent_projects = [
+            str(path),
+            *self._app_settings.recent_projects,
+        ]
+        self._save_app_settings()
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self) -> None:
+        '''Repopulate the File > Open Recent submenu from the settings.'''
+        menu = self._recent_menu
+        menu.clear()
+        entries = self._app_settings.recent_projects
+        for entry in entries:
+            act = menu.addAction(Path(entry).name)
+            act.setData(entry)
+            act.setEnabled(Path(entry).is_file())
+            act.triggered.connect(
+                lambda checked=False, p=entry: self._on_open_recent(p)
+            )
+        menu.addSeparator()
+        act_clear = menu.addAction("Clear Recent List")
+        act_clear.setEnabled(bool(entries))
+        act_clear.triggered.connect(self._on_clear_recent)
+
+    def _on_open_recent(self, path: str) -> None:
+        '''Open a project picked from the File > Open Recent submenu.'''
+        if not self._confirm_discard():
+            return
+        self._load_project_path(path)
+
+    def _on_clear_recent(self) -> None:
+        '''Empty the recent project list.'''
+        self._app_settings.recent_projects = []
+        self._save_app_settings()
+        self._rebuild_recent_menu()
+
+    def maybe_show_start_dialog(self) -> None:
+        '''Show the startup modal (called from ``main()`` after the window
+        shows).
+
+        Scene generation is paused until the modal resolves, so the
+        viewport behind it stays empty (grid only). Every exit builds a
+        scene: the chosen/recent project, or the default 1x1 project for
+        "new", Esc and cancelled open dialogs.
+        '''
+        dialog = StartDialog(self._app_settings.recent_projects, self)
+        dialog.exec()
+        self._generation_paused = False
+        loaded = False
+        if dialog.choice == "open":
+            loaded = self._on_open_project()
+        elif dialog.choice == "recent" and dialog.recent_path:
+            if self._confirm_discard():
+                loaded = self._load_project_path(dialog.recent_path)
+        if not loaded:
+            self._on_generate()
+            self._set_status("New project created.")
 
     def _on_save_project(self) -> None:
         '''Save the project under its current path (Save As when untitled).'''
@@ -1024,6 +1122,7 @@ class MainWindow(QMainWindow):
             return False
         self._project_path = Path(target)
         self._mark_clean()
+        self._add_recent_project(Path(target))
         self._set_status(f"Project saved: {written.name}")
         return True
 
@@ -1931,7 +2030,13 @@ class MainWindow(QMainWindow):
         self._update_derived_label()
 
     def _mark_dirty(self) -> None:
-        '''Flag the project as modified (window title marker).'''
+        '''Flag the project as modified (window title marker).
+
+        Ignored while ``_booting`` is set: programmatic updates during
+        construction must not count as user edits.
+        '''
+        if self._booting:
+            return
         self._dirty = True
         self.setWindowModified(True)
 
@@ -2102,6 +2207,10 @@ class MainWindow(QMainWindow):
         only edited blocks change their preview actors, structural and
         shared-geometry edits rebuild the whole scene.
         '''
+        if self._generation_paused:
+            # Start-screen pause: the viewport stays empty (grid only)
+            # until the startup modal resolves.
+            return
         try:
             shared = self._collect_shared_settings()
         except BrickGenError as exc:
@@ -2730,8 +2839,12 @@ def main() -> None:
     )
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(defer_start=True)
     window.showMaximized()
+    # Startup modal over the empty grid scene; singleShot so the main loop
+    # is running when the dialog opens. Scene generation starts once the
+    # modal resolves (see maybe_show_start_dialog).
+    QTimer.singleShot(0, window.maybe_show_start_dialog)
     sys.exit(app.exec())
 
 

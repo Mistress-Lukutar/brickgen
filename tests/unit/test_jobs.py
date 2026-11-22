@@ -385,6 +385,11 @@ def test_app_generation_and_export_smoke():
 
     w = MainWindow()
 
+    # A freshly constructed window is clean: closing without edits must not
+    # raise the unsaved-changes prompt (boot syncs never count as edits).
+    assert w._dirty is False
+    assert w.isWindowModified() is False
+
     # Initial auto-generation completes on the queue (applied context set).
     # NOTE: startup fires _on_generate twice (explicit call + debounced timer
     # from form sync), so the applied key is 'gen2' — latest-wins in action.
@@ -422,6 +427,53 @@ def test_app_generation_and_export_smoke():
 
     _wait_until(lambda: job_id not in w._export_meta, timeout=120.0)
     assert Path(out).exists() and Path(out).stat().st_size > 0
+
+    w._mark_clean()
+    w.close()
+    w._jobs.close()
+
+
+# ===========================================================================
+# Test 11: test_app_deferred_start_scene
+# ===========================================================================
+
+
+def test_app_deferred_start_scene(monkeypatch):
+    """defer_start keeps the scene empty until the start modal resolves.
+
+    Real-app startup mode: MainWindow(defer_start=True) must not render the
+    default block behind the startup dialog; the scene appears only when
+    the dialog flow lifts the pause.
+    """
+    _ensure_app()
+
+    from brickgen.gui.app import MainWindow
+
+    w = MainWindow(defer_start=True)
+    assert w._generation_paused is True
+    assert w._applied_context is None
+    assert not w._preview._block_actors  # empty viewport behind the modal
+
+    # The paused _on_generate is a no-op (the debounced boot timer hits it
+    # too, so no spurious generation may start behind the modal).
+    seq = w._gen_seq
+    w._on_generate()
+    assert w._applied_context is None
+    assert w._gen_seq == seq
+
+    # "New project" in the startup modal unpauses and builds the scene.
+    class _StubDialog:
+        def __init__(self, recent, parent=None):
+            self.choice = "new"
+            self.recent_path = None
+
+        def exec(self):
+            return 1
+
+    monkeypatch.setattr("brickgen.gui.app.StartDialog", _StubDialog)
+    w.maybe_show_start_dialog()
+    _wait_until(lambda: w._applied_context is not None, timeout=180.0)
+    assert len(w._preview._block_actors) >= 1
 
     w._mark_clean()
     w.close()

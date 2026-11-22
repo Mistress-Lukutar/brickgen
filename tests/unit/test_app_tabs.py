@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -26,6 +27,8 @@ from brickgen.core.project import (  # noqa: E402
     ViewSettings,
 )
 from brickgen.gui.app import MainWindow  # noqa: E402
+from brickgen.services import app_settings as asm  # noqa: E402
+from brickgen.services.app_settings import AppSettings  # noqa: E402
 from brickgen.services.placement_service import (  # noqa: E402
     BED_GAP_MM,
     block_footprints,
@@ -34,6 +37,7 @@ from brickgen.services.placement_service import (  # noqa: E402
     sync_pieces,
     world_position,
 )
+from brickgen.services.project_io import save_project  # noqa: E402
 
 # vtk 9.6 numpy_support sets .shape on arrays, deprecated in numpy 2.5; the
 # warning fires from the preview pipeline exercised by the app smoke test.
@@ -686,3 +690,187 @@ def test_export_print_single_file(
 
     window._project.export = ExportSettings()
     window._dirty = False
+
+
+# ===========================================================================
+# Project open, recent projects and the startup dialog wiring
+
+
+def _isolate_settings(window: MainWindow, monkeypatch: Any, tmp_path: Any) -> None:
+    '''Redirect app-settings persistence to tmp; start from a clean list.'''
+    monkeypatch.setattr(
+        asm, "app_settings_path", lambda: Path(tmp_path) / "settings.json"
+    )
+    window._app_settings = AppSettings()
+    window._rebuild_recent_menu()
+
+
+def test_load_project_path_loads_and_records_recent(
+    window: MainWindow, tmp_path: Path, monkeypatch: Any
+) -> None:
+    '''_load_project_path loads a saved project and records it as recent.'''
+    _reset_state(window)
+    _isolate_settings(window, monkeypatch, tmp_path)
+    path = tmp_path / "proj.json"
+    save_project(window._project, path)
+
+    assert window._load_project_path(str(path)) is True
+    assert window._project_path == path
+    assert window._dirty is False
+    assert [Path(p) for p in window._app_settings.recent_projects] == [path]
+    names = [a.text() for a in window._recent_menu.actions() if not a.isSeparator()]
+    assert names == ["proj.json", "Clear Recent List"]
+
+    _wait_applied(window)  # scene regenerated for the tests that follow
+    window._dirty = False
+
+
+def test_load_project_path_invalid_file(
+    window: MainWindow, tmp_path: Path, monkeypatch: Any
+) -> None:
+    '''A corrupt file reports the failure and keeps the current project.'''
+    _reset_state(window)
+    _isolate_settings(window, monkeypatch, tmp_path)
+    before = window._project
+    bad = tmp_path / "broken.json"
+    bad.write_text("{nope", encoding="utf-8")
+    boxes: list[str] = []
+    monkeypatch.setattr(
+        "brickgen.gui.app.QMessageBox.critical",
+        lambda *a, **k: boxes.append(str(a[2])),
+    )
+
+    assert window._load_project_path(str(bad)) is False
+    assert len(boxes) == 1
+    assert "Invalid JSON" in boxes[0]
+    assert window._project is before
+    window._dirty = False
+
+
+def test_recent_menu_dedupe_missing_clear(
+    window: MainWindow, tmp_path: Path, monkeypatch: Any
+) -> None:
+    '''Recent list dedupes, disables missing files and clears on request.'''
+    _reset_state(window)
+    _isolate_settings(window, monkeypatch, tmp_path)
+    path = tmp_path / "one.json"
+    save_project(window._project, path)
+
+    window._add_recent_project(path)
+    window._add_recent_project(path)  # duplicate -> still one entry
+    assert [Path(p) for p in window._app_settings.recent_projects] == [path]
+    actions = {
+        a.text(): a for a in window._recent_menu.actions() if not a.isSeparator()
+    }
+    assert set(actions) == {"one.json", "Clear Recent List"}
+    assert actions["one.json"].isEnabled()
+
+    ghost = tmp_path / "ghost.json"  # never created
+    window._add_recent_project(ghost)
+    actions = {
+        a.text(): a for a in window._recent_menu.actions() if not a.isSeparator()
+    }
+    assert not actions["ghost.json"].isEnabled()
+
+    window._on_clear_recent()
+    assert window._app_settings.recent_projects == []
+    actions = {
+        a.text(): a for a in window._recent_menu.actions() if not a.isSeparator()
+    }
+    assert set(actions) == {"Clear Recent List"}
+    assert not actions["Clear Recent List"].isEnabled()
+    window._dirty = False
+
+
+def test_maybe_show_start_dialog_new(
+    window: MainWindow, tmp_path: Path, monkeypatch: Any
+) -> None:
+    '''A "new" choice keeps the untitled default project loaded.'''
+    _reset_state(window)
+    _isolate_settings(window, monkeypatch, tmp_path)
+    window._dirty = False  # _reset_state marks the scene dirty via sync
+    window._project_path = None  # simulate the fresh-startup state
+    calls: list[str] = []
+
+    class _StubDialog:
+        def __init__(self, recent: list[str], parent: Any = None) -> None:
+            self.choice = "new"
+            self.recent_path = None
+
+        def exec(self) -> int:
+            calls.append("exec")
+            return 1
+
+    monkeypatch.setattr("brickgen.gui.app.StartDialog", _StubDialog)
+    window.maybe_show_start_dialog()
+    assert calls == ["exec"]
+    assert window._project_path is None
+    assert window._dirty is False
+
+
+def test_maybe_show_start_dialog_open(
+    window: MainWindow, tmp_path: Path, monkeypatch: Any
+) -> None:
+    '''An "open" choice runs the regular open flow (file dialog next).'''
+    _reset_state(window)
+    _isolate_settings(window, monkeypatch, tmp_path)
+    window._dirty = False  # _confirm_discard would open a blocking modal
+    path = tmp_path / "opened.json"
+    save_project(window._project, path)
+
+    class _StubDialog:
+        def __init__(self, recent: list[str], parent: Any = None) -> None:
+            self.choice = "open"
+            self.recent_path = None
+
+        def exec(self) -> int:
+            return 1
+
+    monkeypatch.setattr("brickgen.gui.app.StartDialog", _StubDialog)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    window.maybe_show_start_dialog()
+    assert window._project_path == path
+    _wait_applied(window)
+    window._dirty = False
+
+
+def test_maybe_show_start_dialog_recent(
+    window: MainWindow, tmp_path: Path, monkeypatch: Any
+) -> None:
+    '''A "recent" choice loads the picked project directly.'''
+    _reset_state(window)
+    _isolate_settings(window, monkeypatch, tmp_path)
+    window._dirty = False  # _confirm_discard would open a blocking modal
+    path = tmp_path / "picked.json"
+    save_project(window._project, path)
+
+    class _StubDialog:
+        def __init__(self, recent: list[str], parent: Any = None) -> None:
+            self.choice = "recent"
+            self.recent_path = str(path)
+
+        def exec(self) -> int:
+            return 1
+
+    monkeypatch.setattr("brickgen.gui.app.StartDialog", _StubDialog)
+    window.maybe_show_start_dialog()
+    assert window._project_path == path
+    _wait_applied(window)
+    window._dirty = False
+
+
+def test_mark_dirty_boot_guard(window: MainWindow) -> None:
+    '''_mark_dirty is a no-op while _booting is set: the boot-time piece
+    sync must not flag the untouched project dirty (unsaved-changes prompt
+    on close, [*] in the title).'''
+    _reset_state(window)
+    window._mark_clean()  # _reset_state itself dirties via the piece sync
+    window._booting = True
+    window._mark_dirty()
+    assert window._dirty is False
+    window._booting = False
+    window._mark_dirty()
+    assert window._dirty is True
+    window._mark_clean()
+    assert window._dirty is False
+    assert window.isWindowModified() is False
