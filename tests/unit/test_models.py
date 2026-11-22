@@ -3,7 +3,7 @@ File:   test_models.py
 Brief:  Unit tests for BlockSettings validation and derived properties.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.16.0
+Version: v0.17.0
 '''
 
 from __future__ import annotations

@@ -4,7 +4,7 @@ Brief:  Left-sidebar panel for the print-placement tab: bed configuration,
         placement tools and the selected-piece inspector.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.16.0
+Version: v0.17.0
 '''
 
 from __future__ import annotations
@@ -26,10 +26,6 @@ from PySide6.QtWidgets import (
 )
 
 from brickgen.core.project import PRINT_STAGING_BED, PrintBedSettings, PrintPiece
-from brickgen.services.placement_service import (
-    DISTRIBUTE_BY_COLOR,
-    DISTRIBUTE_EVEN,
-)
 
 
 class PlacementPanel(QWidget):
@@ -37,8 +33,8 @@ class PlacementPanel(QWidget):
     placement tools and the selected-piece inspector.'''
 
     beds_changed = Signal(object)  # PrintBedSettings
-    auto_place_requested = Signal(object)  # list[int] 0-based bed indices
-    distribute_requested = Signal(str, object)  # mode str, list[int]
+    # list[int] 0-based bed indices, "Distribute by color", "Distribute evenly"
+    auto_place_requested = Signal(object, bool, bool)
     piece_bed_changed = Signal(int)  # target bed index or PRINT_STAGING_BED
     piece_position_changed = Signal(float, float)  # delta for primary's zone-local pos
     piece_flip_changed = Signal(bool)  # flip state for ALL selected pieces
@@ -129,23 +125,28 @@ class PlacementPanel(QWidget):
 
         tools_layout.addLayout(from_to_row)
 
+        # Auto-place modifiers (not separate operations): the checkboxes
+        # shape how the single Auto-place button packs the bed range.
+        self._cb_by_color = QCheckBox("Distribute by color")
+        self._cb_by_color.setChecked(True)
+        self._cb_by_color.setToolTip(
+            "Auto-place never mixes piece colors on one bed (one print job per color)."
+        )
+        tools_layout.addWidget(self._cb_by_color)
+
+        self._cb_even = QCheckBox("Distribute evenly")
+        self._cb_even.setChecked(True)
+        self._cb_even.setToolTip(
+            "Auto-place spreads pieces across all selected beds instead of "
+            "filling one bed before moving to the next."
+        )
+        tools_layout.addWidget(self._cb_even)
+
         # Full-width stacked buttons: a horizontal row of three would force
         # a panel width far beyond the sidebar slot and clip on the right.
         self._btn_auto_place = QPushButton("Auto-place (selected beds)")
         self._btn_auto_place.clicked.connect(self._on_auto_place)
         tools_layout.addWidget(self._btn_auto_place)
-
-        self._btn_distribute_color = QPushButton("Distribute by color")
-        self._btn_distribute_color.clicked.connect(
-            lambda: self._on_distribute(DISTRIBUTE_BY_COLOR)
-        )
-        tools_layout.addWidget(self._btn_distribute_color)
-
-        self._btn_distribute_even = QPushButton("Distribute evenly")
-        self._btn_distribute_even.clicked.connect(
-            lambda: self._on_distribute(DISTRIBUTE_EVEN)
-        )
-        tools_layout.addWidget(self._btn_distribute_even)
 
         inner.addWidget(self._tools_group)
 
@@ -251,15 +252,13 @@ class PlacementPanel(QWidget):
         '''Emit auto-place request for the selected bed range.
 
         The spinboxes display 1-based bed numbers (as the viewport labels
-        do); the signal carries 0-based bed indices.
+        do); the signal carries 0-based bed indices plus the states of the
+        two modifier checkboxes ("Distribute by color", "Distribute evenly").
         '''
         beds = list(range(self._spin_from.value() - 1, self._spin_to.value()))
-        self.auto_place_requested.emit(beds)
-
-    def _on_distribute(self, mode: str) -> None:
-        '''Emit distribute request for the selected bed range (0-based).'''
-        beds = list(range(self._spin_from.value() - 1, self._spin_to.value()))
-        self.distribute_requested.emit(mode, beds)
+        self.auto_place_requested.emit(
+            beds, self._cb_by_color.isChecked(), self._cb_even.isChecked()
+        )
 
     # --- Piece inspector handlers ---
 

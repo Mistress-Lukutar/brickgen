@@ -3,7 +3,7 @@ File:   test_placement_view.py
 Brief:  Offscreen PlacementView tests: zone overlays, scene updates, camera.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.16.0
+Version: v0.17.0
 '''
 
 from __future__ import annotations

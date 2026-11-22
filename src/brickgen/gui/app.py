@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.16.0
+Version: v0.17.0
 '''
 
 from __future__ import annotations
@@ -82,7 +82,6 @@ from brickgen.services.placement_service import (
     block_colors,
     block_footprints,
     clamp_into_zone,
-    distribute,
     fallback_spot,
     find_free_spot,
     local_position,
@@ -663,9 +662,6 @@ class MainWindow(QMainWindow):
         self._placement_panel.beds_changed.connect(self._on_placement_beds_changed)
         self._placement_panel.auto_place_requested.connect(
             self._on_placement_auto_place
-        )
-        self._placement_panel.distribute_requested.connect(
-            self._on_placement_distribute
         )
         self._placement_panel.piece_bed_changed.connect(self._on_piece_bed_changed)
         self._placement_panel.piece_position_changed.connect(
@@ -1934,8 +1930,8 @@ class MainWindow(QMainWindow):
     def _enforce_no_overlap(self) -> None:
         '''Repair any overlapping piece pair before the scene renders.
 
-        Belt-and-braces after packing: auto_place/distribute are
-        fuzz-verified overlap-free, but this guarantees the no-overlap
+        Belt-and-braces after packing: auto_place is fuzz-verified
+        overlap-free, but this guarantees the no-overlap
         invariant for EVERY path that reaches the viewport — a piece that
         overlaps another in its zone shifts to the nearest free spot (or
         staging when full) exactly like a repaired manual move.
@@ -2183,9 +2179,14 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
         self._sync_placement()
 
-    def _on_placement_auto_place(self, indices: list[int]) -> None:
-        '''Handle auto-place request.'''
-        report = auto_place(self._project, indices)
+    def _on_placement_auto_place(
+        self,
+        indices: list[int],
+        by_color: bool = True,
+        even: bool = True,
+    ) -> None:
+        '''Handle auto-place request (modifiers from the panel checkboxes).'''
+        report = auto_place(self._project, indices, by_color=by_color, even=even)
         self._enforce_no_overlap()
         self._mark_dirty()
         self._refresh_placement_scene()
@@ -2200,25 +2201,6 @@ class MainWindow(QMainWindow):
         if self._tabs.currentIndex() == 1:
             self._set_status(
                 f"Auto-placed {report.placed} pieces ({report.staged} staged)"
-            )
-
-    def _on_placement_distribute(self, mode: str, indices: list[int]) -> None:
-        '''Handle distribute request.'''
-        report = distribute(self._project, mode, indices)
-        self._enforce_no_overlap()
-        self._mark_dirty()
-        self._refresh_placement_scene()
-        self._placement_panel.sync_inspector(
-            self._project.print_layout.pieces,
-            block_footprints(self._project),
-            block_colors(self._project),
-            self._project.blocks,
-            self._pselection,
-            self._pprimary,
-        )
-        if self._tabs.currentIndex() == 1:
-            self._set_status(
-                f"Distributed {report.placed} pieces ({report.staged} staged)"
             )
 
     def _on_piece_bed_changed(self, bed: int) -> None:

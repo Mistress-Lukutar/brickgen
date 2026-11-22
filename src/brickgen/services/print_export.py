@@ -3,7 +3,7 @@ File:   print_export.py
 Brief:  Assembly and export of print-bed compounds from the placement layout.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.16.0
+Version: v0.17.0
 '''
 
 from __future__ import annotations

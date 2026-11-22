@@ -3,7 +3,7 @@ File:   test_placement_service.py
 Brief:  Unit tests for print-placement layout engine.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.16.0
+Version: v0.17.0
 '''
 
 from __future__ import annotations
@@ -20,14 +20,11 @@ from brickgen.core.project import (
     Project,
 )
 from brickgen.services.placement_service import (
-    DISTRIBUTE_BY_COLOR,
-    DISTRIBUTE_EVEN,
     auto_place,
     bed_origin,
     block_colors,
     block_footprints,
     clamp_into_zone,
-    distribute,
     find_free_spot,
     fits_bed,
     local_position,
@@ -410,7 +407,7 @@ def test_sync_pieces_different_footprints_no_overlap() -> None:
     assert small_p.position_y == pytest.approx(8.0)
 
 
-def test_distribute_by_color_unknown_uid_staged() -> None:
+def test_auto_place_by_color_unknown_uid_staged() -> None:
     '''FIX-3: piece with unknown block_uid goes to staging in by_color mode.'''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0)
     proj = _make_project(
@@ -421,7 +418,7 @@ def test_distribute_by_color_unknown_uid_staged() -> None:
     known_piece = PrintPiece(block_uid="known")
     unknown_piece = PrintPiece(block_uid="unknown_block_999")
     proj.print_layout.pieces.extend([known_piece, unknown_piece])
-    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0])
+    report = auto_place(proj, [0], by_color=True, even=False)
 
     assert report.placed == 1
     assert known_piece.bed == 0
@@ -446,7 +443,7 @@ def test_auto_place_positions_and_counts() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = auto_place(proj, [0, 1])
+    report = auto_place(proj, [0, 1], by_color=False, even=False)
 
     assert report.placed == 3
     assert report.staged == 0
@@ -489,7 +486,7 @@ def test_auto_place_non_selected_bed_untouched() -> None:
     proj.print_layout.pieces[0].position_x = 50.0
     proj.print_layout.pieces[0].position_y = 60.0
 
-    report = auto_place(proj, [0])
+    report = auto_place(proj, [0], by_color=False, even=False)
     # Pool is empty (no pieces on bed 0 or staging), so nothing moves.
     assert report.placed == 0
     p0 = proj.print_layout.pieces[0]
@@ -506,7 +503,7 @@ def test_auto_place_overflow() -> None:
         beds=beds,
     )
     sync_pieces(proj)  # 1 on bed 0, 4 staged.
-    report = auto_place(proj, [0, 1])
+    report = auto_place(proj, [0, 1], by_color=False, even=False)
 
     assert report.staged > 0
     staged = [p for p in proj.print_layout.pieces if p.bed == PRINT_STAGING_BED]
@@ -524,7 +521,7 @@ def test_auto_place_oversize_staged() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = auto_place(proj, [0])
+    report = auto_place(proj, [0], by_color=False, even=False)
 
     assert report.staged == 1
     assert proj.print_layout.pieces[0].bed == PRINT_STAGING_BED
@@ -541,11 +538,11 @@ def test_auto_place_empty_selection() -> None:
     assert report.staged == 0
 
 
-# ================================================================== distribute even
+# ======================================================== auto_place: even only
 
 
-def test_distribute_even_exact_assignment() -> None:
-    '''Distribute even on 2 beds with red qty 4 (8x8) and blue qty 1 (16x8).
+def test_auto_place_even_exact_assignment() -> None:
+    '''Auto-place (even, no colors) on 2 beds: red qty 4 (8x8), blue 1 (16x8).
 
     LPT by area DESC: [blue(128), red, red, red, red].
     bed0 gets blue + one red; bed1 gets three reds.
@@ -557,7 +554,7 @@ def test_distribute_even_exact_assignment() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_EVEN, [0, 1])
+    report = auto_place(proj, [0, 1], by_color=False, even=True)
 
     assert report.placed == 5
     assert report.staged == 0
@@ -586,7 +583,7 @@ def test_distribute_even_exact_assignment() -> None:
         assert p.position_x <= beds.width - beds.gap - 4
 
 
-def test_distribute_even_both_beds_used() -> None:
+def test_auto_place_even_both_beds_used() -> None:
     '''Both beds receive pieces (not all on one bed).'''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
     proj = _make_project(
@@ -594,15 +591,15 @@ def test_distribute_even_both_beds_used() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_EVEN, [0, 1])
+    report = auto_place(proj, [0, 1], by_color=False, even=True)
     assert report.per_bed[0] > 0
     assert report.per_bed[1] > 0
 
 
-# ================================================================== distribute by_color
+# ====================================================== auto_place: by color only
 
 
-def test_distribute_by_color_groups_on_separate_beds() -> None:
+def test_auto_place_by_color_groups_on_separate_beds() -> None:
     '''3 beds, blue group (6 pieces 8x8), red group (2 pieces 8x8).
 
     One print job per color: blue packs bed 0 (3 fit) and spills onto bed 1
@@ -615,7 +612,7 @@ def test_distribute_by_color_groups_on_separate_beds() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0, 1, 2])
+    report = auto_place(proj, [0, 1, 2], by_color=True, even=False)
 
     assert report.placed == 8
     assert report.staged == 0
@@ -628,7 +625,7 @@ def test_distribute_by_color_groups_on_separate_beds() -> None:
     assert red_beds == [2, 2]
 
 
-def test_distribute_by_color_never_mixes_beds() -> None:
+def test_auto_place_by_color_never_mixes_beds() -> None:
     '''Two colors never share a bed even when both would fit together.'''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
     proj = _make_project(
@@ -637,7 +634,7 @@ def test_distribute_by_color_never_mixes_beds() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0, 1])
+    report = auto_place(proj, [0, 1], by_color=True, even=False)
 
     assert report.placed == 2
     assert report.staged == 0
@@ -646,7 +643,7 @@ def test_distribute_by_color_never_mixes_beds() -> None:
     assert bed_red != bed_blue
 
 
-def test_distribute_by_color_spill_to_second_bed() -> None:
+def test_auto_place_by_color_spill_to_second_bed() -> None:
     '''Single color with more pieces than one bed holds → second bed gets spill.'''
     beds = PrintBedSettings(width=40.0, depth=20.0, count=2, gap=4.0)
     proj = _make_project(
@@ -654,14 +651,14 @@ def test_distribute_by_color_spill_to_second_bed() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0, 1])
+    report = auto_place(proj, [0, 1], by_color=True, even=False)
 
-    # Shelf pack fits 3 per bed: bed0 + bed1 hold 6, the 7th is staged.
+    # MaxRects fits 3 per bed: bed0 + bed1 hold 6, the 7th is staged.
     assert report.placed == 6
     assert report.staged == 1
 
 
-def test_distribute_by_color_exact_fit() -> None:
+def test_auto_place_by_color_exact_fit() -> None:
     '''6 pieces of 8x8 exactly fill one bed (capacity 384).
 
     With W=40,D=20,GAP=4: shelf pack fits only 3 per bed.
@@ -673,14 +670,14 @@ def test_distribute_by_color_exact_fit() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0])
+    report = auto_place(proj, [0], by_color=True, even=False)
 
     # All 6 fit on one large bed.
     assert report.placed == 6
     assert report.staged == 0
 
 
-def test_distribute_by_color_spill_to_staging() -> None:
+def test_auto_place_by_color_spill_to_staging() -> None:
     '''When remaining beds cannot hold the spill piece, it goes to staging.'''
     beds = PrintBedSettings(width=40.0, depth=20.0, count=1, gap=4.0)
     # 7 pieces with capacity 384 per bed (each 64 area).
@@ -690,13 +687,13 @@ def test_distribute_by_color_spill_to_staging() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0])
+    report = auto_place(proj, [0], by_color=True, even=False)
 
     # 6 assigned to bed0 (capacity 384), 7th has no more beds → staging.
     assert report.staged >= 1
 
 
-def test_distribute_by_color_single_bed_overflow() -> None:
+def test_auto_place_by_color_single_bed_overflow() -> None:
     '''Single bed can only hold 6 of 7 pieces; 7th goes to staging.'''
     beds = PrintBedSettings(width=40.0, depth=20.0, count=1, gap=4.0)
     proj = _make_project(
@@ -704,23 +701,91 @@ def test_distribute_by_color_single_bed_overflow() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0])
+    report = auto_place(proj, [0], by_color=True, even=False)
 
     # 6 pieces assigned to bed0 (area 384), 7th piece overflows.
     assert report.staged >= 1
 
 
-# ================================================================== unknown mode
+# ==================================================== auto_place: even + by color
 
 
-def test_distribute_unknown_mode_raises() -> None:
-    '''Unknown distribute mode raises ValueError.'''
+def test_auto_place_even_by_color_splits_single_color_evenly() -> None:
+    '''Both modifiers, one color: pieces spread evenly over exclusive beds.
+
+    Six 8x8 pieces fit on ONE 220x220 bed, but with "even" the packer
+    balances the area (LPT 3+3) instead of filling bed 0 first — the
+    sequential modes would leave bed 1 empty.
+    '''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
     proj = _make_project(
-        BlockInstance(uid="A", cells_x=2, cells_y=2, quantity=1),
+        BlockInstance(uid="A", cells_x=2, cells_y=2, color="#ff0000", quantity=6),
+        beds=beds,
     )
     sync_pieces(proj)
-    with pytest.raises(ValueError, match="unknown distribute mode"):
-        distribute(proj, "invalid_mode", [0])
+    report = auto_place(proj, [0, 1], by_color=True, even=True)
+
+    assert report.placed == 6
+    assert report.staged == 0
+    assert report.per_bed[0] == 3
+    assert report.per_bed[1] == 3
+
+
+def test_auto_place_even_by_color_never_mixes_beds() -> None:
+    '''Both modifiers: two colors never share a bed even when both fit.'''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
+    proj = _make_project(
+        BlockInstance(uid="red", cells_x=2, cells_y=2, color="#ff0000", quantity=1),
+        BlockInstance(uid="blue", cells_x=2, cells_y=2, color="#0000ff", quantity=1),
+        beds=beds,
+    )
+    sync_pieces(proj)
+    report = auto_place(proj, [0, 1], by_color=True, even=True)
+
+    assert report.placed == 2
+    assert report.staged == 0
+    bed_red = next(p.bed for p in proj.print_layout.pieces if p.block_uid == "red")
+    bed_blue = next(p.bed for p in proj.print_layout.pieces if p.block_uid == "blue")
+    assert bed_red != bed_blue
+
+
+def test_auto_place_even_by_color_groups_on_separate_beds() -> None:
+    '''Both modifiers: blue (6 pieces) gets beds 0+1 evenly, red takes bed 2.
+
+    Blue alone does not fit one 40x20 bed (3 pieces max), so it grows one
+    bed at a time and lands 3+3; red then takes the still-free bed 2.
+    '''
+    beds = PrintBedSettings(width=40.0, depth=20.0, count=3, gap=4.0)
+    proj = _make_project(
+        BlockInstance(uid="red", cells_x=2, cells_y=2, color="#ff0000", quantity=2),
+        BlockInstance(uid="blue", cells_x=2, cells_y=2, color="#0000ff", quantity=6),
+        beds=beds,
+    )
+    sync_pieces(proj)
+    report = auto_place(proj, [0, 1, 2], by_color=True, even=True)
+
+    assert report.placed == 8
+    assert report.staged == 0
+    blue_beds = [p.bed for p in proj.print_layout.pieces if p.block_uid == "blue"]
+    assert blue_beds.count(0) == 3
+    assert blue_beds.count(1) == 3
+    red_beds = [p.bed for p in proj.print_layout.pieces if p.block_uid == "red"]
+    assert red_beds == [2, 2]
+
+
+def test_auto_place_even_by_color_spill_to_staging() -> None:
+    '''Both modifiers: pieces left when the beds run out go to staging.'''
+    beds = PrintBedSettings(width=40.0, depth=20.0, count=1, gap=4.0)
+    proj = _make_project(
+        BlockInstance(uid="A", cells_x=2, cells_y=2, color="#ff0000", quantity=7),
+        beds=beds,
+    )
+    sync_pieces(proj)
+    report = auto_place(proj, [0], by_color=True, even=True)
+
+    # 3 pieces fit the single bed, the remaining 4 go to staging.
+    assert report.placed == 3
+    assert report.staged == 4
 
 
 # ======================================================== validation round-trip
@@ -745,14 +810,14 @@ def test_auto_place_preserves_print_layout_validity() -> None:
     Project.model_validate(proj.model_dump())
 
 
-def test_distribute_preserves_print_layout_validity() -> None:
-    '''After distribute the project still validates.'''
+def test_auto_place_preserves_print_layout_validity_even() -> None:
+    '''After auto_place (even) the project still validates.'''
     proj = _make_project(
         BlockInstance(uid="red", cells_x=2, cells_y=2, color="#ff0000", quantity=4),
         BlockInstance(uid="blue", cells_x=4, cells_y=2, color="#0000ff", quantity=1),
     )
     sync_pieces(proj)
-    distribute(proj, DISTRIBUTE_EVEN, [0, 1])
+    auto_place(proj, [0, 1], by_color=False, even=True)
     Project.model_validate(proj.model_dump())
 
 
@@ -781,7 +846,7 @@ def test_auto_place_rotates_to_fit() -> None:
     )
     sync_pieces(proj)
 
-    report = auto_place(proj, [0])
+    report = auto_place(proj, [0], by_color=False, even=False)
 
     assert report.placed == 1
     piece = proj.print_layout.pieces[0]
@@ -796,7 +861,7 @@ def test_auto_place_prefers_unrotated() -> None:
     '''A piece that fits unrotated is NOT turned by the packing.'''
     proj = _make_project(BlockInstance(uid="a", cells_x=4, cells_y=2, quantity=1))
     sync_pieces(proj)
-    auto_place(proj, [0])
+    auto_place(proj, [0], by_color=False, even=False)
     piece = proj.print_layout.pieces[0]
     assert piece.rotated90 is False
     assert piece.position_x == pytest.approx(110.0)  # centered on the 220 mm bed
@@ -810,7 +875,7 @@ def test_auto_place_rotation_nonoverlap() -> None:
         BlockInstance(uid="a", cells_x=4, cells_y=2, quantity=2), beds=beds
     )
     sync_pieces(proj)
-    auto_place(proj, [0])
+    auto_place(proj, [0], by_color=False, even=False)
 
     pieces = proj.print_layout.pieces
     assert all(p.bed == 0 for p in pieces)
@@ -847,15 +912,15 @@ def test_sync_respects_rotated_existing_pieces() -> None:
     )
 
 
-def test_distribute_keeps_rotation_flag_consistent() -> None:
-    '''distribute re-packs positions and the rotated90 flags stay valid.'''
+def test_auto_place_keeps_rotation_flag_consistent() -> None:
+    '''auto_place re-packs positions and the rotated90 flags stay valid.'''
     beds = PrintBedSettings(width=12.0, depth=24.0, count=2, gap=0.0)
     proj = _make_project(
         BlockInstance(uid="a", cells_x=4, cells_y=2, color="#ff0000", quantity=2),
         beds=beds,
     )
     sync_pieces(proj)
-    distribute(proj, DISTRIBUTE_EVEN, [0, 1])
+    auto_place(proj, [0, 1], by_color=False, even=True)
     fp = block_footprints(proj)
     for piece in proj.print_layout.pieces:
         w, d = piece_dims(piece, fp)
@@ -884,7 +949,7 @@ def test_auto_place_reuses_holes_beyond_shelf() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    report = auto_place(proj, [0])
+    report = auto_place(proj, [0], by_color=False, even=False)
 
     assert report.placed == 8
     assert report.staged == 0
@@ -907,14 +972,14 @@ def test_auto_place_stress_no_overlap_in_bounds() -> None:
     beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
     proj = _make_project(*blocks, beds=beds)
     sync_pieces(proj)
-    report = auto_place(proj, [0, 1])
+    report = auto_place(proj, [0, 1], by_color=False, even=False)
 
     assert report.placed + report.staged == sum(b.quantity for b in blocks)
     _assert_bed_invariants(proj, beds)
 
 
-def test_distribute_even_stress_invariants() -> None:
-    '''Distribute even: placed pieces never overlap or leave the beds.'''
+def test_auto_place_even_stress_invariants() -> None:
+    '''Auto-place (even): placed pieces never overlap or leave the beds.'''
     rng = random.Random(7)
     blocks = [
         BlockInstance(
@@ -929,14 +994,14 @@ def test_distribute_even_stress_invariants() -> None:
     beds = PrintBedSettings(width=220.0, depth=220.0, count=3, gap=4.0)
     proj = _make_project(*blocks, beds=beds)
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_EVEN, [0, 1, 2])
+    report = auto_place(proj, [0, 1, 2], by_color=False, even=True)
 
     assert report.placed + report.staged == sum(b.quantity for b in blocks)
     _assert_bed_invariants(proj, beds)
 
 
-def test_distribute_by_color_stress_invariants() -> None:
-    '''Distribute by color: placed pieces never overlap or leave the beds.'''
+def test_auto_place_by_color_stress_invariants() -> None:
+    '''Auto-place (by color): placed pieces never overlap or leave the beds.'''
     rng = random.Random(11)
     colors = ["#ff0000", "#00ff00", "#0000ff", "#ffff00"]
     blocks = [
@@ -952,12 +1017,42 @@ def test_distribute_by_color_stress_invariants() -> None:
     beds = PrintBedSettings(width=220.0, depth=220.0, count=4, gap=4.0)
     proj = _make_project(*blocks, beds=beds)
     sync_pieces(proj)
-    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0, 1, 2, 3])
+    report = auto_place(proj, [0, 1, 2, 3], by_color=True, even=False)
 
     assert report.placed + report.staged == sum(b.quantity for b in blocks)
     _assert_bed_invariants(proj, beds)
 
     # One print job per color: no bed holds two colors.
+    colors_map = block_colors(proj)
+    bed_colors: dict[int, set[str]] = {}
+    for piece in proj.print_layout.pieces:
+        if piece.bed != PRINT_STAGING_BED:
+            bed_colors.setdefault(piece.bed, set()).add(colors_map[piece.block_uid])
+    assert all(len(cs) == 1 for cs in bed_colors.values())
+
+
+def test_auto_place_even_by_color_stress_invariants() -> None:
+    '''Both modifiers: invariants hold AND no bed ever mixes colors.'''
+    rng = random.Random(23)
+    colors = ["#ff0000", "#00ff00", "#0000ff", "#ffff00", "#ff00ff"]
+    blocks = [
+        BlockInstance(
+            uid=f"x{i}",
+            cells_x=rng.randint(1, 6),
+            cells_y=rng.randint(1, 6),
+            color=colors[i % len(colors)],
+            quantity=rng.randint(2, 12),
+        )
+        for i in range(12)
+    ]
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=5, gap=4.0)
+    proj = _make_project(*blocks, beds=beds)
+    sync_pieces(proj)
+    report = auto_place(proj, [0, 1, 2, 3, 4], by_color=True, even=True)
+
+    assert report.placed + report.staged == sum(b.quantity for b in blocks)
+    _assert_bed_invariants(proj, beds)
+
     colors_map = block_colors(proj)
     bed_colors: dict[int, set[str]] = {}
     for piece in proj.print_layout.pieces:
