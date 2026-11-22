@@ -3,8 +3,8 @@ File:   parts_panel.py
 Brief:  Right-side Assemble-tab panel: planned parts with thumbnails, color
         variants and placed/planned counts.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations
@@ -51,13 +51,16 @@ def _color_chip(color: str) -> QPixmap:
 class _PartCard(QFrame):
     '''One planned-part card: thumbnail, name, color combo, counts.
 
-    A click anywhere on the card (except the combo, which swallows its own
-    presses) starts placing that part: the window attaches a ghost copy of
-    the color-selected block to the cursor.
+    A click anywhere on the card body (except the combo, which swallows
+    its own presses) starts placing that part: the window attaches a
+    ghost copy of the color-selected block to the cursor. Switching the
+    combo re-renders the thumbnail in the selected variant's color.
     '''
 
     # Emitted with the block uid of the color variant selected on the card.
     place_requested = Signal(str)
+    # Emitted when the color combo selection changes (thumbnail recolor).
+    variant_changed = Signal()
 
     def __init__(
         self,
@@ -78,6 +81,7 @@ class _PartCard(QFrame):
         '''
         super().__init__(parent)
         self._uids = list(uids)
+        self._colors = list(colors)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFixedSize(*PART_CARD_SIZE)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -105,6 +109,8 @@ class _PartCard(QFrame):
         layout.addWidget(self._combo)
         if len(colors) <= 1:
             self._combo.setEnabled(False)
+        # Connected after population: the initial addItem(0) must not fire.
+        self._combo.currentIndexChanged.connect(self._on_combo_index_changed)
 
         self._counts = QLabel("")
         self._counts.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -115,6 +121,11 @@ class _PartCard(QFrame):
         '''Block uid of the currently selected color variant.'''
         index = max(0, min(self._combo.currentIndex(), len(self._uids) - 1))
         return self._uids[index]
+
+    def selected_color(self) -> str:
+        '''Planned color of the currently selected variant.'''
+        index = max(0, min(self._combo.currentIndex(), len(self._colors) - 1))
+        return self._colors[index]
 
     def set_thumbnail(self, pixmap: QPixmap) -> None:
         '''Show the rendered part thumbnail.'''
@@ -133,6 +144,10 @@ class _PartCard(QFrame):
         for index, caption in enumerate(per_color):
             if caption and index < self._combo.count():
                 self._combo.setItemText(index, caption)
+
+    def _on_combo_index_changed(self, _index: int) -> None:
+        '''The color combo changed: the thumbnail must follow the color.'''
+        self.variant_changed.emit()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
         '''Any press on the card body starts placing the part.'''
@@ -170,6 +185,8 @@ class PlannedPartsPanel(QWidget):
         self._thumb_meta: dict[int, tuple[str, str, int]] = {}
         # (geometry key, color) -> rendered pixmap.
         self._thumb_cache: dict[tuple[str, str], QPixmap] = {}
+        # (geometry key, color) builds currently running on the queue.
+        self._pending_thumbs: set[tuple[str, str]] = set()
         self._jobs.job_done.connect(self._on_job_done)
         # Two columns of cards minimum (mirrors the template library).
         self.setMinimumWidth(2 * CARD_WIDTH + 28)
@@ -250,6 +267,9 @@ class PlannedPartsPanel(QWidget):
             tooltip = f"{group.name} · {planned} planned"
             card = _PartCard(group.name, uids, colors, tooltip)
             card.place_requested.connect(self.place_requested)
+            card.variant_changed.connect(
+                lambda card=card: self._on_card_variant_changed(card)
+            )
             self._cards.append(card)
             self._card_keys.append(group.key)
 
@@ -271,29 +291,65 @@ class PlannedPartsPanel(QWidget):
             card.set_counts(planned, placed, per_color)
 
     def _submit_thumbnails(self, groups: list[PartGroup]) -> None:
-        '''Queue thumbnail builds for every card (cache-first).'''
+        '''Queue thumbnail builds for every card (cache-first).
+
+        Each card's thumbnail renders in its SELECTED variant's color, so
+        the initial submission uses the combo selection (index 0 right
+        after a rebuild).
+        '''
         self._refresh_seq += 1
         seq = self._refresh_seq
         self._thumb_meta.clear()
+        # Cards were rebuilt: running builds are stale (their results are
+        # discarded by the seq guard) and their pending marks must not
+        # block resubmission of the same (key, color).
+        self._pending_thumbs.clear()
         for card, group in zip(self._cards, groups):
             if not group.variants:
                 continue
-            color = group.variants[0].color
-            cache_key = (group.key, color)
-            cached = self._thumb_cache.get(cache_key)
-            if cached is not None:
-                card.set_thumbnail(cached)
-                continue
-            payload = {
-                # The group key IS the canonical geometry JSON (layout
-                # fields only): the worker rebuilds the merged settings
-                # from it plus the shared geometry defaults.
-                'settings': json.loads(group.key),
-                'tolerance': THUMBNAIL_PAYLOAD_TOLERANCE,
-                'angular': THUMBNAIL_PAYLOAD_ANGULAR,
-            }
-            job_id = self._jobs.submit('thumbnail', payload)
-            self._thumb_meta[job_id] = (group.key, color, seq)
+            color = card.selected_color()
+            self._show_or_submit_thumbnail(card, group.key, color, seq)
+
+    def _show_or_submit_thumbnail(
+        self, card: _PartCard, key: str, color: str, seq: int
+    ) -> None:
+        '''Show the cached thumbnail for (key, color) or queue its build.
+
+        Args:
+            card: The card asking for the thumbnail.
+            key: Geometry key of the card's part group.
+            color: Selected variant color to render the part in.
+            seq: Current refresh sequence number for the job result guard.
+        '''
+        cache_key = (key, color)
+        cached = self._thumb_cache.get(cache_key)
+        if cached is not None:
+            card.set_thumbnail(cached)
+            return
+        if cache_key in self._pending_thumbs:
+            return  # a build for this (key, color) is already running
+        payload = {
+            # The group key IS the canonical geometry JSON (layout
+            # fields only): the worker rebuilds the merged settings
+            # from it plus the shared geometry defaults.
+            'settings': json.loads(key),
+            'tolerance': THUMBNAIL_PAYLOAD_TOLERANCE,
+            'angular': THUMBNAIL_PAYLOAD_ANGULAR,
+        }
+        job_id = self._jobs.submit('thumbnail', payload)
+        self._thumb_meta[job_id] = (key, color, seq)
+        self._pending_thumbs.add(cache_key)
+
+    def _on_card_variant_changed(self, card: _PartCard) -> None:
+        '''A card's color combo changed: re-render its thumbnail color.'''
+        try:
+            index = self._cards.index(card)
+        except ValueError:  # pragma: no cover - card always known here
+            return
+        key = self._card_keys[index]
+        self._show_or_submit_thumbnail(
+            card, key, card.selected_color(), self._refresh_seq
+        )
 
     def _relayout_cards(self) -> None:
         '''Place the cards into the grid, wrapping by viewport width.'''
@@ -336,6 +392,7 @@ class PlannedPartsPanel(QWidget):
         if meta is None:
             return  # Foreign job (generation/export — other slots handle those).
         key, color, seq = meta
+        self._pending_thumbs.discard((key, color))
         if seq != self._refresh_seq:
             return  # A newer refresh replaced the cards; discard stale result.
         if isinstance(result, JobError):
@@ -351,5 +408,6 @@ class PlannedPartsPanel(QWidget):
             return
         self._thumb_cache[(key, color)] = pixmap
         for card, card_key in zip(self._cards, self._card_keys):
-            if card_key == key:
+            # Only the card whose selected variant requested this color.
+            if card_key == key and card.selected_color() == color:
                 card.set_thumbnail(pixmap)
