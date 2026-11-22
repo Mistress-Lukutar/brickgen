@@ -83,12 +83,11 @@ from brickgen.services.placement_service import (
     block_colors,
     block_footprints,
     clamp_into_zone,
-    fallback_spot,
-    find_free_spot,
     local_position,
     piece_dims,
     resolve_manual_moves,
     resolve_piece_placements,
+    stage_pieces,
     sync_pieces,
     world_position,
 )
@@ -2135,36 +2134,24 @@ class MainWindow(QMainWindow):
         if self._tabs.currentIndex() == 1:
             self._set_status(self._placement_summary())
 
-    def _move_pieces_to_staging(self, pieces: list[PrintPiece]) -> None:
-        '''Stage pieces at free staging spots (fallback: keep coords).
-
-        Args:
-            pieces: The pieces to stage (mutated in place).
-        '''
-        beds = self._project.print_layout.beds
-        fps = block_footprints(self._project)
-        for piece in pieces:
-            piece.bed = PRINT_STAGING_BED
-            w, d = piece_dims(piece, fps) if piece.block_uid in fps else (0.0, 0.0)
-            existing: list[tuple[float, float, float, float]] = [
-                (p.position_x, p.position_y, *piece_dims(p, fps))
-                for p in self._project.print_layout.pieces
-                if p.bed == PRINT_STAGING_BED and p.uid != piece.uid
-            ]
-            spot = find_free_spot(existing, w, d, beds)
-            if spot is None:
-                spot = fallback_spot(existing, w, d, beds)
-            if spot is not None:
-                piece.position_x, piece.position_y = spot
-
     def _on_placement_beds_changed(self, beds: PrintBedSettings) -> None:
         '''Apply new bed settings to the project.
 
-        Pieces referencing removed beds or sticking out of the resized bed
-        rectangle are moved to staging, so no piece ever stays out of
-        bounds after a bed resize.
+        A gap-only change never touches the pieces: the gap only feeds
+        packing and collision checks, so every existing position stays
+        valid.  For width/depth/count changes, pieces referencing removed
+        beds or sticking out of the resized bed rectangle are moved to
+        staging (packed into the free staging space), so no piece ever
+        stays out of bounds after a bed resize.
         '''
+        old = self._project.print_layout.beds
         self._project.print_layout.beds = beds
+        if (beds.width, beds.depth, beds.count) == (old.width, old.depth, old.count):
+            # Gap-only change: keep every piece exactly where it is.
+            self._placement_view.set_print_beds(beds)
+            self._placement_panel.set_beds(beds)
+            self._mark_dirty()
+            return
         footprints = block_footprints(self._project)
         outside: list[PrintPiece] = []
         for piece in self._project.print_layout.pieces:
@@ -2184,7 +2171,7 @@ class MainWindow(QMainWindow):
             ):
                 outside.append(piece)
         if outside:
-            self._move_pieces_to_staging(outside)
+            stage_pieces(self._project.print_layout.pieces, footprints, beds, outside)
         self._placement_view.set_print_beds(beds)
         self._placement_panel.set_beds(beds)
         # Clamp the persisted auto-place range into the new bed count and
@@ -2282,13 +2269,18 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
 
     def _on_stage_selection(self) -> None:
-        '''Move selected pieces to staging.'''
+        '''Move selected pieces to staging (packed into the free space).'''
         pieces = [
             self._project.print_layout.pieces[idx]
             for idx in sorted(self._pselection)
             if idx < len(self._project.print_layout.pieces)
         ]
-        self._move_pieces_to_staging(pieces)
+        stage_pieces(
+            self._project.print_layout.pieces,
+            block_footprints(self._project),
+            self._project.print_layout.beds,
+            pieces,
+        )
         self._mark_dirty()
         self._after_placement_change()
 

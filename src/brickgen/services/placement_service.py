@@ -205,107 +205,6 @@ def _overlaps(
     return abs(ax - bx) < (aw + bw) / 2.0 + gap and abs(ay - by) < (ad + bd) / 2.0 + gap
 
 
-def find_free_spot(
-    placed: list[tuple[float, float, float, float]],
-    width: float,
-    depth: float,
-    beds: PrintBedSettings,
-) -> tuple[float, float] | None:
-    '''Find the first free spot in a zone for a piece of given dimensions.
-
-    Scans from the bottom-left corner using zone-local coordinates.  The
-    candidate set is built from existing rect edges plus the initial edge;
-    the first valid position wins.
-
-    Args:
-        placed: Existing rects as ``(cx, cy, w, d)`` in zone-local coords.
-        width: New piece width in mm.
-        depth: New piece depth in mm.
-        beds: The project's ``PrintBedSettings``.
-
-    Returns:
-        ``(cx, cy)`` centre of the first free spot, or ``None`` when no
-        position fits within zone margins.
-    '''
-    gap = beds.gap
-    # Build candidate sets for x and y centres.
-    xs_set: set[float] = {gap + width / 2.0}
-    ys_set: set[float] = {gap + depth / 2.0}
-    for rx, ry, rw, rd in placed:
-        xs_set.add(rx + rw / 2.0 + gap + width / 2.0)
-        ys_set.add(ry + rd / 2.0 + gap + depth / 2.0)
-    xs = sorted(xs_set)
-    ys = sorted(ys_set)
-
-    for cy in ys:
-        for cx in xs:
-            # Check zone bounds with gap margin.
-            if not (gap + width / 2.0 <= cx <= beds.width - gap - width / 2.0):
-                continue
-            if not (gap + depth / 2.0 <= cy <= beds.depth - gap - depth / 2.0):
-                continue
-            # Check overlap against every placed rect.
-            ok = True
-            for rx, ry, rw, rd in placed:
-                if _overlaps(cx, cy, width, depth, rx, ry, rw, rd, gap):
-                    ok = False
-                    break
-            if ok:
-                return (cx, cy)
-    return None
-
-
-def fallback_spot(
-    placed: list[tuple[float, float, float, float]],
-    w: float,
-    d: float,
-    beds: PrintBedSettings,
-) -> tuple[float, float] | None:
-    '''Least-conflict fallback spot for a piece that fits nowhere.
-
-    Scans a coarse grid of candidate centers across the zone margins and
-    returns the spot overlapping the fewest existing rects (ties: lower
-    y, lower x).  Used when the zone is so full that :func:`find_free_spot`
-    fails: staged pieces then spread out instead of stacking on one
-    corner.
-
-    Args:
-        placed: Existing rects as ``(cx, cy, w, d)`` in zone-local coords.
-        w: New piece width in mm.
-        d: New piece depth in mm.
-        beds: The project's ``PrintBedSettings``.
-
-    Returns:
-        ``(cx, cy)`` centre of the least-conflicting spot, or ``None``
-        when the piece cannot fit the zone at all.
-    '''
-    gap = beds.gap
-    lo_x = gap + w / 2.0
-    hi_x = beds.width - gap - w / 2.0
-    lo_y = gap + d / 2.0
-    hi_y = beds.depth - gap - d / 2.0
-    if lo_x > hi_x or lo_y > hi_y:
-        return None
-    steps_x = max(int((hi_x - lo_x) // max(w + gap, 1e-9)) + 1, 1)
-    steps_y = max(int((hi_y - lo_y) // max(d + gap, 1e-9)) + 1, 1)
-    xs = np.linspace(lo_x, hi_x, min(max(steps_x, 2), 16))
-    ys = np.linspace(lo_y, hi_y, min(max(steps_y, 2), 16))
-    best: tuple[int, float, float] | None = None
-    pos = (lo_x, lo_y)
-    for cy in ys:
-        for cx in xs:
-            conflicts = sum(
-                1
-                for px, py, pw, pd in placed
-                if abs(cx - px) < (w + pw) / 2.0 and abs(cy - py) < (d + pd) / 2.0
-            )
-            key = (conflicts, float(cy), float(cx))
-            if best is None or key < best:
-                best = key
-                pos = (float(cx), float(cy))
-    return pos
-
-
 def clamp_into_zone(
     piece: PrintPiece,
     footprints: dict[str, tuple[float, float]],
@@ -347,8 +246,7 @@ def nearest_free_spot(
     '''Conflict-free spot closest to a requested position.
 
     Candidate centers are built from the requested position, the zone
-    margins and the edges of the already-placed rects (mirroring
-    :func:`find_free_spot`'s candidate generation, whose cross product
+    margins and the edges of the already-placed rects (the cross product
     also covers diagonal neighbors); every candidate is bounds- and
     clearance-checked, and the one with the smallest Euclidean distance
     to ``(near_x, near_y)`` wins (ties: lower y, lower x).
@@ -410,11 +308,10 @@ def resolve_piece_placements(
 
     Every moved piece keeps its position when it clears all pieces in the
     same zone by ``gap``; otherwise it shifts to the nearest conflict-free
-    spot in that zone (:func:`nearest_free_spot`), or goes to staging at a
-    free spot when the zone is full (fallback: :func:`fallback_spot`, so
-    a completely packed scene still spreads staged pieces out instead of
-    stacking).  Manual moves can therefore never produce overlapping
-    volumes.
+    spot in that zone (:func:`nearest_free_spot`), or goes to staging
+    when the zone is full (:func:`_stage_piece`, MaxRects-packed into the
+    free staging space).  Manual moves can therefore never produce
+    overlapping volumes.
 
     Args:
         pieces: The full piece list (mutated in place).
@@ -449,15 +346,10 @@ def resolve_piece_placements(
             piece.position_x, piece.position_y = spot
             rects.append((spot[0], spot[1], w, d))
             continue
-        # Zone full: stage the piece at a free spot (or spread it out).
-        staged = static.setdefault(PRINT_STAGING_BED, [])
-        spot = find_free_spot(staged, w, d, beds)
-        if spot is None:
-            spot = fallback_spot(staged, w, d, beds)
-        piece.bed = PRINT_STAGING_BED
-        if spot is not None:
-            piece.position_x, piece.position_y = spot
-        staged.append((piece.position_x, piece.position_y, w, d))
+        # Zone full: stage the piece (MaxRects-packed into the free
+        # staging space around the already-staged pieces).
+        fw, fd = footprints[piece.block_uid]
+        _stage_piece(piece, fw, fd, static.setdefault(PRINT_STAGING_BED, []), beds)
 
 
 def resolve_manual_moves(
@@ -499,27 +391,92 @@ def _stage_piece(
     staged_rects: list[tuple[float, float, float, float]],
     beds: PrintBedSettings,
 ) -> None:
-    '''Send a piece to staging at the first free staging spot.
+    '''Send a piece to the staging zone, packed into the free staging space.
 
-    Falls back to the piece's current coords when staging is full (overlap
-    allowed there, mirroring :func:`sync_pieces`).  *staged_rects* tracks
+    The already-staged rects act as obstacles: the piece is MaxRects-
+    packed (gap-aware) into the remaining space and never overlaps them.
+    When staging is full the piece keeps its coordinates, clamped into
+    the zone margins — overlap is allowed there.  *staged_rects* tracks
     already-staged pieces as ``(cx, cy, w, d)`` zone-local rects and grows
     by one entry per staged piece.
 
     Args:
-        piece: The piece to stage (bed and position are mutated).
-        w: Orientation-aware piece width in mm.
-        d: Orientation-aware piece depth in mm.
+        piece: The piece to stage (bed, position and ``rotated90`` are
+            mutated).
+        w: UNROTATED piece footprint width in mm.
+        d: UNROTATED piece footprint depth in mm.
         staged_rects: Running list of staged piece rects.
         beds: The project's ``PrintBedSettings``.
     '''
     piece.bed = PRINT_STAGING_BED
-    spot = find_free_spot(staged_rects, w, d, beds)
-    if spot is None:
-        spot = fallback_spot(staged_rects, w, d, beds)
-    if spot is not None:
-        piece.position_x, piece.position_y = spot
-    staged_rects.append((piece.position_x, piece.position_y, w, d))
+    placements, _leftovers = _maxrects_pack(
+        [(piece.uid, w, d)], beds, obstacles=staged_rects
+    )
+    if piece.uid in placements:
+        cx, cy, rotated = placements[piece.uid]
+        piece.position_x = cx
+        piece.position_y = cy
+        piece.rotated90 = rotated
+    else:
+        # Staging full: clamp into the zone margins (overlap allowed).
+        cw, cd = (d, w) if piece.rotated90 else (w, d)
+        lo_x = beds.gap + cw / 2.0
+        hi_x = beds.width - beds.gap - cw / 2.0
+        lo_y = beds.gap + cd / 2.0
+        hi_y = beds.depth - beds.gap - cd / 2.0
+        if lo_x <= hi_x and lo_y <= hi_y:
+            piece.position_x = min(max(piece.position_x, lo_x), hi_x)
+            piece.position_y = min(max(piece.position_y, lo_y), hi_y)
+    rw, rd = (d, w) if piece.rotated90 else (w, d)
+    staged_rects.append((piece.position_x, piece.position_y, rw, rd))
+
+
+def stage_pieces(
+    pieces: list[PrintPiece],
+    footprints: dict[str, tuple[float, float]],
+    beds: PrintBedSettings,
+    moved: list[PrintPiece],
+) -> None:
+    '''Send *moved* pieces to the staging zone, packed into the free space.
+
+    The pieces already staged keep their positions and act as obstacles:
+    the moved pieces are MaxRects-packed (gap-aware) into the remaining
+    staging space in one batch.  Pieces that fit nowhere keep their
+    coordinates, clamped into the staging zone margins — overlap is
+    allowed in a packed staging zone.  Pieces with an unknown block uid
+    keep their coordinates untouched.
+
+    Args:
+        pieces: The full piece list.
+        footprints: ``{block_uid: (w, d)}`` from :func:`block_footprints`.
+        beds: The project's ``PrintBedSettings``.
+        moved: The pieces to stage (bed and position mutated in place).
+    '''
+    moved_uids = {p.uid for p in moved}
+    staged_rects = [
+        (p.position_x, p.position_y, *piece_dims(p, footprints))
+        for p in pieces
+        if p.bed == PRINT_STAGING_BED
+        and p.uid not in moved_uids
+        and p.block_uid in footprints
+    ]
+    items: list[tuple[str, float, float]] = []
+    for piece in moved:
+        piece.bed = PRINT_STAGING_BED
+        if piece.block_uid in footprints:
+            items.append((piece.uid, *footprints[piece.block_uid]))
+    placements, _leftovers = _maxrects_pack(items, beds, obstacles=staged_rects)
+    for piece in moved:
+        if piece.block_uid not in footprints:
+            continue  # unknown block: keep the coords
+        if piece.uid in placements:
+            cx, cy, rotated = placements[piece.uid]
+            piece.position_x = cx
+            piece.position_y = cy
+            piece.rotated90 = rotated
+        else:
+            # Staging full: clamp into the zone margins (overlap allowed).
+            clamp_into_zone(piece, footprints, beds)
 
 
 @dataclasses.dataclass
@@ -547,7 +504,9 @@ def sync_pieces(project: Project) -> SyncReport:
     Steps:
         1. Drop pieces whose ``block_uid`` is not among current blocks.
         2. Per block (in block order): keep at most ``quantity`` earliest entries.
-        3. Per block (in block order): append missing pieces, trying bed 0 then staging.
+        3. Per block (in block order): append missing pieces, MaxRects-packed
+           into bed 0's free space first, staging as fallback (existing
+           pieces never move; they act as packing obstacles).
         4. Return counts.
 
     Args:
@@ -596,42 +555,40 @@ def sync_pieces(project: Project) -> SyncReport:
 
         # Append missing pieces for this block.
         to_add = qty - kept_for_block
-        for _i in range(to_add):
-            new_piece = PrintPiece(block_uid=uid)
-            # Try bed 0 first (convert existing pieces to tuples, using
-            # their ORIENTATION-AWARE footprints — pieces may be rotated).
-            bed0_tuples = [
+        bed0_rects: list[tuple[float, float, float, float]] = []
+        staged_rects: list[tuple[float, float, float, float]] = []
+        if to_add > 0:
+            # Orientation-aware rects of the pieces already in each zone:
+            # obstacles for the packing of the new pieces (they never move).
+            bed0_rects = [
                 (p.position_x, p.position_y, *piece_dims(p, fp))
                 for p in pieces
                 if p.bed == 0
             ]
-            spot = find_free_spot(bed0_tuples, w, d, beds)
-            if spot is not None:
+            staged_rects = [
+                (p.position_x, p.position_y, *piece_dims(p, fp))
+                for p in pieces
+                if p.bed == PRINT_STAGING_BED
+            ]
+        for _i in range(to_add):
+            new_piece = PrintPiece(block_uid=uid)
+            # Try bed 0 first, then staging: each new piece is MaxRects-
+            # packed (gap-aware) into the free space around the pieces
+            # already in the zone, so existing pieces keep their positions.
+            placements, _leftovers = _maxrects_pack(
+                [(new_piece.uid, w, d)], beds, obstacles=bed0_rects
+            )
+            if new_piece.uid in placements:
+                cx, cy, rotated = placements[new_piece.uid]
                 new_piece.bed = 0
-                new_piece.position_x, new_piece.position_y = spot
+                new_piece.position_x = cx
+                new_piece.position_y = cy
+                new_piece.rotated90 = rotated
+                rw, rd = (d, w) if rotated else (w, d)
+                bed0_rects.append((cx, cy, rw, rd))
             else:
-                # Try staging.
-                staged_tuples = [
-                    (p.position_x, p.position_y, *piece_dims(p, fp))
-                    for p in pieces
-                    if p.bed == PRINT_STAGING_BED
-                ]
-                spot = find_free_spot(staged_tuples, w, d, beds)
-                if spot is not None:
-                    new_piece.bed = PRINT_STAGING_BED
-                    new_piece.position_x, new_piece.position_y = spot
-                    report.staged += 1
-                else:
-                    # Zone full: least-conflict spot so staged pieces
-                    # spread out instead of stacking on one corner.
-                    new_piece.bed = PRINT_STAGING_BED
-                    spot = fallback_spot(staged_tuples, w, d, beds)
-                    if spot is not None:
-                        new_piece.position_x, new_piece.position_y = spot
-                    else:
-                        new_piece.position_x = beds.gap + w / 2.0
-                        new_piece.position_y = beds.gap + d / 2.0
-                    report.staged += 1
+                _stage_piece(new_piece, w, d, staged_rects, beds)
+                report.staged += 1
             pieces.append(new_piece)
             report.added += 1
 
@@ -652,9 +609,122 @@ def _pool_key(uid: str, w: float, d: float) -> tuple[float, float, str]:
     return (-w * d, -max(w, d), uid)
 
 
+def _carve_free_rects(
+    rx: np.ndarray,
+    ry: np.ndarray,
+    rw: np.ndarray,
+    rh: np.ndarray,
+    px: float,
+    py: float,
+    pw: float,
+    ph: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    '''Split the free rects intersecting the occupied rect ``(px, py, pw, ph)``.
+
+    Every intersecting free rect is cut into up to four maximal strips
+    around the occupied rect; strips contained in a surviving rect or in
+    an already-kept strip are pruned (the free rects stay pairwise
+    maximal).  Touching rects survive — the strict overlap test keeps
+    them.
+
+    Args:
+        rx, ry: Free-rect bottom-left corner arrays (zone-local mm).
+        rw, rh: Free-rect size arrays.
+        px, py: Occupied rect bottom-left corner.
+        pw, ph: Occupied rect size.
+
+    Returns:
+        The new free-rect state as four arrays ``(rx, ry, rw, rh)``.
+    '''
+    eps = 1e-9
+    inter = (
+        (rx < px + pw - eps)
+        & (rx + rw > px + eps)
+        & (ry < py + ph - eps)
+        & (ry + rh > py + eps)
+    )
+    sx: list[float] = []
+    sy: list[float] = []
+    sw: list[float] = []
+    sh: list[float] = []
+    for fx, fy, fw, fh in zip(rx[inter], ry[inter], rw[inter], rh[inter]):
+        fx1 = fx + fw
+        fy1 = fy + fh
+        if px - fx > eps:  # left strip
+            sx.append(fx)
+            sy.append(fy)
+            sw.append(px - fx)
+            sh.append(fh)
+        if fx1 - (px + pw) > eps:  # right strip
+            sx.append(px + pw)
+            sy.append(fy)
+            sw.append(fx1 - (px + pw))
+            sh.append(fh)
+        if py - fy > eps:  # bottom strip
+            sx.append(fx)
+            sy.append(fy)
+            sw.append(fw)
+            sh.append(py - fy)
+        if fy1 - (py + ph) > eps:  # top strip
+            sx.append(fx)
+            sy.append(py + ph)
+            sw.append(fw)
+            sh.append(fy1 - (py + ph))
+    rx, ry, rw, rh = rx[~inter], ry[~inter], rw[~inter], rh[~inter]
+
+    if sx:
+        nx = np.array(sx)
+        ny = np.array(sy)
+        nw = np.array(sw)
+        nh = np.array(sh)
+        # Prune redundant strips: any strip contained in an old rect or
+        # in an already-kept strip adds nothing.  Old rects are pairwise
+        # maximal (invariant), so only new strips can be contained.
+        # Area-DESC processing makes exact duplicates keep one copy.
+        kx: list[float] = []
+        ky: list[float] = []
+        kw: list[float] = []
+        kh: list[float] = []
+        for j in np.argsort(-(nw * nh), kind="stable"):
+            ax, ay, aw, ah = nx[j], ny[j], nw[j], nh[j]
+            contained = bool(
+                (
+                    (rx <= ax + eps)
+                    & (rx + rw >= ax + aw - eps)
+                    & (ry <= ay + eps)
+                    & (ry + rh >= ay + ah - eps)
+                ).any()
+            )
+            if not contained and kx:
+                kxa = np.array(kx)
+                kya = np.array(ky)
+                kwa = np.array(kw)
+                kha = np.array(kh)
+                contained = bool(
+                    (
+                        (kxa <= ax + eps)
+                        & (kxa + kwa >= ax + aw - eps)
+                        & (kya <= ay + eps)
+                        & (kya + kha >= ay + ah - eps)
+                    ).any()
+                )
+            if not contained:
+                kx.append(float(ax))
+                ky.append(float(ay))
+                kw.append(float(aw))
+                kh.append(float(ah))
+        if kx:
+            rx = np.concatenate([rx, np.array(kx)])
+            ry = np.concatenate([ry, np.array(ky)])
+            rw = np.concatenate([rw, np.array(kw)])
+            rh = np.concatenate([rh, np.array(kh)])
+    return rx, ry, rw, rh
+
+
 def _maxrects_pack(
     items: list[tuple[str, float, float]],
     beds: PrintBedSettings,
+    obstacles: list[tuple[float, float, float, float]] | None = None,
 ) -> tuple[dict[str, tuple[float, float, bool]], list[str]]:
     '''MaxRects packing of one bed zone, gap-aware and centered.
 
@@ -678,6 +748,10 @@ def _maxrects_pack(
     exactly ``gap`` between real pieces and between the cluster and the
     bed edges.  After packing, the cluster bounding box is translated so
     it sits centered on the bed (zone-local coordinates stay zone-local).
+    With *obstacles* the packer instead packs around fixed rects (they
+    are inflated by ``gap`` and carved out of the free space first) and
+    the result is NOT centered — placements are absolute zone-local
+    coords compatible with the obstacles.
 
     Performance: the per-piece scan over all (free rect, orientation)
     pairs is numpy-vectorized; hundreds of pieces pack in milliseconds on
@@ -695,6 +769,11 @@ def _maxrects_pack(
             footprint.  Order in the list is the placement priority
             (callers sort by :func:`_pool_key`).
         beds: The project's ``PrintBedSettings``.
+        obstacles: Already-placed REAL rects ``(cx, cy, w, d)`` (zone-local
+            center coords) that must not be touched.  A list (possibly
+            empty) selects incremental mode: items pack around the
+            obstacles and the result is NOT centered.  ``None`` (default)
+            packs an empty zone and centers the packed cluster.
 
     Returns:
         ``(placements, leftovers)`` where *placements* maps unique_id to
@@ -714,6 +793,20 @@ def _maxrects_pack(
     ry = np.array([gap / 2.0])
     rw = np.array([beds.width - gap])
     rh = np.array([beds.depth - gap])
+    # Seed the free space with the obstacles: every fixed real rect is
+    # inflated by gap (exactly the space a packed item would occupy) and
+    # carved out, so new items keep the gap clearance from it.
+    for ox, oy, ow, od in obstacles or ():
+        rx, ry, rw, rh = _carve_free_rects(
+            rx,
+            ry,
+            rw,
+            rh,
+            ox - (ow + gap) / 2.0,
+            oy - (od + gap) / 2.0,
+            ow + gap,
+            od + gap,
+        )
     # Cluster bounding box (inflated extents) + packed inflated area, for
     # the bbox-growth score. +inf/-inf start: the first item's growth is
     # its own area for every candidate, so the tie-break chain decides.
@@ -789,91 +882,18 @@ def _maxrects_pack(
         cur_area += cw * ch
 
         # Split every free rect intersecting the placed inflated rect into
-        # up to four maximal strips; drop the intersecting rects (touching
+        # up to four maximal strips (drops the intersecting rects; touching
         # rects survive — the strict overlap test keeps them).
-        inter = (
-            (rx < px1 - eps)
-            & (rx + rw > px + eps)
-            & (ry < py1 - eps)
-            & (ry + rh > py + eps)
-        )
-        sx: list[float] = []
-        sy: list[float] = []
-        sw: list[float] = []
-        sh: list[float] = []
-        for fx, fy, fw, fh in zip(rx[inter], ry[inter], rw[inter], rh[inter]):
-            fx1 = fx + fw
-            fy1 = fy + fh
-            if px - fx > eps:  # left strip
-                sx.append(fx)
-                sy.append(fy)
-                sw.append(px - fx)
-                sh.append(fh)
-            if fx1 - px1 > eps:  # right strip
-                sx.append(px1)
-                sy.append(fy)
-                sw.append(fx1 - px1)
-                sh.append(fh)
-            if py - fy > eps:  # bottom strip
-                sx.append(fx)
-                sy.append(fy)
-                sw.append(fw)
-                sh.append(py - fy)
-            if fy1 - py1 > eps:  # top strip
-                sx.append(fx)
-                sy.append(py1)
-                sw.append(fw)
-                sh.append(fy1 - py1)
-        rx, ry, rw, rh = rx[~inter], ry[~inter], rw[~inter], rh[~inter]
-
-        if sx:
-            nx = np.array(sx)
-            ny = np.array(sy)
-            nw = np.array(sw)
-            nh = np.array(sh)
-            # Prune redundant strips: any strip contained in an old rect or
-            # in an already-kept strip adds nothing.  Old rects are pairwise
-            # maximal (invariant), so only new strips can be contained.
-            # Area-DESC processing makes exact duplicates keep one copy.
-            kx: list[float] = []
-            ky: list[float] = []
-            kw: list[float] = []
-            kh: list[float] = []
-            for j in np.argsort(-(nw * nh), kind="stable"):
-                ax, ay, aw, ah = nx[j], ny[j], nw[j], nh[j]
-                contained = bool(
-                    (
-                        (rx <= ax + eps)
-                        & (rx + rw >= ax + aw - eps)
-                        & (ry <= ay + eps)
-                        & (ry + rh >= ay + ah - eps)
-                    ).any()
-                )
-                if not contained and kx:
-                    kxa = np.array(kx)
-                    kya = np.array(ky)
-                    kwa = np.array(kw)
-                    kha = np.array(kh)
-                    contained = bool(
-                        (
-                            (kxa <= ax + eps)
-                            & (kxa + kwa >= ax + aw - eps)
-                            & (kya <= ay + eps)
-                            & (kya + kha >= ay + ah - eps)
-                        ).any()
-                    )
-                if not contained:
-                    kx.append(float(ax))
-                    ky.append(float(ay))
-                    kw.append(float(aw))
-                    kh.append(float(ah))
-            if kx:
-                rx = np.concatenate([rx, np.array(kx)])
-                ry = np.concatenate([ry, np.array(ky)])
-                rw = np.concatenate([rw, np.array(kw)])
-                rh = np.concatenate([rh, np.array(kh)])
+        rx, ry, rw, rh = _carve_free_rects(rx, ry, rw, rh, px, py, cw, ch)
 
     if not placements:
+        return placements, leftovers
+
+    if obstacles is not None:
+        # Packing around fixed rects (incremental placement): placements
+        # are absolute (centering would move items onto the obstacles /
+        # out of the zone).  An EMPTY obstacles list still selects this
+        # mode — only a from-scratch pack (None) is centered.
         return placements, leftovers
 
     # Center the packed cluster: translate so the occupied bounding box

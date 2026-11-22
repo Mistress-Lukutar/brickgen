@@ -25,13 +25,13 @@ from brickgen.services.placement_service import (
     block_colors,
     block_footprints,
     clamp_into_zone,
-    find_free_spot,
     fits_bed,
     local_position,
     nearest_free_spot,
     piece_dims,
     resolve_manual_moves,
     resolve_piece_placements,
+    stage_pieces,
     staging_origin,
     sync_pieces,
     world_position,
@@ -238,33 +238,57 @@ def test_fits_bed_small() -> None:
     assert fits_bed(8.0, 8.0, beds) is True
 
 
-def test_find_free_spot_empty_bed() -> None:
-    '''First free spot on an empty bed is at the corner margin.'''
-    beds = PrintBedSettings(width=220.0, depth=220.0, gap=4.0)
-    spot = find_free_spot([], 8.0, 8.0, beds)
-    assert spot == (8.0, 8.0)
+def test_stage_pieces_packs_around_existing() -> None:
+    '''stage_pieces packs the moved piece beside the already-staged one.
+
+    The staged piece keeps its position and acts as a packing obstacle:
+    the moved piece lands in the free strip right of it (gap-clear), so
+    pushing pieces to staging never disturbs the staged layout.
+    '''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0)
+    proj = _make_project(BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2))
+    sync_pieces(proj)
+    p0, p1 = proj.print_layout.pieces
+    # p0 already staged at (8, 8); p1 sits on bed 0 and must be staged.
+    p0.bed = PRINT_STAGING_BED
+    p0.position_x, p0.position_y = 8.0, 8.0
+    p1.bed = 0
+    p1.position_x, p1.position_y = 100.0, 100.0
+
+    stage_pieces(proj.print_layout.pieces, block_footprints(proj), beds, [p1])
+
+    assert p1.bed == PRINT_STAGING_BED
+    # Inflated obstacle (2,2)-(14,14); the right strip is tighter-ranked
+    # than the top one (lower y) → center (14+6, 2+6) = (20, 8).
+    assert p1.position_x == pytest.approx(20.0)
+    assert p1.position_y == pytest.approx(8.0)
+    # The previously staged piece is untouched.
+    assert (p0.position_x, p0.position_y) == pytest.approx((8.0, 8.0))
 
 
-def test_find_free_spot_second_sequential() -> None:
-    '''Two sequential finds on a bed with gap=4: second spot x=20.0.'''
-    beds = PrintBedSettings(width=220.0, depth=220.0, gap=4.0)
-    # First piece at (8, 8).
-    placed: list[tuple[float, float, float, float]] = [(8.0, 8.0, 8.0, 8.0)]
-    spot = find_free_spot(placed, 8.0, 8.0, beds)
-    # xs = {8} ∪ {8+4+4} = {8, 16}; ys = {8, 16}.
-    # (8,8) overlaps; (8,16) overlaps; (16,8): abs(8)=8 < 12 ✓ → overlaps.
-    # (16,16): abs(8)=8<12 and abs(8)=8<12 → overlaps.
-    # (20,8): abs(12)=12 < 12? No → free spot at (20, 8).
-    assert spot == (20.0, 8.0)
+def test_stage_pieces_full_zone_clamps_coords() -> None:
+    '''When the staging zone is full, the piece is clamped inside it.
 
+    Overlap is allowed in a packed staging zone, but the piece must stay
+    within the zone margins instead of keeping out-of-zone coordinates.
+    '''
+    beds = PrintBedSettings(width=20.0, depth=20.0, count=1, gap=4.0)
+    proj = _make_project(BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2))
+    sync_pieces(proj)
+    p0, p1 = proj.print_layout.pieces
+    # p0 staged at (8, 8) fills the tiny staging zone; p1 comes from a
+    # removed bed with stale far-out coordinates.
+    p0.bed = PRINT_STAGING_BED
+    p0.position_x, p0.position_y = 8.0, 8.0
+    p1.bed = 0
+    p1.position_x, p1.position_y = 100.0, 100.0
 
-def test_find_free_spot_no_space() -> None:
-    '''When no position fits, returns None.'''
-    beds = PrintBedSettings(width=20.0, depth=20.0, gap=4.0)
-    # Fill bed with overlapping pieces at every candidate.
-    placed = [(8.0, 8.0, 8.0, 8.0)]
-    spot = find_free_spot(placed, 8.0, 8.0, beds)
-    assert spot is None
+    stage_pieces(proj.print_layout.pieces, block_footprints(proj), beds, [p1])
+
+    assert p1.bed == PRINT_STAGING_BED
+    # No free rect fits the inflated 12x12 rect → clamped to the margins.
+    assert p1.position_x == pytest.approx(12.0)  # 20 - 4 - 8/2
+    assert p1.position_y == pytest.approx(12.0)
 
 
 # ================================================================== sync_pieces
@@ -373,17 +397,15 @@ def test_sync_pieces_print_layout_valid() -> None:
 
 
 def test_sync_pieces_different_footprints_no_overlap() -> None:
-    '''FIX-1 regression: existing pieces use their own footprint in find_free_spot.
+    '''FIX-1 regression: packing respects existing pieces' real footprints.
 
     Two blocks with DIFFERENT footprints: a 4x2 (16x8) qty 1 and a 2x2 (8x8) qty 1.
-    After sync, the big piece sits at (12, 8). The small piece must find a spot
-    beside it using the big piece's real 16x8 footprint — not its own 8x8.
-
-    Candidate xs = {4+4} U {12 + 16/2 + 4 + 8/2} = {8, 12+8+4+4} = {8, 28}.
-    At (8,8): overlaps big piece centred at (12,8) with w=16,d=8, gap=4:
-      abs(8-12)=4 < (8+16)/2 + 4 = 16 → True. Overlaps. Skip.
-    At (8,16): abs(8-12)=4<16 and abs(16-8)=8<(8+8)/2+4=12 → overlaps. Skip.
-    At (28,8): abs(28-12)=16 < 16? No → no overlap. Free spot at (28, 8).
+    After sync, the big piece sits at (12, 8). The small piece is packed into
+    the free space carved around the big piece's real 16x8 footprint (inflated:
+    (2,2)-(22,14)) — never on top of it.  The maximal strips (top: full width,
+    right: full height) tie on the fit score, so the bottom-left preference
+    wins → the small piece lands right of the big one at (28, 8), 4 mm (the
+    gap) from its right edge.
     '''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0)
     proj = _make_project(
@@ -397,15 +419,16 @@ def test_sync_pieces_different_footprints_no_overlap() -> None:
     big_p = next(p for p in proj.print_layout.pieces if p.block_uid == "big")
     small_p = next(p for p in proj.print_layout.pieces if p.block_uid == "small")
 
-    # Big piece at corner (16x8 → center (12, 8)).
+    # Big piece at corner (16x8 → center (12, 8)), untouched by the packing.
     assert big_p.bed == 0
     assert big_p.position_x == pytest.approx(12.0)
     assert big_p.position_y == pytest.approx(8.0)
 
-    # Small piece beside big one at (28, 8).
+    # Small piece packed right of the big piece at (28, 8).
     assert small_p.bed == 0
     assert small_p.position_x == pytest.approx(28.0)
     assert small_p.position_y == pytest.approx(8.0)
+    _assert_bed_invariants(proj, beds)
 
 
 def test_auto_place_by_color_unknown_uid_staged() -> None:

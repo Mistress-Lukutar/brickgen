@@ -322,6 +322,35 @@ def test_panel_beds_signal_updates_project(window: MainWindow) -> None:
     assert window._project.print_layout.beds.width == original_width
 
 
+def test_piece_gap_change_keeps_positions(window: MainWindow) -> None:
+    '''Regression: changing ONLY the piece gap must not touch any piece.
+
+    The gap feeds packing and collision checks only — no repack, no
+    staging migration, every piece keeps its bed and position.
+    '''
+    _reset_state(window)
+    window._project.blocks[0].quantity = 3
+    window._sync_placement()
+    pieces = window._project.print_layout.pieces
+    assert len(pieces) == 3
+    before = [(p.bed, p.position_x, p.position_y, p.rotated90) for p in pieces]
+
+    beds0 = window._project.print_layout.beds
+    new_beds = PrintBedSettings(
+        width=beds0.width,
+        depth=beds0.depth,
+        count=beds0.count,
+        gap=beds0.gap + 2.0,
+    )
+    window._on_placement_beds_changed(new_beds)
+
+    # Settings applied, but no piece moved or staged.
+    assert window._project.print_layout.beds.gap == new_beds.gap
+    after = [(p.bed, p.position_x, p.position_y, p.rotated90) for p in pieces]
+    assert after == before
+    assert all(p.bed != PRINT_STAGING_BED for p in pieces)
+
+
 def test_rotated_piece_builds_variant_mesh(window: MainWindow) -> None:
     '''A rotated90 piece renders from the orientation variant cache.'''
     _reset_state(window)
