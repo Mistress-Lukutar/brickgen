@@ -3,7 +3,7 @@ File:   library.py
 Brief:  Template library panel: thumbnail previews, select, save, refresh.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.20.0
 '''
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ THUMBNAIL_SIZE = (192, 144)
 CARD_SIZE = (THUMBNAIL_SIZE[0] + 12, THUMBNAIL_SIZE[1] + 40)
 
 
-def render_thumbnail(mesh: pv.PolyData) -> QPixmap:
+def render_thumbnail(mesh: pv.PolyData, color: str = BLOCK_COLOR) -> QPixmap:
     '''Render an off-screen preview image for a prepared preview mesh.
 
     UI-thread only: creates a small off-screen VTK plotter. The heavy
@@ -49,6 +49,7 @@ def render_thumbnail(mesh: pv.PolyData) -> QPixmap:
 
     Args:
         mesh: Pre-tessellated PyVista PolyData to render.
+        color: Surface color of the part (block color on the assemble tab).
 
     Returns:
         Thumbnail pixmap (dark background matching the viewport, iso view).
@@ -59,7 +60,7 @@ def render_thumbnail(mesh: pv.PolyData) -> QPixmap:
         # lighting="three lights" matches the preview shading (stub says bool).
         plotter.add_mesh(
             mesh,
-            color=BLOCK_COLOR,
+            color=color,
             lighting="three lights",  # type: ignore[arg-type]
         )
         plotter.camera_position = "iso"

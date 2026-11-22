@@ -3,7 +3,7 @@ File:   project_io.py
 Brief:  JSON save/load of multi-block GUI projects with legacy settings migration.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.20.0
 '''
 
 from __future__ import annotations
@@ -28,16 +28,17 @@ logger = logging.getLogger(__name__)
 
 PROJECT_SCHEMA_KEY = "schema"
 PROJECT_SCHEMA_NAME = "brickgen-project"
-PROJECT_SCHEMA_VERSION = 10
+PROJECT_SCHEMA_VERSION = 11
 # Versions accepted by load_project: v4/v5 payloads are migrated on the fly
 # (v4 kept pins/tubes flags on the shared settings, v5 moved them onto
 # each block, v6 added print_layout and block uids, v7 added the per-piece
 # rotated90 flag, v8 added the per-project view settings, v9 added the
-# print_layout tools state, v10 added the per-project export settings).
+# print_layout tools state, v10 added the per-project export settings, v11
+# added the assemble state and the per-block quantity-linked flag).
 # v8+ needs no payload backfill: a missing ``view`` / ``print_layout.tools``
-# / ``export`` key falls back to the model defaults, matching how pre-v8+
-# projects rendered.
-_MIGRATABLE_VERSIONS = (4, 5, 6, 7, 8, 9, 10)
+# / ``export`` / ``assemble`` key falls back to the model defaults, matching
+# how pre-v8+ projects rendered.
+_MIGRATABLE_VERSIONS = (4, 5, 6, 7, 8, 9, 10, 11)
 
 
 def save_project(project: Project, path: Path) -> Path:
@@ -64,6 +65,7 @@ def save_project(project: Project, path: Path) -> Path:
         },
         "blocks": [block.model_dump() for block in project.blocks],
         "print_layout": project.print_layout.model_dump(),
+        "assemble": project.assemble.model_dump(),
         "view": project.view.model_dump(),
         "export": project.export.model_dump(),
     }
@@ -81,15 +83,16 @@ def save_project(project: Project, path: Path) -> Path:
 def load_project(path: Path) -> Project:
     '''Load a project from a JSON file.
 
-    Supports the current project schema (v10), previous v9 (print_layout
-    tools state), v8 (per-project view settings), v7 (per-piece rotated90
-    flag), v6 (print_layout + block uids), v5 (per-block pins/tubes
-    flags) and v4 (pins/tubes on shared settings), with automatic
-    migration, plus legacy single-block preset files that lack a
-    ``blocks`` key or carry the old ``brickgen-settings`` schema marker.
-    Pre-v10 files carry no ``export`` settings, pre-v9 files no
-    ``print_layout.tools`` state and pre-v8 files no view settings, so
-    they load with the model defaults.
+    Supports the current project schema (v11), previous v10 (per-project
+    export settings), v9 (print_layout tools state), v8 (per-project view
+    settings), v7 (per-piece rotated90 flag), v6 (print_layout + block
+    uids), v5 (per-block pins/tubes flags) and v4 (pins/tubes on shared
+    settings), with automatic migration, plus legacy single-block preset
+    files that lack a ``blocks`` key or carry the old ``brickgen-settings``
+    schema marker.
+    Pre-v11 files carry no ``assemble`` state, pre-v10 files no ``export``
+    settings, pre-v9 files no ``print_layout.tools`` state and pre-v8
+    files no view settings, so they load with the model defaults.
 
     Args:
         path: Source ``*.json`` path.

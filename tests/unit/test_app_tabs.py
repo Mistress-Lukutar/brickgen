@@ -3,7 +3,7 @@ File:   test_app_tabs.py
 Brief:  Integration tests for the MainWindow tab integration (S4).
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.21.0
 '''
 
 from __future__ import annotations
@@ -92,8 +92,12 @@ def _reset_state(win: MainWindow) -> None:
     '''
     win._project.blocks[:] = [win._project.blocks[0]]
     win._project.blocks[0].quantity = 1
+    win._project.blocks[0].quantity_linked = False
     win._project.print_layout.beds = PrintBedSettings()
     win._project.print_layout.pieces.clear()
+    win._project.assemble.pieces.clear()
+    win._aselection = set()
+    win._aprimary = None
     win._block_meshes_flipped = [None] * len(win._block_meshes)
     win._pselection = set()
     win._pprimary = None
@@ -106,21 +110,31 @@ def _reset_state(win: MainWindow) -> None:
 
 
 def test_tabs_switch_sidebar_and_library(window: MainWindow) -> None:
-    '''2 tabs with correct titles; switch to 1 -> sidebar stack index 1,
-    right panel shows the export panel, quantity actions disabled; back to
-    0 restores library + planning state.'''
+    '''3 tabs with correct titles; switch to 1 -> assemble panel/parts,
+    switch to 2 -> export panel, quantity actions disabled; back to 0
+    restores library + planning state.'''
     QApplication.processEvents()
 
     # Verify tab structure.
-    assert window._tabs.count() == 2
+    assert window._tabs.count() == 3
     assert window._tabs.tabText(0) == "Planning"
-    assert window._tabs.tabText(1) == "Print placement"
+    assert window._tabs.tabText(1) == "Assemble"
+    assert window._tabs.tabText(2) == "Print placement"
 
-    # Switch to tab 1 (placement).
+    # Switch to tab 1 (assemble).
     window._tabs.setCurrentIndex(1)
     QApplication.processEvents()
     assert window._sidebar_stack.currentIndex() == 1
+    assert window._sidebar_stack.currentWidget() is window._assemble_panel
     assert window._right_stack.currentIndex() == 1
+    assert window._right_stack.currentWidget() is window._parts_panel
+    assert not window._act_qty_labels.isEnabled()
+
+    # Switch to tab 2 (placement).
+    window._tabs.setCurrentIndex(2)
+    QApplication.processEvents()
+    assert window._sidebar_stack.currentIndex() == 2
+    assert window._right_stack.currentIndex() == 2
     assert window._right_stack.currentWidget() is window._export_panel
     assert not window._act_qty_labels.isEnabled()
 
@@ -392,9 +406,16 @@ def test_view_settings_stored_in_project(window: MainWindow) -> None:
     assert window._preview._grid_enabled is True
     assert window._dirty is True
 
+    # Assemble-tab grid toggle uses its own per-project flag and the base
+    # class's origin-centered floor grid.
+    window._tabs.setCurrentIndex(1)
+    window._act_show_grid.setChecked(True)
+    assert window._project.assemble.view.grid_enabled is True
+    assert window._assemble_view._grid_enabled is True
+
     # Placement-tab grid toggle uses its own flag (per-bed grids, never the
     # base class's infinite floor grid).
-    window._tabs.setCurrentIndex(1)
+    window._tabs.setCurrentIndex(2)
     window._act_show_grid.setChecked(True)
     assert window._project.view.placement_grid_enabled is True
     assert window._placement_view._bed_grid_enabled is True
@@ -542,7 +563,7 @@ def test_copy_paste_blocks(window: MainWindow) -> None:
 
 def test_copy_paste_pieces_increments_quantity(window: MainWindow) -> None:
     '''Placement paste adds a physical copy: quantity +1, one new piece.'''
-    window._tabs.setCurrentIndex(1)
+    window._tabs.setCurrentIndex(2)
     _reset_state(window)
     window._reset_edit_history()
     window._dirty = False
@@ -578,7 +599,7 @@ def test_select_all_blocks_and_pieces(window: MainWindow) -> None:
     assert window._primary == 0
 
     # Placement: two pieces now (one per block), select all.
-    window._tabs.setCurrentIndex(1)
+    window._tabs.setCurrentIndex(2)
     window._sync_placement()
     window._on_select_all()
     n_pieces = len(window._project.print_layout.pieces)
@@ -605,7 +626,7 @@ def test_cross_select_mode(window: MainWindow) -> None:
     window._selection = {0}
     window._primary = 0
 
-    window._tabs.setCurrentIndex(1)
+    window._tabs.setCurrentIndex(2)
     QApplication.processEvents()
     assert window._pselection == {0, 1}
     assert window._pprimary == 0
@@ -615,7 +636,7 @@ def test_cross_select_mode(window: MainWindow) -> None:
     window._act_cross_select.setChecked(False)
     window._pselection = set()
     window._pprimary = None
-    window._tabs.setCurrentIndex(1)
+    window._tabs.setCurrentIndex(2)
     assert window._pselection == set()
 
     _reset_state(window)
@@ -624,7 +645,7 @@ def test_cross_select_mode(window: MainWindow) -> None:
 
 def test_export_settings_persist_in_project(window: MainWindow) -> None:
     '''Export panel edits land in the project model (persisted JSON).'''
-    window._tabs.setCurrentIndex(1)
+    window._tabs.setCurrentIndex(2)
     _reset_state(window)
     window._dirty = False
 
@@ -650,7 +671,7 @@ def test_export_print_per_bed_files(
     window: MainWindow, tmp_path: Any, monkeypatch: Any
 ) -> None:
     '''Per-bed export writes <stem>_bedNN.<ext> using project settings.'''
-    window._tabs.setCurrentIndex(1)
+    window._tabs.setCurrentIndex(2)
     _reset_state(window)
     window._dirty = False
     window._project.export = ExportSettings(
@@ -673,7 +694,7 @@ def test_export_print_single_file(
     window: MainWindow, tmp_path: Any, monkeypatch: Any
 ) -> None:
     '''Single-file export writes <stem>.<ext> with all beds combined.'''
-    window._tabs.setCurrentIndex(1)
+    window._tabs.setCurrentIndex(2)
     _reset_state(window)
     window._dirty = False
     window._project.export = ExportSettings(

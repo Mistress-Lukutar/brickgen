@@ -3,7 +3,7 @@ File:   preview.py
 Brief:  PyVista/VTK-based 3D scene preview: multi-block meshes, selection, navigation.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.20.0
 '''
 
 from __future__ import annotations
@@ -355,6 +355,44 @@ def mesh_from_arrays(data: dict) -> pv.PolyData:
     return mesh
 
 
+def assemble_variant_mesh(
+    base_mesh: pv.PolyData,
+    rot_z: int,
+    flipped: bool,
+    lift_z: float,
+) -> pv.PolyData:
+    '''Build the assemble-tab mesh variant of one piece orientation.
+
+    The piece turns ``rot_z`` quarter turns (90 degrees each) about Z,
+    then flipped pieces turn 180 degrees about X (pins down) and lift so
+    the geometry stays on ``z >= 0`` — the same transform order as the
+    print-placement variants and the placement export.
+
+    Note: the pyvista transform methods must have their RESULT assigned —
+    newer pyvista releases return a transformed copy instead of mutating
+    in place, so calling them without assignment silently renders the
+    untransformed mesh.
+
+    Args:
+        base_mesh: The untransformed block mesh (centered at origin).
+        rot_z: Quarter-turn count about Z (0..3).
+        flipped: Rotate 180 degrees about X (pins down).
+        lift_z: Z translation applied after the flip (``total_height``).
+
+    Returns:
+        The transformed mesh copy (the input mesh is left untouched).
+    '''
+    variant = base_mesh.copy()
+    angle = (int(rot_z) % 4) * 90.0
+    if angle:
+        variant = variant.rotate_z(angle)
+    if flipped:
+        # 180 deg about X: pins down; lift onto z >= 0.
+        variant = variant.rotate_x(180.0)
+        variant = variant.translate((0.0, 0.0, lift_z))
+    return variant
+
+
 def piece_variant_mesh(
     base_mesh: pv.PolyData,
     rotated90: bool,
@@ -367,11 +405,6 @@ def piece_variant_mesh(
     export); flipped pieces turn 180 degrees about X (pins down) and are
     lifted so the geometry stays on ``z >= 0``.
 
-    Note: the pyvista transform methods must have their RESULT assigned —
-    newer pyvista releases return a transformed copy instead of mutating
-    in place, so calling them without assignment silently renders the
-    untransformed mesh (overlapping pieces in the placement viewport).
-
     Args:
         base_mesh: The untransformed block mesh (centered at origin).
         rotated90: Rotate 90 degrees about Z.
@@ -381,15 +414,7 @@ def piece_variant_mesh(
     Returns:
         The transformed mesh copy (the input mesh is left untouched).
     '''
-    variant = base_mesh.copy()
-    if rotated90:
-        # 90 deg about Z: footprint swaps (matches export).
-        variant = variant.rotate_z(90.0)
-    if flipped:
-        # 180 deg about X: pins down; lift onto z >= 0.
-        variant = variant.rotate_x(180.0)
-        variant = variant.translate((0.0, 0.0, lift_z))
-    return variant
+    return assemble_variant_mesh(base_mesh, 1 if rotated90 else 0, flipped, lift_z)
 
 
 def build_preview_mesh(
@@ -1091,10 +1116,15 @@ class PreviewWidget(QtInteractor):
 
     # ------------------------------------------------------------- internals
     def _position_actor(self, index: int, x: float, y: float) -> None:
-        '''Move every actor of block *index* to the scene position.'''
+        '''Move every actor of block *index* to the scene position.
+
+        The scene meta may carry ``pos_z`` (the Assemble tab places pieces
+        at height); planning blocks default to the floor plane.
+        '''
         if 0 <= index < len(self._block_actors):
+            z = float(self._scene_meta[index].get('pos_z', 0.0))
             for actor in self._block_actors[index]:
-                actor.SetPosition(float(x), float(y), 0.0)
+                actor.SetPosition(float(x), float(y), z)
 
     def _clear_scene_actors(self) -> None:
         '''Remove every surface/edge/wireframe/outline/label actor.
@@ -1283,7 +1313,11 @@ class PreviewWidget(QtInteractor):
                 render=False,
             )
             position = self._scene_meta[index]
-            actor.SetPosition(position['pos_x'], position['pos_y'], 0.0)
+            actor.SetPosition(
+                position['pos_x'],
+                position['pos_y'],
+                float(position.get('pos_z', 0.0)),
+            )
             self._outline_actors[index] = actor
         self.render()
 
@@ -1471,6 +1505,7 @@ class PreviewWidget(QtInteractor):
         for index, (original_x, original_y) in originals.items():
             if not 0 <= index < len(self._scene_meta):
                 continue
+            z = float(self._scene_meta[index].get('pos_z', 0.0))
             if restore:
                 x, y = original_x, original_y
             else:
@@ -1480,7 +1515,7 @@ class PreviewWidget(QtInteractor):
             self._position_actor(index, x, y)
             outline = self._outline_actors.get(index)
             if outline is not None:
-                outline.SetPosition(x, y, 0.0)
+                outline.SetPosition(x, y, z)
         self._move_quantity_labels(originals)
         self.render()
 
@@ -1930,6 +1965,7 @@ class PreviewWidget(QtInteractor):
         xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
         meta = self._scene_meta[index]
         position_x, position_y = float(meta['pos_x']), float(meta['pos_y'])
+        position_z = float(meta.get('pos_z', 0.0))
         renderer = self.renderer
         height = self.size().height()
         xs: list[float] = []
@@ -1937,7 +1973,9 @@ class PreviewWidget(QtInteractor):
         for x in (xmin, xmax):
             for y in (ymin, ymax):
                 for z in (zmin, zmax):
-                    renderer.SetWorldPoint(x + position_x, y + position_y, z, 1.0)
+                    renderer.SetWorldPoint(
+                        x + position_x, y + position_y, z + position_z, 1.0
+                    )
                     renderer.WorldToDisplay()
                     display_x, display_y, _ = renderer.GetDisplayPoint()[:3]
                     xs.append(display_x)

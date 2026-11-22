@@ -3,7 +3,7 @@ File:   test_project_io.py
 Brief:  Unit tests for JSON save/load of multi-block projects.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.21.0
 '''
 
 from __future__ import annotations

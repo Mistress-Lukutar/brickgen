@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.20.0
 '''
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ from brickgen.core.project import (
     LAYOUT_FIELDS,
     PRINT_STAGING_BED,
     QUANTITY_LABEL_POSITIONS,
+    AssembledPiece,
     BlockInstance,
     BlockLayout,
     ExportSettings,
@@ -65,10 +66,13 @@ from brickgen.core.project import (
     PrintToolsSettings,
     Project,
 )
+from brickgen.gui.assemble_panel import AssemblePanel
+from brickgen.gui.assemble_view import AssembleView
 from brickgen.gui.export_panel import ExportPanel
 from brickgen.gui.grid_editor import CellGridEditor, CellState
 from brickgen.gui.jobs import SKIPPED, JobError, JobQueue
 from brickgen.gui.library import TemplateLibraryPanel
+from brickgen.gui.parts_panel import PlannedPartsPanel
 from brickgen.gui.placement_panel import PlacementPanel
 from brickgen.gui.placement_view import PlacementView
 from brickgen.gui.preferences import PreferencesDialog
@@ -76,11 +80,19 @@ from brickgen.gui.preview import (
     DISPLAY_MODES,
     MODE_SOLID,
     PreviewWidget,
+    assemble_variant_mesh,
     mesh_from_arrays,
     piece_variant_mesh,
 )
 from brickgen.gui.start_dialog import StartDialog
 from brickgen.services.app_settings import load_app_settings, save_app_settings
+from brickgen.services.assemble_service import (
+    Support,
+    assemble_groups,
+    assemble_summary,
+    assemble_supports,
+    placed_counts,
+)
 from brickgen.services.placement_service import (
     auto_place,
     block_colors,
@@ -157,10 +169,12 @@ class MainWindow(QMainWindow):
         self._burst_timer.setInterval(UNDO_BURST_MS)
         self._burst_timer.timeout.connect(self._close_edit_burst)
 
-        # Edit-menu clipboards (block dumps for the planning tab, piece dumps
-        # for the placement tab) and the cross-select toggle.
+        # Edit-menu clipboards (block dumps for the planning tab, piece
+        # dumps for the placement tab, assembled-piece dumps for the
+        # assemble tab) and the cross-select toggle.
         self._clip_blocks: list[dict] = []
         self._clip_pieces: list[dict] = []
+        self._clip_assembled: list[dict] = []
         self._cross_select = False
         self.setWindowTitle("Untitled[*] - BrickGen")
         self.resize(1400, 760)
@@ -195,26 +209,42 @@ class MainWindow(QMainWindow):
         # every piece shares one of the four per-block variants.
         self._mesh_variants: dict[tuple[int, bool, bool], pv.PolyData] = {}
 
+        # Assemble tab state.
+        self._aselection: set[int] = set()
+        self._aprimary: int | None = None
+        # Assemble orientation mesh variants keyed (block index, rot_z,
+        # flipped): every assembled piece shares one of the eight per-block
+        # variants.
+        self._assemble_variants: dict[tuple[int, int, bool], pv.PolyData] = {}
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        # Sidebar stack: page 0 = planning sidebar, page 1 = placement panel.
+        # Sidebar stack: page 0 = planning sidebar, page 1 = assemble panel,
+        # page 2 = placement panel.
         self._sidebar_stack = QStackedWidget()
         self._sidebar = self._build_sidebar()
         self._sidebar_stack.addWidget(self._sidebar)
+        self._assemble_panel = AssemblePanel()
+        self._sidebar_stack.addWidget(self._assemble_panel)
         self._placement_panel = PlacementPanel()
         self._sidebar_stack.addWidget(self._placement_panel)
 
-        # Tab widget: page 0 = planning preview, page 1 = placement view.
+        # Tab widget: page 0 = planning preview, page 1 = assemble view,
+        # page 2 = placement view.
         self._tabs = QTabWidget()
         self._tabs.addTab(self._build_preview_pane(), "Planning")
+        self._assemble_view = AssembleView()
+        self._tabs.addTab(self._assemble_view, "Assemble")
         self._placement_view = PlacementView()
         self._tabs.addTab(self._placement_view, "Print placement")
 
         splitter.addWidget(self._sidebar_stack)
         splitter.addWidget(self._tabs)
         # Right panel stack: page 0 = template library (planning), page 1 =
-        # export panel (placement).
+        # planned parts (assemble), page 2 = export panel (placement).
         self._library = TemplateLibraryPanel(self._selected_block_layout, self._jobs)
         self._library.apply_requested.connect(self._on_template_selected)
+        self._parts_panel = PlannedPartsPanel(self._jobs)
+        self._parts_panel.place_requested.connect(self._on_parts_place_requested)
         self._export_panel = ExportPanel()
         self._export_panel.export_requested.connect(self._on_export_print)
         self._export_panel.export_settings_changed.connect(
@@ -222,6 +252,7 @@ class MainWindow(QMainWindow):
         )
         self._right_stack = QStackedWidget()
         self._right_stack.addWidget(self._library)
+        self._right_stack.addWidget(self._parts_panel)
         self._right_stack.addWidget(self._export_panel)
         splitter.addWidget(self._right_stack)
         splitter.setStretchFactor(0, 0)
@@ -252,6 +283,9 @@ class MainWindow(QMainWindow):
         self._placement_view.set_print_beds(self._project.print_layout.beds)
         self._placement_panel.set_beds(self._project.print_layout.beds)
         self._placement_panel.set_tools(self._project.print_layout.tools)
+        # Assemble view init: world footprints of the placed pieces come
+        # from the pure service (supports for stacking/side snapping).
+        self._assemble_view.set_supports_provider(self._assemble_supports_excluding)
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
         self._booting = False
@@ -263,21 +297,49 @@ class MainWindow(QMainWindow):
         '''Return the currently active preview widget.'''
         if self._tabs.currentIndex() == 0:
             return self._preview
+        if self._tabs.currentIndex() == 1:
+            return self._assemble_view
         return self._placement_view
 
     def _on_tab_changed(self, index: int) -> None:
         '''Switch the sidebar page, right panel and view-menu state.'''
+        # Leaving the assemble tab drops its modal placement mode (the
+        # ghost grabs the mouse — it must not survive the tab switch).
+        if index != 1:
+            self._assemble_view.cancel_placement()
         self._sidebar_stack.setCurrentIndex(index)
         self._right_stack.setCurrentIndex(index)
 
-        # Enable/disable quantity actions only on planning tab.
+        # Enable/disable quantity actions only on planning tab; the Del
+        # shortcut must never remove PLANNING blocks from another tab.
         self._act_qty_labels.setEnabled(index == 0)
+        self._act_remove_blocks.setEnabled(index == 0 and bool(self._selection))
 
         # Refresh "Show grid" checked state from the active preview.
         self._refresh_grid_action_state()
 
-        # When entering tab 1: push shared settings into placement view.
+        # When entering the assemble tab: push the view settings and sync.
         if index == 1:
+            self._assemble_view.set_grid_unit(self._project.settings.unit_size)
+            self._assemble_view.set_grid_scale(self._project.view.grid_scale)
+            self._assemble_view.set_snap_enabled(
+                self._project.assemble.view.snap_to_grid
+            )
+            self._assemble_view.set_snap_parts(
+                self._project.assemble.view.snap_to_parts
+            )
+            self._assemble_view.set_grid_enabled(
+                self._project.assemble.view.grid_enabled
+            )
+            self._assemble_panel.set_snapping(
+                self._project.assemble.view.snap_to_grid,
+                self._project.assemble.view.snap_to_parts,
+            )
+            self._sync_assemble()
+
+        # When entering the placement tab: push shared settings into the
+        # placement view.
+        elif index == 2:
             # Cross-select mode: the pieces of every block selected on the
             # planning tab become the placement selection.
             if self._cross_select:
@@ -298,8 +360,11 @@ class MainWindow(QMainWindow):
         re-enter ``_on_grid_show`` (which would treat it as a user edit and
         dirty the project on a mere tab switch).
         '''
-        if self._tabs.currentIndex() == 0:
+        index = self._tabs.currentIndex()
+        if index == 0:
             checked = self._project.view.grid_enabled
+        elif index == 1:
+            checked = self._project.assemble.view.grid_enabled
         else:
             checked = self._project.view.placement_grid_enabled
         self._act_show_grid.blockSignals(True)
@@ -379,14 +444,16 @@ class MainWindow(QMainWindow):
         self._act_copy = QAction("&Copy", self)
         self._act_copy.setShortcut(QKeySequence.StandardKey.Copy)
         self._act_copy.setToolTip(
-            "Copy the selected blocks (planning) or pieces (placement) (Ctrl+C)."
+            "Copy the selected blocks (planning), assembled copies (assemble) "
+            "or pieces (placement) (Ctrl+C)."
         )
         self._act_copy.triggered.connect(self._on_copy)
         edit_menu.addAction(self._act_copy)
         self._act_paste = QAction("&Paste", self)
         self._act_paste.setShortcut(QKeySequence.StandardKey.Paste)
         self._act_paste.setToolTip(
-            "Paste the copied blocks (planning) or pieces (placement) (Ctrl+V)."
+            "Paste the copied blocks (planning), assembled copies (assemble) "
+            "or pieces (placement) (Ctrl+V)."
         )
         self._act_paste.triggered.connect(self._on_paste)
         edit_menu.addAction(self._act_paste)
@@ -394,7 +461,7 @@ class MainWindow(QMainWindow):
         self._act_select_all = QAction("Select &All", self)
         self._act_select_all.setShortcut(QKeySequence.StandardKey.SelectAll)
         self._act_select_all.setToolTip(
-            "Select every block (planning) or piece (placement) (Ctrl+A)."
+            "Select every block (planning) or piece (assemble/placement) (Ctrl+A)."
         )
         self._act_select_all.triggered.connect(self._on_select_all)
         edit_menu.addAction(self._act_select_all)
@@ -593,11 +660,21 @@ class MainWindow(QMainWindow):
         form.addRow("Color", self._block_color)
 
         self._block_quantity = QSpinBox()
-        self._block_quantity.setRange(1, 100000)
+        self._block_quantity.setRange(0, 100000)
         self._block_quantity.setToolTip(
-            "How many physical copies this block represents (BOM tracking)."
+            "How many physical copies this block represents (BOM tracking); "
+            "0 keeps the block planned without any printed copy."
         )
         form.addRow("Quantity", self._block_quantity)
+
+        self._cb_qty_linked = QCheckBox("Linked to Assemble count")
+        self._cb_qty_linked.setToolTip(
+            "Derive the quantity from the copies of this block currently\n"
+            "placed on the Assemble tab (placing/deleting there updates it).\n"
+            "Unchecked keeps the manual BOM quantity above."
+        )
+        self._cb_qty_linked.toggled.connect(self._on_qty_link_toggled)
+        form.addRow(self._cb_qty_linked)
 
         self._block_tubes = QCheckBox("Inner tubes (2x2+ centers)")
         self._block_tubes.setToolTip(
@@ -746,9 +823,10 @@ class MainWindow(QMainWindow):
             self._placement_panel.minimumWidth(),
         )
         self._sidebar_stack.setMinimumWidth(sidebar_w)
-        # Same for the right-side stack (library / export panel).
+        # Same for the right-side stack (library / planned parts / export).
         right_w = max(
             self._library.minimumWidth(),
+            self._parts_panel.minimumWidth(),
             self._export_panel.minimumWidth(),
         )
         preview_w = max(self._splitter.width() - sidebar_w - right_w, 200)
@@ -789,6 +867,22 @@ class MainWindow(QMainWindow):
         self._placement_panel.stage_selection_requested.connect(
             self._on_stage_selection
         )
+
+        # Assemble signals.
+        self._assemble_view.selection_changed.connect(self._on_assemble_selection)
+        self._assemble_view.blocks_moved.connect(self._on_assemble_pieces_moved)
+        self._assemble_view.piece_placed.connect(self._on_assemble_piece_placed)
+        self._assemble_view.delete_requested.connect(self._on_assemble_delete)
+        self._assemble_panel.snap_grid_changed.connect(self._on_assemble_snap_grid)
+        self._assemble_panel.snap_parts_changed.connect(self._on_assemble_snap_parts)
+        self._assemble_panel.piece_position_changed.connect(
+            self._on_assemble_position_changed
+        )
+        self._assemble_panel.piece_rotation_changed.connect(
+            self._on_assemble_rotation_changed
+        )
+        self._assemble_panel.piece_flip_changed.connect(self._on_assemble_flip_changed)
+        self._assemble_panel.delete_requested.connect(self._on_assemble_delete)
 
     def _update_derived_label(self) -> None:
         '''Update the read-only derived-dimensions label from current spin values.
@@ -953,6 +1047,11 @@ class MainWindow(QMainWindow):
         self._pprimary = None
         self._block_meshes = []
         self._mesh_variants = {}
+        # Reset assemble state (scene rebuilds on tab enter / generation).
+        self._aselection = set()
+        self._aprimary = None
+        self._assemble_variants = {}
+        self._assemble_view.cancel_placement()
         self._mark_clean()
         self._reset_edit_history()
         self._syncing_ui = True
@@ -1008,6 +1107,11 @@ class MainWindow(QMainWindow):
         self._pprimary = None
         self._block_meshes = []
         self._mesh_variants = {}
+        # Reset assemble state (scene rebuilds on tab enter / generation).
+        self._aselection = set()
+        self._aprimary = None
+        self._assemble_variants = {}
+        self._assemble_view.cancel_placement()
         self._mark_clean()
         self._reset_edit_history()
         # Restore the project's own view state (grids, snap, labels).
@@ -1234,6 +1338,10 @@ class MainWindow(QMainWindow):
         self._pprimary = None
         self._block_meshes = []
         self._mesh_variants = {}
+        self._aselection = set()
+        self._aprimary = None
+        self._assemble_variants = {}
+        self._assemble_view.cancel_placement()
         self._syncing_ui = True
         try:
             self._apply_view_settings()
@@ -1249,7 +1357,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- clipboard
     def _on_copy(self) -> None:
         '''Copy the active tab's selection into its per-tab clipboard.'''
-        if self._tabs.currentIndex() == 0:
+        index = self._tabs.currentIndex()
+        if index == 0:
             if not self._selection:
                 self._set_status("Nothing to copy: no blocks selected.")
                 return
@@ -1258,6 +1367,17 @@ class MainWindow(QMainWindow):
                 for index in sorted(self._selection)
             ]
             self._set_status(f"Copied {len(self._clip_blocks)} block(s).")
+        elif index == 1:
+            if not self._aselection:
+                self._set_status("Nothing to copy: no pieces selected.")
+                return
+            assembled = self._project.assemble.pieces
+            self._clip_assembled = [
+                deepcopy(assembled[index].model_dump())
+                for index in sorted(self._aselection)
+                if index < len(assembled)
+            ]
+            self._set_status(f"Copied {len(self._clip_assembled)} copy(ies).")
         else:
             pieces = self._project.print_layout.pieces
             if not self._pselection:
@@ -1273,8 +1393,11 @@ class MainWindow(QMainWindow):
     def _on_paste(self) -> None:
         '''Paste the active tab's clipboard: blocks on planning, pieces on
         the placement tab.'''
-        if self._tabs.currentIndex() == 0:
+        index = self._tabs.currentIndex()
+        if index == 0:
             self._paste_blocks()
+        elif index == 1:
+            self._paste_assembled()
         else:
             self._paste_pieces()
 
@@ -1329,10 +1452,16 @@ class MainWindow(QMainWindow):
         self._begin_edit("paste-pieces")
         beds = self._project.print_layout.beds
         pasted = 0
+        linked_skipped = 0
         for values in self._clip_pieces:
             block = blocks_by_uid.get(str(values.get("block_uid", "")))
             if block is None:
                 continue  # The source block was removed since the copy.
+            if block.quantity_linked:
+                # The count of a linked block belongs to the Assemble tab:
+                # extra placement pieces would be dropped by the next sync.
+                linked_skipped += 1
+                continue
             block.quantity += 1
             bed = int(values.get("bed", PRINT_STAGING_BED))
             if not (PRINT_STAGING_BED <= bed < beds.count):
@@ -1349,15 +1478,69 @@ class MainWindow(QMainWindow):
             pieces.append(piece)
             pasted += 1
         if not pasted:
+            if linked_skipped:
+                self._set_status(
+                    "Nothing pasted: the copied blocks are linked to the "
+                    "Assemble tab (place copies there instead)."
+                )
             return
         self._sync_placement()
         self._mark_dirty()
-        self._set_status(f"Pasted {pasted} piece(s) (+{pasted} BOM quantity).")
+        message = f"Pasted {pasted} piece(s) (+{pasted} BOM quantity)."
+        if linked_skipped:
+            message += f" {linked_skipped} skipped (linked to the Assemble count)."
+        self._set_status(message)
+
+    def _paste_assembled(self) -> None:
+        '''Paste the copied assembled copies as new placed copies.
+
+        Every pasted copy keeps the source's orientation and height and
+        starts 10 mm to the right of it (mirroring the placement paste);
+        the pasted copies are selected, and a linked block's quantity
+        follows the new count.
+        '''
+        if not self._clip_assembled:
+            self._set_status("Clipboard is empty: copy pieces first (Ctrl+C).")
+            return
+        blocks_by_uid = {block.uid: block for block in self._project.blocks}
+        if not any(
+            str(values.get("block_uid", "")) in blocks_by_uid
+            for values in self._clip_assembled
+        ):
+            self._set_status("Nothing to paste: copied blocks no longer exist.")
+            return
+        self._begin_edit("paste-assembled")
+        pasted: list[int] = []
+        pasted_uids: set[str] = set()
+        for values in self._clip_assembled:
+            block_uid = str(values.get("block_uid", ""))
+            if block_uid not in blocks_by_uid:
+                continue  # The source block was removed since the copy.
+            piece = AssembledPiece.model_validate(
+                {
+                    **values,
+                    "uid": uuid.uuid4().hex,
+                    "position_x": float(values.get("position_x", 0.0)) + 10.0,
+                }
+            )
+            self._project.assemble.pieces.append(piece)
+            pasted.append(len(self._project.assemble.pieces) - 1)
+            pasted_uids.add(block_uid)
+        if not pasted:
+            return
+        self._aselection = set(pasted)
+        self._aprimary = pasted[-1]
+        self._assemble_view.set_selection(self._aselection, self._aprimary)
+        self._mark_dirty()
+        self._sync_assemble()
+        self._apply_linked_quantities(self._linked_block_indices(pasted_uids))
+        self._set_status(f"Pasted {len(pasted)} copy(ies).")
 
     # ------------------------------------------------------------ select all
     def _on_select_all(self) -> None:
-        '''Select every block (planning) or every piece (placement).'''
-        if self._tabs.currentIndex() == 0:
+        '''Select every block (planning) or every piece (assemble/placement).'''
+        index = self._tabs.currentIndex()
+        if index == 0:
             count = len(self._project.blocks)
             if not count:
                 return
@@ -1365,6 +1548,14 @@ class MainWindow(QMainWindow):
             self._primary = 0
             self._preview.set_selection(self._selection, self._primary)
             self._on_scene_selection((frozenset(self._selection), self._primary))
+        elif index == 1:
+            count = len(self._project.assemble.pieces)
+            if not count:
+                return
+            self._aselection = set(range(count))
+            self._aprimary = 0
+            self._assemble_view.set_selection(self._aselection, self._aprimary)
+            self._on_assemble_selection((frozenset(self._aselection), self._aprimary))
         else:
             count = len(self._project.print_layout.pieces)
             if not count:
@@ -1550,12 +1741,19 @@ class MainWindow(QMainWindow):
         self._syncing_inspector = True
         try:
             selection = sorted(self._selection)
-            self._act_remove_blocks.setEnabled(bool(selection))
+            # The Del shortcut must never remove PLANNING blocks while a
+            # non-planning tab is active (it deletes assemble/placement
+            # pieces there through the view's own Del handling).
+            self._act_remove_blocks.setEnabled(
+                self._tabs.currentIndex() == 0 and bool(selection)
+            )
             if not selection:
                 self._primary = None
                 self._block_group.setEnabled(False)
                 self._block_group.setTitle("Block (select in the scene)")
                 self._layout_group.setEnabled(False)
+                self._cb_qty_linked.setChecked(False)
+                self._block_quantity.setEnabled(True)
                 return
             if self._primary is None or self._primary not in self._selection:
                 self._primary = selection[-1]
@@ -1573,6 +1771,10 @@ class MainWindow(QMainWindow):
                 f"QPushButton {{ background-color: {block.color}; }}"
             )
             self._block_quantity.setValue(block.quantity)
+            self._cb_qty_linked.setChecked(block.quantity_linked)
+            # Linked blocks derive their quantity from the assemble count:
+            # the spin is read-only while the checkbox is set.
+            self._block_quantity.setEnabled(not block.quantity_linked)
             self._block_tubes.setChecked(block.tubes_enabled)
             self._block_pos_x.setValue(block.position_x)
             self._block_pos_y.setValue(block.position_y)
@@ -1621,18 +1823,76 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
 
     def _on_block_quantity_changed(self) -> None:
-        '''Apply the edited BOM quantity to every selected block.'''
+        '''Apply the edited BOM quantity to every selected block.
+
+        Linked blocks are skipped: their quantity follows the Assemble
+        count and a manual edit would be overwritten immediately.
+        '''
         if self._syncing_inspector or self._primary is None:
             return
-        self._begin_edit("block-quantity", coalesce=True)
         quantity = self._block_quantity.value()
+        targets = [
+            index
+            for index in sorted(self._selection)
+            if not self._project.blocks[index].quantity_linked
+        ]
+        if not targets:
+            return
+        self._begin_edit("block-quantity", coalesce=True)
         changed: dict[int, int] = {}
-        for index in sorted(self._selection):
+        for index in targets:
             self._project.blocks[index].quantity = quantity
             changed[index] = quantity
         self._preview.set_block_quantities(changed)
         self._sync_blocks_list()
         self._mark_dirty()
+
+    def _on_qty_link_toggled(self, checked: bool) -> None:
+        '''Toggle the assemble-count link for every selected block.
+
+        Checking the box derives the quantity from the currently placed
+        copies immediately (so the placement scene stays consistent);
+        unchecking keeps the current value as the manual BOM quantity.
+        '''
+        if self._syncing_inspector or self._primary is None:
+            return
+        self._begin_edit("quantity-link")
+        for index in sorted(self._selection):
+            self._project.blocks[index].quantity_linked = bool(checked)
+        self._sync_block_inspector()
+        self._mark_dirty()
+        if checked:
+            # Snap the linked quantities to the current assemble counts;
+            # a quantity change resyncs the placement pieces too.
+            self._apply_linked_quantities(sorted(self._selection))
+
+    def _apply_linked_quantities(self, indices: list[int]) -> None:
+        '''Set the quantity of every linked block to its assemble count.
+
+        Args:
+            indices: Block indices to process (linked ones only change).
+
+        Returns:
+            None. Marks the project dirty and resyncs the planning
+            quantity labels / placement pieces when a value changed.
+        '''
+        counts = placed_counts(self._project.assemble.pieces)
+        changed: dict[int, int] = {}
+        for index in indices:
+            block = self._project.blocks[index]
+            if not block.quantity_linked:
+                continue
+            placed = counts.get(block.uid, 0)
+            if block.quantity != placed:
+                block.quantity = placed
+                changed[index] = placed
+        if not changed:
+            return
+        self._preview.set_block_quantities(changed)
+        self._sync_blocks_list()
+        self._sync_block_inspector()
+        self._mark_dirty()
+        self._sync_placement()
 
     def _on_block_tubes_toggled(self, checked: bool) -> None:
         '''Apply the block-level inner-tubes toggle to every selected block.'''
@@ -2020,6 +2280,10 @@ class MainWindow(QMainWindow):
         self._sync_layout_from_primary()
         self._sync_inspector()
         self._export_panel.set_settings(self._project.export)
+        # The planned-parts panel mirrors the block list (structure only;
+        # the assemble scene itself rebuilds on tab enter / generation).
+        self._prune_assemble_pieces()
+        self._sync_assemble_panel()
         self._update_title()
 
     def _sync_shared_form(self) -> None:
@@ -2069,6 +2333,14 @@ class MainWindow(QMainWindow):
         self._preview.set_quantity_labels(
             view.quantity_labels_enabled, view.quantity_label_position
         )
+        self._assemble_view.set_grid_scale(view.grid_scale)
+        self._assemble_view.set_snap_enabled(self._project.assemble.view.snap_to_grid)
+        self._assemble_view.set_snap_parts(self._project.assemble.view.snap_to_parts)
+        self._assemble_view.set_grid_enabled(self._project.assemble.view.grid_enabled)
+        self._assemble_panel.set_snapping(
+            self._project.assemble.view.snap_to_grid,
+            self._project.assemble.view.snap_to_parts,
+        )
         self._placement_view.set_grid_scale(view.grid_scale)
         self._placement_view.set_snap_enabled(view.grid_snap)
         self._placement_view.set_grid_enabled(view.placement_grid_enabled)
@@ -2104,26 +2376,36 @@ class MainWindow(QMainWindow):
 
     def _on_grid_show(self, checked: bool) -> None:
         '''Toggle the floor grid on the active preview (stored per project).'''
-        if self._tabs.currentIndex() == 0:
+        index = self._tabs.currentIndex()
+        if index == 0:
             self._project.view.grid_enabled = checked
+        elif index == 1:
+            self._project.assemble.view.grid_enabled = checked
         else:
             self._project.view.placement_grid_enabled = checked
         self._mark_dirty()
         self._active_preview().set_grid_enabled(checked)
 
     def _on_grid_scale(self, scale: float) -> None:
-        '''Set the grid cell scale factor (stored per project, both previews).'''
+        '''Set the grid cell scale factor (stored per project, all previews).'''
         self._project.view.grid_scale = scale
         self._mark_dirty()
         self._preview.set_grid_scale(scale)
+        self._assemble_view.set_grid_scale(scale)
         self._placement_view.set_grid_scale(scale)
 
     def _on_grid_snap(self, checked: bool) -> None:
-        '''Toggle snap-to-grid movement (stored per project, both previews).'''
-        self._project.view.grid_snap = checked
+        '''Toggle snap-to-grid movement (stored per project, per viewport).'''
+        index = self._tabs.currentIndex()
+        if index == 1:
+            # The assemble tab keeps its own snap preference.
+            self._project.assemble.view.snap_to_grid = checked
+            self._assemble_view.set_snap_enabled(checked)
+        else:
+            self._project.view.grid_snap = checked
+            self._preview.set_snap_enabled(checked)
+            self._placement_view.set_snap_enabled(checked)
         self._mark_dirty()
-        self._preview.set_snap_enabled(checked)
-        self._placement_view.set_snap_enabled(checked)
 
     def _on_view_qty_labels(self, checked: bool) -> None:
         '''Toggle the per-block BOM quantity labels (stored per project).'''
@@ -2219,6 +2501,7 @@ class MainWindow(QMainWindow):
         self._project.settings = shared
         # The grid cells and the snap step follow the unit size.
         self._preview.set_grid_unit(shared.unit_size)
+        self._assemble_view.set_grid_unit(shared.unit_size)
         self._placement_view.set_grid_unit(shared.unit_size)
 
         self._gen_seq += 1
@@ -2347,10 +2630,13 @@ class MainWindow(QMainWindow):
             colors.append(block.color)
         self._preview.update_scene(meshes, colors, meta_list, context['changed'])
 
-        # Store resolved meshes for placement tab; reset orientation cache.
+        # Store resolved meshes for the placement/assemble tabs; reset the
+        # orientation caches.
         self._block_meshes = list(meshes)
         self._mesh_variants = {}
+        self._assemble_variants = {}
         self._sync_placement()
+        self._sync_assemble()
 
         self._set_status(self._scene_summary())
 
@@ -2451,8 +2737,11 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str, error: bool = False) -> None:
         '''Set status text with the matching color.'''
         self._status_style(error)
-        if self._tabs.currentIndex() == 0:
+        index = self._tabs.currentIndex()
+        if index == 0:
             self._status.setText(text)
+        elif index == 1:
+            self._assemble_panel.set_status(text, error)
         else:
             self._placement_panel.set_status(text, error)
             self._export_panel.set_status(text, error)
@@ -2495,7 +2784,7 @@ class MainWindow(QMainWindow):
             self._pselection,
             self._pprimary,
         )
-        if self._tabs.currentIndex() == 1:
+        if self._tabs.currentIndex() == 2:
             self._set_status(self._placement_summary())
 
     def _refresh_placement_scene(self) -> None:
@@ -2611,7 +2900,7 @@ class MainWindow(QMainWindow):
             self._pselection,
             self._pprimary,
         )
-        if self._tabs.currentIndex() == 1:
+        if self._tabs.currentIndex() == 2:
             self._set_status(self._placement_summary())
 
     # --------------------------------------------------- placement handlers
@@ -2661,7 +2950,7 @@ class MainWindow(QMainWindow):
             self._pselection,
             self._pprimary,
         )
-        if self._tabs.currentIndex() == 1:
+        if self._tabs.currentIndex() == 2:
             self._set_status(self._placement_summary())
 
     def _on_placement_beds_changed(self, beds: PrintBedSettings) -> None:
@@ -2738,7 +3027,7 @@ class MainWindow(QMainWindow):
             self._pselection,
             self._pprimary,
         )
-        if self._tabs.currentIndex() == 1:
+        if self._tabs.currentIndex() == 2:
             self._set_status(
                 f"Auto-placed {report.placed} pieces ({report.staged} staged)"
             )
@@ -2830,6 +3119,365 @@ class MainWindow(QMainWindow):
         )
         self._mark_dirty()
         self._after_placement_change()
+
+    # ------------------------------------------------------- assemble sync
+
+    def _assemble_supports_excluding(self, exclude_uids: set[str]) -> list[Support]:
+        '''World footprints of the placed pieces for the assemble viewport.
+
+        Args:
+            exclude_uids: Piece uids to skip (the pieces being dragged).
+
+        Returns:
+            The remaining pieces' footprints (pure service call).
+        '''
+        return assemble_supports(self._project, exclude_uids)
+
+    def _prune_assemble_pieces(self) -> None:
+        '''Drop assembled pieces whose block no longer exists.'''
+        uids = {block.uid for block in self._project.blocks}
+        pieces = self._project.assemble.pieces
+        kept = [piece for piece in pieces if piece.block_uid in uids]
+        if len(kept) != len(pieces):
+            self._project.assemble.pieces = kept
+            self._mark_dirty()
+
+    def _assemble_block_labels(self) -> dict[str, str]:
+        '''Block uid -> "CxM" display label for the assemble inspector.'''
+        return {
+            block.uid: f"{block.cells_x}x{block.cells_y}"
+            for block in self._project.blocks
+        }
+
+    def _sync_assemble_panel(self) -> None:
+        '''Refresh the planned-parts cards from the current block list.'''
+        groups = assemble_groups(self._project)
+        counts = placed_counts(self._project.assemble.pieces)
+        self._parts_panel.refresh(groups, counts)
+
+    def _refresh_assemble_scene(self) -> None:
+        '''Rebuild the assemble viewport actors from cached block meshes.'''
+        uid_to_idx = {block.uid: i for i, block in enumerate(self._project.blocks)}
+        heights = {
+            block.uid: self._project.block_settings(i).total_height
+            for i, block in enumerate(self._project.blocks)
+        }
+        dims = {
+            block.uid: (
+                self._project.block_settings(i).outer_length_x / 2,
+                self._project.block_settings(i).outer_length_y / 2,
+            )
+            for i, block in enumerate(self._project.blocks)
+        }
+        colors_map = {block.uid: block.color for block in self._project.blocks}
+
+        meshes_out: list[pv.PolyData | None] = []
+        colors_out: list[str] = []
+        meta_out: list[dict] = []
+        for piece in self._project.assemble.pieces:
+            blk_idx = uid_to_idx.get(piece.block_uid)
+            if blk_idx is None or blk_idx >= len(self._block_meshes):
+                continue
+            base_mesh = self._block_meshes[blk_idx]
+            if base_mesh is None:
+                continue
+            mesh: pv.PolyData = base_mesh
+            if piece.rot_z or piece.flipped:
+                # Lazy variant cache: one transformed mesh per orientation.
+                key = (blk_idx, piece.rot_z, piece.flipped)
+                variant = self._assemble_variants.get(key)
+                if variant is None:
+                    variant = assemble_variant_mesh(
+                        base_mesh,
+                        piece.rot_z,
+                        piece.flipped,
+                        heights.get(piece.block_uid, 0),
+                    )
+                    self._assemble_variants[key] = variant
+                mesh = variant
+            half_x, half_y = dims.get(piece.block_uid, (0.0, 0.0))
+            if piece.rot_z % 2:
+                half_x, half_y = half_y, half_x
+            meta_out.append(
+                {
+                    'pos_x': piece.position_x,
+                    'pos_y': piece.position_y,
+                    'pos_z': piece.position_z,
+                    'half_x': half_x,
+                    'half_y': half_y,
+                    'top_z': heights.get(piece.block_uid, 0),
+                    'quantity': 1,
+                    'uid': piece.uid,
+                    'rot_z': piece.rot_z,
+                    'flipped': piece.flipped,
+                }
+            )
+            colors_out.append(colors_map.get(piece.block_uid, "#3f7fbf"))
+            meshes_out.append(mesh)
+
+        self._assemble_view.update_scene(meshes_out, colors_out, meta_out)
+
+        # Prune the selection to the current piece count.
+        n_pieces = len(self._project.assemble.pieces)
+        self._aselection = {i for i in self._aselection if i < n_pieces}
+        if self._aprimary is not None and self._aprimary >= n_pieces:
+            self._aprimary = None
+
+    def _sync_assemble(self) -> None:
+        '''Prune stale pieces and rebuild the assemble scene + panel.'''
+        self._prune_assemble_pieces()
+        self._refresh_assemble_scene()
+        self._sync_assemble_panel()
+        self._assemble_panel.sync_inspector(
+            self._project.assemble.pieces,
+            self._aselection,
+            self._aprimary,
+            self._assemble_block_labels(),
+        )
+        if self._tabs.currentIndex() == 1:
+            self._set_status(assemble_summary(self._project))
+
+    # ---------------------------------------------------- assemble handlers
+
+    def _on_assemble_selection(self, payload: object) -> None:
+        '''Sync the assemble selection state into the window + inspector.
+
+        A rubber-band (frame) selection carries no primary — the lowest
+        selected index becomes the primary (mirrors the placement tab).
+        '''
+        selection, primary = cast(tuple[frozenset, int | None], payload)
+        n_pieces = len(self._project.assemble.pieces)
+        self._aselection = {i for i in selection if 0 <= i < n_pieces}
+        if primary is None and self._aselection:
+            primary = min(self._aselection)
+        self._aprimary = primary
+        self._assemble_panel.sync_inspector(
+            self._project.assemble.pieces,
+            self._aselection,
+            self._aprimary,
+            self._assemble_block_labels(),
+        )
+
+    def _on_assemble_pieces_moved(self, moves: dict) -> None:
+        '''Commit moved assembled pieces into the project.
+
+        Args:
+            moves: Mapping of piece index to the final ``(x, y, z, rot_z)``
+                state (Space mid-drag may have rotated the pieces).
+        '''
+        pieces = self._project.assemble.pieces
+        valid = {
+            index: (x, y, z, rot_z)
+            for index, (x, y, z, rot_z) in moves.items()
+            if 0 <= index < len(pieces)
+        }
+        if not any(
+            (
+                pieces[index].position_x,
+                pieces[index].position_y,
+                pieces[index].position_z,
+                pieces[index].rot_z,
+            )
+            != (x, y, z, rot_z % 4)
+            for index, (x, y, z, rot_z) in valid.items()
+        ):
+            return
+        self._begin_edit("assemble-move")
+        for index, (x, y, z, rot_z) in valid.items():
+            piece = pieces[index]
+            piece.position_x = x
+            piece.position_y = y
+            piece.position_z = z
+            piece.rot_z = int(rot_z) % 4
+        self._mark_dirty()
+        self._assemble_panel.sync_inspector(
+            pieces,
+            self._aselection,
+            self._aprimary,
+            self._assemble_block_labels(),
+        )
+        if self._tabs.currentIndex() == 1:
+            self._set_status(assemble_summary(self._project))
+
+    def _on_assemble_piece_placed(self, info: dict) -> None:
+        '''Drop a ghost copy from the parts panel onto the assembly.
+
+        Args:
+            info: Payload of :data:`AssembleView.piece_placed` with keys
+                ``block`` (block index), ``x``, ``y``, ``z``, ``rot_z``
+                and ``flipped``.
+        '''
+        block_index = int(info.get('block', -1))
+        if not 0 <= block_index < len(self._project.blocks):
+            return
+        self._begin_edit("assemble-place")
+        self._project.assemble.pieces.append(
+            AssembledPiece(
+                block_uid=self._project.blocks[block_index].uid,
+                position_x=float(info['x']),
+                position_y=float(info['y']),
+                position_z=float(info['z']),
+                rot_z=int(info.get('rot_z', 0)),
+                flipped=bool(info.get('flipped', False)),
+            )
+        )
+        self._mark_dirty()
+        self._sync_assemble()
+        # A linked block's quantity follows the new count (the placement
+        # scene resyncs inside _apply_linked_quantities).
+        self._apply_linked_quantities([block_index])
+        self._set_status(assemble_summary(self._project))
+
+    def _linked_block_indices(self, uids: set[str]) -> list[int]:
+        '''Indices of the linked blocks among those referenced by *uids*.'''
+        return [
+            index
+            for index, block in enumerate(self._project.blocks)
+            if block.uid in uids and block.quantity_linked
+        ]
+
+    def _on_assemble_delete(self) -> None:
+        '''Delete the selected assembled pieces (Del hotkey / panel button).
+
+        Only the placed copies are removed: the planned part (template)
+        stays in the panel with a placed count of 0, and linked block
+        quantities follow the new counts.
+        '''
+        if not self._aselection:
+            return
+        pieces = self._project.assemble.pieces
+        removed_uids = {
+            pieces[index].block_uid for index in self._aselection if index < len(pieces)
+        }
+        self._begin_edit("assemble-delete")
+        self._project.assemble.pieces = [
+            piece for index, piece in enumerate(pieces) if index not in self._aselection
+        ]
+        self._aselection = set()
+        self._aprimary = None
+        self._assemble_view.set_selection(set(), None)
+        self._mark_dirty()
+        self._sync_assemble()
+        self._apply_linked_quantities(self._linked_block_indices(removed_uids))
+        self._set_status(assemble_summary(self._project))
+
+    def _on_assemble_position_changed(self, x: float, y: float, z: float) -> None:
+        '''Apply the inspector position to the selected pieces.
+
+        The primary piece moves to the absolute coordinates; with a
+        multi-selection the whole group shifts by the same delta.
+        '''
+        if not self._aselection or self._aprimary is None:
+            return
+        pieces = self._project.assemble.pieces
+        if self._aprimary >= len(pieces):
+            return
+        self._begin_edit("assemble-position", coalesce=True)
+        primary = pieces[self._aprimary]
+        dx = x - primary.position_x
+        dy = y - primary.position_y
+        dz = z - primary.position_z
+        for index in sorted(self._aselection):
+            if index >= len(pieces):
+                continue
+            piece = pieces[index]
+            piece.position_x += dx
+            piece.position_y += dy
+            piece.position_z += dz
+        self._mark_dirty()
+        self._refresh_assemble_scene()
+        self._assemble_panel.sync_inspector(
+            pieces,
+            self._aselection,
+            self._aprimary,
+            self._assemble_block_labels(),
+        )
+
+    def _on_assemble_rotation_changed(self, rot_z: int) -> None:
+        '''Set the 90-degree Z rotation on all selected pieces.'''
+        if not self._aselection:
+            return
+        self._begin_edit("assemble-rotation", coalesce=True)
+        pieces = self._project.assemble.pieces
+        for index in sorted(self._aselection):
+            if index >= len(pieces):
+                continue
+            pieces[index].rot_z = int(rot_z) % 4
+        self._mark_dirty()
+        self._refresh_assemble_scene()
+        self._assemble_panel.sync_inspector(
+            pieces,
+            self._aselection,
+            self._aprimary,
+            self._assemble_block_labels(),
+        )
+
+    def _on_assemble_flip_changed(self, flipped: bool) -> None:
+        '''Set the 180-degree flip on all selected pieces.'''
+        if not self._aselection:
+            return
+        self._begin_edit("assemble-flip")
+        pieces = self._project.assemble.pieces
+        for index in sorted(self._aselection):
+            if index >= len(pieces):
+                continue
+            pieces[index].flipped = bool(flipped)
+        self._mark_dirty()
+        self._refresh_assemble_scene()
+        self._assemble_panel.sync_inspector(
+            pieces,
+            self._aselection,
+            self._aprimary,
+            self._assemble_block_labels(),
+        )
+
+    def _on_assemble_snap_grid(self, checked: bool) -> None:
+        '''Store the assemble snap-to-grid preference (per project).'''
+        self._project.assemble.view.snap_to_grid = bool(checked)
+        self._assemble_view.set_snap_enabled(bool(checked))
+        self._mark_dirty()
+
+    def _on_assemble_snap_parts(self, checked: bool) -> None:
+        '''Store the assemble snap-to-parts preference (per project).'''
+        self._project.assemble.view.snap_to_parts = bool(checked)
+        self._assemble_view.set_snap_parts(bool(checked))
+        self._mark_dirty()
+
+    def _on_parts_place_requested(self, block_uid: str) -> None:
+        '''Attach a ghost copy of the requested planned part to the cursor.
+
+        Args:
+            block_uid: uid of the block (color variant) to place.
+        '''
+        index = next(
+            (
+                i
+                for i, block in enumerate(self._project.blocks)
+                if block.uid == block_uid
+            ),
+            None,
+        )
+        if index is None:
+            return
+        mesh = self._block_meshes[index] if index < len(self._block_meshes) else None
+        if mesh is None or mesh.n_points == 0:
+            self._set_status(
+                "Part mesh is not ready yet - wait for the generation.",
+                error=True,
+            )
+            return
+        settings = self._project.block_settings(index)
+        self._assemble_view.start_placement(
+            mesh,
+            index,
+            settings.outer_length_x / 2,
+            settings.outer_length_y / 2,
+            settings.total_height,
+            self._project.blocks[index].color,
+        )
+        self._set_status(
+            "Placing: click drops a copy, R/Space rotates, F flips, Esc finishes."
+        )
 
 
 def main() -> None:

@@ -4,7 +4,7 @@ Brief:  Right-sidebar export panel for the print-placement tab: precision,
         format, per-bed vs single-file output and the export button.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.20.0
 '''
 
 from __future__ import annotations

@@ -3,7 +3,7 @@ File:   test_settings_io.py
 Brief:  Unit tests for JSON settings persistence.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.21.0
 '''
 
 from __future__ import annotations

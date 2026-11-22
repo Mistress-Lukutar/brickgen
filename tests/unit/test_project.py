@@ -3,7 +3,7 @@ File:   test_project.py
 Brief:  Unit tests for Project and BlockInstance models.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.21.0
 '''
 
 from __future__ import annotations
@@ -52,10 +52,12 @@ def test_invalid_color_rejected() -> None:
         BlockInstance(color="red")
 
 
-def test_quantity_zero_rejected() -> None:
-    '''quantity=0 is below ge=1 and must be rejected.'''
+def test_quantity_zero_allowed_negative_rejected() -> None:
+    '''quantity=0 is valid (linked blocks with no placed copies); negative
+    values must be rejected.'''
+    assert BlockInstance(quantity=0).quantity == 0
     with pytest.raises(SettingsValidationError):
-        BlockInstance(quantity=0)
+        BlockInstance(quantity=-1)
 
 
 def test_non_finite_position_rejected() -> None:

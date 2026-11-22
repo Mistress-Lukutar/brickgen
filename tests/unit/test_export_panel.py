@@ -3,7 +3,7 @@ File:   test_export_panel.py
 Brief:  Offscreen ExportPanel tests: settings sync, change signals, wiring.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.21.0
 '''
 
 from __future__ import annotations

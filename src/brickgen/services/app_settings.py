@@ -3,7 +3,7 @@ File:   app_settings.py
 Brief:  Persistent application preferences (precisions, default format).
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.20.0
 '''
 
 from __future__ import annotations

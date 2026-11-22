@@ -3,7 +3,7 @@ File:   grid_editor.py
 Brief:  Top-view cell grid editor: selection and per-cell feature states.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.20.0
 '''
 
 from __future__ import annotations

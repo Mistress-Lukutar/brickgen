@@ -3,7 +3,7 @@ File:   test_start_dialog.py
 Brief:  Unit tests for the startup welcome dialog (new/open/recent).
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.21.0
 '''
 
 from __future__ import annotations

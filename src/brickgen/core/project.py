@@ -3,7 +3,7 @@ File:   project.py
 Brief:  Project and placed-block models for the multi-block GUI scene.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.20.0
 '''
 
 from __future__ import annotations
@@ -223,7 +223,17 @@ class BlockInstance(BlockLayout):
     quantity: int = Field(
         default=1,
         description=(
-            "How many physical copies this placed block represents, for BOM tracking."
+            "How many physical copies this placed block represents, for BOM "
+            "tracking. 0 is allowed for blocks whose quantity is linked to "
+            "the Assemble tab before their first placed copy."
+        ),
+    )
+    quantity_linked: bool = Field(
+        default=False,
+        description=(
+            "True derives ``quantity`` from the number of this block's "
+            "copies placed on the Assemble tab; False keeps the manual "
+            "BOM quantity."
         ),
     )
 
@@ -239,9 +249,9 @@ class BlockInstance(BlockLayout):
     @classmethod
     def _validate_quantity(cls, value: int) -> int:
         '''Wrap pydantic bounds in SettingsValidationError.'''
-        if not (1 <= value <= _QUANTITY_MAX):
+        if not (0 <= value <= _QUANTITY_MAX):
             raise SettingsValidationError(
-                f"quantity must be between 1 and {_QUANTITY_MAX}"
+                f"quantity must be between 0 and {_QUANTITY_MAX}"
             )
         return value
 
@@ -492,6 +502,118 @@ class PrintLayout(BaseModel):
         return self
 
 
+class AssembledPiece(BaseModel):
+    '''One placed copy of a block on the Assemble tab.
+
+    ``block_uid`` references the :class:`BlockInstance` the copy is built
+    from (the copy inherits the block's geometry and color). The position
+    is the piece footprint CENTER in mm; ``position_z`` is the height of
+    the piece BOTTOM (0 = on the floor). ``rot_z`` counts 90-degree turns
+    about the Z axis (0..3, footprint swaps on odd values); ``flipped``
+    turns the piece 180 degrees about the X axis (pins down) and lifts it
+    by the block height, matching the print-placement flip semantics.
+    Model config:
+        extra: "forbid" — rejects unknown keys to catch payload typos.
+    '''
+
+    model_config = {"extra": "forbid"}
+
+    uid: str = Field(
+        default_factory=lambda: uuid.uuid4().hex,
+        description="Stable assembled-piece id.",
+    )
+    block_uid: str = Field(
+        description="uid of the BlockInstance this assembled copy is built from."
+    )
+    position_x: float = Field(
+        default=0.0,
+        description="Piece footprint center X, mm.",
+    )
+    position_y: float = Field(
+        default=0.0,
+        description="Piece footprint center Y, mm.",
+    )
+    position_z: float = Field(
+        default=0.0,
+        description="Height of the piece bottom above the floor, mm.",
+    )
+    rot_z: int = Field(
+        default=0,
+        description="Quarter turns (90 degrees each) about the Z axis, 0..3.",
+    )
+    flipped: bool = Field(
+        default=False,
+        description="180-deg rotation about X: pins point down.",
+    )
+
+    @field_validator("uid", "block_uid")
+    @classmethod
+    def _validate_uid_field(cls, value: str) -> str:
+        '''Ensure uid / block_uid are non-empty stripped strings.'''
+        if not value.strip():
+            raise SettingsValidationError("uid and block_uid must be non-empty strings")
+        return value
+
+    @field_validator("rot_z")
+    @classmethod
+    def _validate_rot_z(cls, value: int) -> int:
+        '''Restrict the quarter-turn count to the 0..3 range.'''
+        if not 0 <= value <= 3:
+            raise SettingsValidationError("rot_z must be a quarter-turn count 0..3")
+        return value
+
+    @field_validator("position_x", "position_y", "position_z")
+    @classmethod
+    def _validate_position(cls, value: float) -> float:
+        '''Reject non-finite position values (NaN / inf).'''
+        return _validate_finite(value, "position must be a finite number")
+
+
+class AssembleViewSettings(BaseModel):
+    '''Per-project Assemble-tab view preferences (snapping, floor grid).
+
+    The floor grid reuses the shared ``ViewSettings.grid_scale`` cell scale
+    (one Grid menu scale for every viewport); only the assemble-specific
+    toggles live here.
+    Model config:
+        extra: "forbid" — rejects unknown keys to catch payload typos.
+    '''
+
+    model_config = {"extra": "forbid"}
+
+    grid_enabled: bool = Field(
+        default=True,
+        description="Show the XY floor grid in the assemble viewport.",
+    )
+    snap_to_grid: bool = Field(
+        default=True,
+        description="Round piece placement to the grid step.",
+    )
+    snap_to_parts: bool = Field(
+        default=True,
+        description=(
+            "Magnetize pieces to other assembled pieces: drop onto the "
+            "topmost support under the footprint and align flush to the "
+            "sides of nearby pieces."
+        ),
+    )
+
+
+class AssembleState(BaseModel):
+    '''Assemble-tab state of a project: placed copies and view settings.'''
+
+    model_config = {"extra": "forbid"}
+
+    pieces: list[AssembledPiece] = Field(
+        default_factory=list,
+        description="Copies placed on the assemble scene.",
+    )
+    view: AssembleViewSettings = Field(
+        default_factory=AssembleViewSettings,
+        description="Assemble viewport snapping and grid preferences.",
+    )
+
+
 class ViewSettings(BaseModel):
     '''Per-project view preferences (View/Grid menu state).
 
@@ -571,6 +693,10 @@ class Project(BaseModel):
         default_factory=PrintLayout,
         description="Print-placement state: bed configuration and pieces.",
     )
+    assemble: AssembleState = Field(
+        default_factory=AssembleState,
+        description="Assemble-tab state: placed copies and view settings.",
+    )
     view: ViewSettings = Field(
         default_factory=ViewSettings,
         description=(
@@ -616,6 +742,9 @@ __all__ = [
     "PrintPiece",
     "PrintToolsSettings",
     "PrintLayout",
+    "AssembledPiece",
+    "AssembleViewSettings",
+    "AssembleState",
     "ViewSettings",
     "ExportSettings",
     "EXPORT_FORMATS",

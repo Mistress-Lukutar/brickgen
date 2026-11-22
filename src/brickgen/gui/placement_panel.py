@@ -4,7 +4,7 @@ Brief:  Left-sidebar panel for the print-placement tab: bed configuration,
         placement tools and the selected-piece inspector.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.19.0
+Version: v0.20.0
 '''
 
 from __future__ import annotations
