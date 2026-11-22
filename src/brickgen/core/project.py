@@ -2,14 +2,15 @@
 File:   project.py
 Brief:  Project and placed-block models for the multi-block GUI scene.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
 
 import re
 import uuid
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -45,6 +46,16 @@ LAYOUT_FIELDS: tuple[str, ...] = (
 
 _QUANTITY_MAX = 100000
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+# Anchor side of the per-block BOM quantity label (relative to each block).
+QuantityLabelPosition = Literal["left", "right", "top", "bottom"]
+QUANTITY_LABEL_POSITIONS: tuple[str, ...] = ("left", "right", "top", "bottom")
+
+# Grid cell scale presets offered by the Grid menu: the actual grid step is
+# ``unit_size * grid_scale`` mm (1.0 = one cell per Unit Size).
+GRID_SCALE_PRESETS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
+
+_GRID_SCALE_MAX = 1000.0
 
 # Print-placement piece.bed value meaning "not placed on any bed".
 PRINT_STAGING_BED = -1
@@ -374,12 +385,59 @@ class PrintLayout(BaseModel):
         return self
 
 
+class ViewSettings(BaseModel):
+    '''Per-project view preferences (View/Grid menu state).
+
+    Everything the user toggles through the View menu (BOM quantity labels
+    and their anchor side) and the Grid menu (floor grid, cell scale,
+    snap-to-grid) — for both the planning preview and the print-placement
+    viewport — lives here and is saved with the project file, so every
+    project restores its own view state on open.
+
+    Model config:
+        extra: "forbid" — rejects unknown keys to catch payload typos.
+    '''
+
+    model_config = {"extra": "forbid"}
+
+    grid_enabled: bool = Field(
+        default=False,
+        description="Show the XY floor grid in the planning preview.",
+    )
+    grid_scale: float = Field(
+        default=0.5,
+        gt=0,
+        le=_GRID_SCALE_MAX,
+        description=(
+            "Grid cell scale factor; the grid step is ``unit_size * grid_scale`` "
+            "mm (1.0 = one cell per Unit Size)."
+        ),
+    )
+    grid_snap: bool = Field(
+        default=False,
+        description="Snap block movement to the grid step.",
+    )
+    placement_grid_enabled: bool = Field(
+        default=False,
+        description="Show the floor grid on the print-placement viewport.",
+    )
+    quantity_labels_enabled: bool = Field(
+        default=False,
+        description="Show the BOM quantity label next to every placed block.",
+    )
+    quantity_label_position: QuantityLabelPosition = Field(
+        default="right",
+        description="Anchor side of the quantity label, relative to each block.",
+    )
+
+
 class Project(BaseModel):
     '''A multi-block project scene.
 
-    A project holds shared block geometry (``settings``) and a list of
-    placed block instances, each with its own grid size, per-cell layout,
-    scene position, color, and quantity.
+    A project holds shared block geometry (``settings``), a list of placed
+    block instances, each with its own grid size, per-cell layout, scene
+    position, color, and quantity, plus the per-project view settings
+    (grids, snapping, BOM labels).
 
     Convention: ``settings`` carries **shared geometry only**; its per-cell
     lists and stud/tube flags are unused. Per-instance layout and flags
@@ -405,6 +463,13 @@ class Project(BaseModel):
     print_layout: PrintLayout = Field(
         default_factory=PrintLayout,
         description="Print-placement state: bed configuration and pieces.",
+    )
+    view: ViewSettings = Field(
+        default_factory=ViewSettings,
+        description=(
+            "Per-project view settings: floor grids, cell scale, snap and "
+            "BOM quantity labels (View/Grid menu state)."
+        ),
     )
 
     def block_settings(self, index: int) -> BlockSettings:
@@ -436,4 +501,8 @@ __all__ = [
     "PrintBedSettings",
     "PrintPiece",
     "PrintLayout",
+    "ViewSettings",
+    "QuantityLabelPosition",
+    "QUANTITY_LABEL_POSITIONS",
+    "GRID_SCALE_PRESETS",
 ]

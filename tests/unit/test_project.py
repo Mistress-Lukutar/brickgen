@@ -2,8 +2,8 @@
 File:   test_project.py
 Brief:  Unit tests for Project and BlockInstance models.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -14,12 +14,15 @@ from brickgen.core.exceptions import SettingsValidationError
 from brickgen.core.models import BlockSettings
 from brickgen.core.project import (
     DEFAULT_BLOCK_COLOR,
+    GRID_SCALE_PRESETS,
     PRINT_STAGING_BED,
+    QUANTITY_LABEL_POSITIONS,
     BlockInstance,
     PrintBedSettings,
     PrintLayout,
     PrintPiece,
     Project,
+    ViewSettings,
 )
 
 
@@ -354,3 +357,59 @@ def test_project_with_valid_pieces_validates() -> None:
         )
     )
     assert len(proj.print_layout.pieces) == 3
+
+
+# -------------------------------------------------------- Project.view
+def test_view_settings_defaults() -> None:
+    '''ViewSettings exposes the documented factory defaults.'''
+    view = ViewSettings()
+    assert view.grid_enabled is False
+    assert view.grid_scale == 0.5
+    assert view.grid_snap is False
+    assert view.placement_grid_enabled is False
+    assert view.quantity_labels_enabled is False
+    assert view.quantity_label_position == "right"
+
+
+def test_view_settings_scale_bounds() -> None:
+    '''Grid scale must be a finite positive number within the cap.'''
+    ViewSettings(grid_scale=1000.0)
+    with pytest.raises(Exception):
+        ViewSettings(grid_scale=0.0)
+    with pytest.raises(Exception):
+        ViewSettings(grid_scale=-0.5)
+    with pytest.raises(Exception):
+        ViewSettings(grid_scale=1000.5)
+    # NaN / inf fail the gt/le field constraints.
+    with pytest.raises(Exception):
+        ViewSettings(grid_scale=float("nan"))
+    with pytest.raises(Exception):
+        ViewSettings(grid_scale=float("inf"))
+
+
+def test_view_settings_position_literal_rejected() -> None:
+    '''Only the documented anchor sides are accepted.'''
+    assert set(QUANTITY_LABEL_POSITIONS) == {"left", "right", "top", "bottom"}
+    with pytest.raises(Exception):
+        ViewSettings(quantity_label_position="diagonal")
+
+
+def test_view_settings_unknown_key_rejected() -> None:
+    '''Unknown keys are rejected (extra="forbid").'''
+    with pytest.raises(Exception):
+        ViewSettings(grid_scalee=1.0)  # type: ignore[call-arg]
+
+
+def test_grid_scale_presets_offered() -> None:
+    '''The Grid menu offers the documented scale presets incl. 0.5 / 1 / 10.'''
+    for scale in (0.25, 0.5, 1.0, 2.0, 5.0, 10.0):
+        assert scale in GRID_SCALE_PRESETS
+
+
+def test_project_view_default_and_custom() -> None:
+    '''A project without explicit view gets defaults; a custom one sticks.'''
+    proj = Project()
+    assert proj.view == ViewSettings()
+    proj2 = Project(view=ViewSettings(grid_snap=True, grid_scale=2.0))
+    assert proj2.view.grid_snap is True
+    assert proj2.view.grid_scale == 2.0

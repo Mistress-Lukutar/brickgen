@@ -4,7 +4,7 @@ Parametric stud-block (LEGO-like) generator built on CadQuery/OCC, with a PySide
 
 ## Layout
 
-- `src/brickgen/core/` — geometry domain: `models.py` (Pydantic `BlockSettings`, validators, `MAX_CELLS=64` sanity limits), `project.py` (project/scene models + print-placement models, schema v6), `builder.py` (CadQuery geometry), `exceptions.py`. No Qt imports allowed here.
+- `src/brickgen/core/` — geometry domain: `models.py` (Pydantic `BlockSettings`, validators, `MAX_CELLS=64` sanity limits), `project.py` (project/scene models + print-placement + per-project view models, schema v8), `builder.py` (CadQuery geometry), `exceptions.py`. No Qt imports allowed here.
 - `src/brickgen/services/` — export, placement engine (`placement_service.py`, pure), print-bed compounds (`print_export.py`, cadquery allowed), template library, settings/project I/O. No Qt.
 - `src/brickgen/gui/` — PySide6 + PyVistaQt UI (`app.py`, `preview.py`, planning tab; `placement_view.py`/`placement_panel.py`, print-placement tab), background jobs (`jobs.py` process queue, `jobtasks.py` worker-side tasks).
 - `src/brickgen/cli/` — Typer headless entry (`brickgen` script; commands `export` — project file → per-bed files, `formats`); GUI entry is `brickgen-gui` / `python -m brickgen.gui.app`.

@@ -2,8 +2,8 @@
 File:   project_io.py
 Brief:  JSON save/load of multi-block GUI projects with legacy settings migration.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -28,12 +28,14 @@ logger = logging.getLogger(__name__)
 
 PROJECT_SCHEMA_KEY = "schema"
 PROJECT_SCHEMA_NAME = "brickgen-project"
-PROJECT_SCHEMA_VERSION = 7
+PROJECT_SCHEMA_VERSION = 8
 # Versions accepted by load_project: v4/v5 payloads are migrated on the fly
 # (v4 kept pins/tubes flags on the shared settings, v5 moved them onto
 # each block, v6 added print_layout and block uids, v7 added the per-piece
-# rotated90 flag).
-_MIGRATABLE_VERSIONS = (4, 5, 6, 7)
+# rotated90 flag, v8 added the per-project view settings). v8 needs no
+# payload backfill: a missing ``view`` key falls back to ViewSettings
+# defaults, matching how pre-v8 projects rendered.
+_MIGRATABLE_VERSIONS = (4, 5, 6, 7, 8)
 
 
 def save_project(project: Project, path: Path) -> Path:
@@ -60,6 +62,7 @@ def save_project(project: Project, path: Path) -> Path:
         },
         "blocks": [block.model_dump() for block in project.blocks],
         "print_layout": project.print_layout.model_dump(),
+        "view": project.view.model_dump(),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,10 +78,13 @@ def save_project(project: Project, path: Path) -> Path:
 def load_project(path: Path) -> Project:
     '''Load a project from a JSON file.
 
-    Supports the current project schema (v6), previous v5 (per-block
+    Supports the current project schema (v8), previous v7 (per-piece
+    rotated90 flag), v6 (print_layout + block uids), v5 (per-block
     pins/tubes flags) and v4 (pins/tubes on shared settings), with
     automatic migration, plus legacy single-block preset files that lack
     a ``blocks`` key or carry the old ``brickgen-settings`` schema marker.
+    Pre-v8 files carry no view settings, so they load with the
+    ``ViewSettings`` defaults.
 
     Args:
         path: Source ``*.json`` path.

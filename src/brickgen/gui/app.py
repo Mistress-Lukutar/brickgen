@@ -2,8 +2,8 @@
 File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -52,8 +52,10 @@ from brickgen.core.models import (
 )
 from brickgen.core.project import (
     BLOCK_FLAG_FIELDS,
+    GRID_SCALE_PRESETS,
     LAYOUT_FIELDS,
     PRINT_STAGING_BED,
+    QUANTITY_LABEL_POSITIONS,
     BlockInstance,
     BlockLayout,
     PrintBedSettings,
@@ -71,12 +73,7 @@ from brickgen.gui.preview import (
     PreviewWidget,
     mesh_from_arrays,
 )
-from brickgen.services.app_settings import (
-    GRID_SCALE_PRESETS,
-    QUANTITY_LABEL_POSITIONS,
-    load_app_settings,
-    save_app_settings,
-)
+from brickgen.services.app_settings import load_app_settings, save_app_settings
 from brickgen.services.export_service import SUPPORTED_FORMATS
 from brickgen.services.placement_service import (
     auto_place,
@@ -181,11 +178,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
         # Menus after the preview pane: the View actions bind to the preview.
         self._build_menus()
-        # Floor grid: unit size from the shared settings, the rest persisted.
+        # Floor grid: unit size from the shared settings; every other view
+        # option comes from the per-project view settings.
         self._preview.set_grid_unit(self._project.settings.unit_size)
-        self._preview.set_grid_scale(self._app_settings.grid_scale)
-        self._preview.set_snap_enabled(self._app_settings.grid_snap)
-        self._preview.set_grid_enabled(self._app_settings.grid_enabled)
+        self._apply_view_settings()
 
         # Auto-generation: debounced rebuild after any parameter change.
         self._regen_timer = QTimer(self)
@@ -224,22 +220,30 @@ class MainWindow(QMainWindow):
         # When entering tab 1: push shared settings into placement view.
         if index == 1:
             self._placement_view.set_grid_unit(self._project.settings.unit_size)
-            self._placement_view.set_grid_scale(self._app_settings.grid_scale)
-            self._placement_view.set_snap_enabled(self._app_settings.grid_snap)
+            self._placement_view.set_grid_scale(self._project.view.grid_scale)
+            self._placement_view.set_snap_enabled(self._project.view.grid_snap)
             self._placement_view.set_grid_enabled(
-                self._app_settings.placement_grid_enabled
+                self._project.view.placement_grid_enabled
             )
             self._placement_view.set_print_beds(self._project.print_layout.beds)
             self._sync_placement()
 
     def _refresh_grid_action_state(self) -> None:
-        '''Update the "Show grid" action checked state from the active preview.'''
+        '''Update the "Show grid" action checked state from the active preview.
+
+        The check change is signal-blocked: a programmatic sync must not
+        re-enter ``_on_grid_show`` (which would treat it as a user edit and
+        dirty the project on a mere tab switch).
+        '''
         if self._tabs.currentIndex() == 0:
-            self._act_show_grid.setChecked(self._app_settings.grid_enabled)
+            checked = self._project.view.grid_enabled
         else:
-            self._act_show_grid.setChecked(
-                self._app_settings.placement_grid_enabled
-            )
+            checked = self._project.view.placement_grid_enabled
+        self._act_show_grid.blockSignals(True)
+        try:
+            self._act_show_grid.setChecked(checked)
+        finally:
+            self._act_show_grid.blockSignals(False)
 
     # ------------------------------------------------------------------ menus
     def _build_menus(self) -> None:
@@ -301,48 +305,56 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         self._act_qty_labels = QAction("Show &block quantities", self)
         self._act_qty_labels.setCheckable(True)
-        self._act_qty_labels.setChecked(self._app_settings.quantity_labels_enabled)
+        self._act_qty_labels.setChecked(self._project.view.quantity_labels_enabled)
         self._act_qty_labels.toggled.connect(self._on_view_qty_labels)
         view_menu.addAction(self._act_qty_labels)
         position_menu = view_menu.addMenu("Quantity label &position")
         position_group = QActionGroup(self)
+        self._act_qty_positions: dict[str, QAction] = {}
         for position in QUANTITY_LABEL_POSITIONS:
             act_pos = QAction(position.capitalize(), self)
             act_pos.setCheckable(True)
-            act_pos.setChecked(position == self._app_settings.quantity_label_position)
+            act_pos.setChecked(position == self._project.view.quantity_label_position)
             act_pos.triggered.connect(
                 lambda checked=False, p=position: self._on_view_qty_position(p)
             )
             position_group.addAction(act_pos)
             position_menu.addAction(act_pos)
+            self._act_qty_positions[position] = act_pos
 
         grid_menu = self.menuBar().addMenu("&Grid")
         self._act_show_grid = QAction("Show &grid", self)
         self._act_show_grid.setCheckable(True)
-        self._act_show_grid.setChecked(self._app_settings.grid_enabled)
+        self._act_show_grid.setChecked(
+            self._project.view.grid_enabled
+            if self._tabs.currentIndex() == 0
+            else self._project.view.placement_grid_enabled
+        )
         self._act_show_grid.toggled.connect(self._on_grid_show)
         grid_menu.addAction(self._act_show_grid)
         grid_menu.addSeparator()
         scale_menu = grid_menu.addMenu("Cell &scale")
         scale_group = QActionGroup(self)
+        self._act_grid_scale: dict[float, QAction] = {}
         for scale in GRID_SCALE_PRESETS:
             act_scale = QAction(self._grid_scale_label(scale), self)
             act_scale.setCheckable(True)
-            act_scale.setChecked(scale == self._app_settings.grid_scale)
+            act_scale.setChecked(scale == self._project.view.grid_scale)
             act_scale.triggered.connect(
                 lambda checked=False, s=scale: self._on_grid_scale(s)
             )
             scale_group.addAction(act_scale)
             scale_menu.addAction(act_scale)
+            self._act_grid_scale[scale] = act_scale
         grid_menu.addSeparator()
-        act_snap = QAction("&Snap to grid", self)
-        act_snap.setCheckable(True)
-        act_snap.setChecked(self._app_settings.grid_snap)
-        act_snap.setToolTip(
+        self._act_snap = QAction("&Snap to grid", self)
+        self._act_snap.setCheckable(True)
+        self._act_snap.setChecked(self._project.view.grid_snap)
+        self._act_snap.setToolTip(
             "Gizmo and G-grab moves round to the grid step (unit size x cell scale)."
         )
-        act_snap.toggled.connect(self._on_grid_snap)
-        grid_menu.addAction(act_snap)
+        self._act_snap.toggled.connect(self._on_grid_snap)
+        grid_menu.addAction(self._act_snap)
 
     # ------------------------------------------------------------------ layout
     def _build_sidebar(self) -> QWidget:
@@ -635,33 +647,21 @@ class MainWindow(QMainWindow):
         self._block_color.clicked.connect(self._on_block_color_clicked)
 
         # Placement signals.
-        self._placement_view.selection_changed.connect(
-            self._on_placement_selection
-        )
-        self._placement_view.blocks_moved.connect(
-            self._on_placement_pieces_moved
-        )
-        self._placement_panel.beds_changed.connect(
-            self._on_placement_beds_changed
-        )
+        self._placement_view.selection_changed.connect(self._on_placement_selection)
+        self._placement_view.blocks_moved.connect(self._on_placement_pieces_moved)
+        self._placement_panel.beds_changed.connect(self._on_placement_beds_changed)
         self._placement_panel.auto_place_requested.connect(
             self._on_placement_auto_place
         )
         self._placement_panel.distribute_requested.connect(
             self._on_placement_distribute
         )
-        self._placement_panel.piece_bed_changed.connect(
-            self._on_piece_bed_changed
-        )
+        self._placement_panel.piece_bed_changed.connect(self._on_piece_bed_changed)
         self._placement_panel.piece_position_changed.connect(
             self._on_piece_position_changed
         )
-        self._placement_panel.piece_flip_changed.connect(
-            self._on_piece_flip_changed
-        )
-        self._placement_panel.flip_selection_requested.connect(
-            self._on_flip_selection
-        )
+        self._placement_panel.piece_flip_changed.connect(self._on_piece_flip_changed)
+        self._placement_panel.flip_selection_requested.connect(self._on_flip_selection)
         self._placement_panel.stage_selection_requested.connect(
             self._on_stage_selection
         )
@@ -823,6 +823,7 @@ class MainWindow(QMainWindow):
         self._block_meshes = []
         self._mesh_variants = {}
         self._mark_clean()
+        self._apply_view_settings()
         self._sync_all()
         self._placement_view.set_print_beds(self._project.print_layout.beds)
         self._placement_panel.set_beds(self._project.print_layout.beds)
@@ -855,6 +856,8 @@ class MainWindow(QMainWindow):
         self._block_meshes = []
         self._mesh_variants = {}
         self._mark_clean()
+        # Restore the project's own view state (grids, snap, labels).
+        self._apply_view_settings()
         self._sync_all()
         self._placement_view.set_print_beds(self._project.print_layout.beds)
         self._placement_panel.set_beds(self._project.print_layout.beds)
@@ -1527,43 +1530,89 @@ class MainWindow(QMainWindow):
         '''Menu label of a grid cell scale preset (e.g. ``50%``).'''
         return f"{round(scale * 100)}%"
 
+    def _apply_view_settings(self) -> None:
+        '''Push the per-project view settings into both previews and menus.
+
+        Called on startup and whenever the whole project is replaced
+        (new/open), so the view state always matches ``self._project``.
+        '''
+        view = self._project.view
+        self._preview.set_grid_scale(view.grid_scale)
+        self._preview.set_snap_enabled(view.grid_snap)
+        self._preview.set_grid_enabled(view.grid_enabled)
+        self._preview.set_quantity_labels(
+            view.quantity_labels_enabled, view.quantity_label_position
+        )
+        self._placement_view.set_grid_scale(view.grid_scale)
+        self._placement_view.set_snap_enabled(view.grid_snap)
+        self._placement_view.set_grid_enabled(view.placement_grid_enabled)
+        self._refresh_view_actions()
+
+    def _refresh_view_actions(self) -> None:
+        '''Sync the View/Grid menu checked states from the project view.
+
+        Signal-blocked: the programmatic check changes must not re-enter
+        the toggle handlers (which would dirty the project on open/new).
+        '''
+        view = self._project.view
+        actions: list[QAction] = [
+            self._act_show_grid,
+            self._act_snap,
+            self._act_qty_labels,
+            *self._act_grid_scale.values(),
+            *self._act_qty_positions.values(),
+        ]
+        for action in actions:
+            action.blockSignals(True)
+        try:
+            self._act_show_grid.setChecked(view.grid_enabled)
+            self._act_snap.setChecked(view.grid_snap)
+            self._act_qty_labels.setChecked(view.quantity_labels_enabled)
+            for scale, action in self._act_grid_scale.items():
+                action.setChecked(scale == view.grid_scale)
+            for position, action in self._act_qty_positions.items():
+                action.setChecked(position == view.quantity_label_position)
+        finally:
+            for action in actions:
+                action.blockSignals(False)
+
     def _on_grid_show(self, checked: bool) -> None:
-        '''Toggle the floor grid on the active preview and persist it.'''
+        '''Toggle the floor grid on the active preview (stored per project).'''
         if self._tabs.currentIndex() == 0:
-            self._app_settings.grid_enabled = checked
+            self._project.view.grid_enabled = checked
         else:
-            self._app_settings.placement_grid_enabled = checked
-        self._save_app_settings()
+            self._project.view.placement_grid_enabled = checked
+        self._mark_dirty()
         self._active_preview().set_grid_enabled(checked)
 
     def _on_grid_scale(self, scale: float) -> None:
-        '''Set the grid cell scale factor and persist it (both previews).'''
-        self._app_settings.grid_scale = scale
-        self._save_app_settings()
+        '''Set the grid cell scale factor (stored per project, both previews).'''
+        self._project.view.grid_scale = scale
+        self._mark_dirty()
         self._preview.set_grid_scale(scale)
         self._placement_view.set_grid_scale(scale)
 
     def _on_grid_snap(self, checked: bool) -> None:
-        '''Toggle snap-to-grid movement and persist it (both previews).'''
-        self._app_settings.grid_snap = checked
-        self._save_app_settings()
+        '''Toggle snap-to-grid movement (stored per project, both previews).'''
+        self._project.view.grid_snap = checked
+        self._mark_dirty()
         self._preview.set_snap_enabled(checked)
         self._placement_view.set_snap_enabled(checked)
 
     def _on_view_qty_labels(self, checked: bool) -> None:
-        '''Toggle the per-block BOM quantity labels and persist it.'''
-        self._app_settings.quantity_labels_enabled = checked
-        self._save_app_settings()
+        '''Toggle the per-block BOM quantity labels (stored per project).'''
+        self._project.view.quantity_labels_enabled = checked
+        self._mark_dirty()
         self._preview.set_quantity_labels(
-            checked, self._app_settings.quantity_label_position
+            checked, self._project.view.quantity_label_position
         )
 
     def _on_view_qty_position(self, position: str) -> None:
-        '''Set the quantity label anchor side and persist it.'''
-        self._app_settings.quantity_label_position = position  # type: ignore[assignment]
-        self._save_app_settings()
+        '''Set the quantity label anchor side (stored per project).'''
+        self._project.view.quantity_label_position = position  # type: ignore[assignment]
+        self._mark_dirty()
         self._preview.set_quantity_labels(
-            self._app_settings.quantity_labels_enabled, position
+            self._project.view.quantity_labels_enabled, position
         )
 
     def _save_app_settings(self) -> None:
@@ -1921,14 +1970,16 @@ class MainWindow(QMainWindow):
 
             wx, wy = world_position(piece, beds)
             half_x, half_y = piece_dims(piece, footprints)
-            meta_out.append({
-                'pos_x': wx,
-                'pos_y': wy,
-                'half_x': half_x / 2.0,
-                'half_y': half_y / 2.0,
-                'top_z': heights.get(piece.block_uid, 0),
-                'quantity': 1,
-            })
+            meta_out.append(
+                {
+                    'pos_x': wx,
+                    'pos_y': wy,
+                    'half_x': half_x / 2.0,
+                    'half_y': half_y / 2.0,
+                    'top_z': heights.get(piece.block_uid, 0),
+                    'quantity': 1,
+                }
+            )
             colors_out.append(colors_map.get(piece.block_uid, "#3f7fbf"))
             meshes_out.append(mesh)
 
@@ -1992,9 +2043,7 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------- placement handlers
 
-    def _on_placement_selection(
-        self, payload: object
-    ) -> None:
+    def _on_placement_selection(self, payload: object) -> None:
         '''Sync placement selection state.'''
         selection, primary = cast(tuple[frozenset, int | None], payload)
         n_pieces = len(self._project.print_layout.pieces)
@@ -2064,9 +2113,7 @@ class MainWindow(QMainWindow):
                 f"Auto-placed {report.placed} pieces ({report.staged} staged)"
             )
 
-    def _on_placement_distribute(
-        self, mode: str, indices: list[int]
-    ) -> None:
+    def _on_placement_distribute(self, mode: str, indices: list[int]) -> None:
         '''Handle distribute request.'''
         report = distribute(self._project, mode, indices)
         self._mark_dirty()

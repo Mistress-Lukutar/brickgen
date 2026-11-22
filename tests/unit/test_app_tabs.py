@@ -2,8 +2,8 @@
 File:   test_app_tabs.py
 Brief:  Integration tests for the MainWindow tab integration (S4).
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from brickgen.core.project import (  # noqa: E402
     PRINT_STAGING_BED,
     BlockInstance,
     PrintBedSettings,
+    ViewSettings,
 )
 from brickgen.gui.app import MainWindow  # noqa: E402
 from brickgen.services.placement_service import (  # noqa: E402
@@ -217,9 +218,7 @@ def test_auto_place_handler(window: MainWindow) -> None:
     pieces = window._project.print_layout.pieces
     assert len(pieces) == 4  # 2 + 2
     assert all(p.bed == 0 for p in pieces)
-    assert all(
-        p.bed != PRINT_STAGING_BED for p in pieces
-    )
+    assert all(p.bed != PRINT_STAGING_BED for p in pieces)
 
 
 def test_panel_beds_signal_updates_project(window: MainWindow) -> None:
@@ -267,3 +266,46 @@ def test_rotated_piece_builds_variant_mesh(window: MainWindow) -> None:
     assert variant.n_points > 0
     # The viewport still shows the piece.
     assert len(window._placement_view._block_actors) == 1
+
+
+def test_view_settings_stored_in_project(window: MainWindow) -> None:
+    '''Grid/View menu toggles mutate ``project.view`` and dirty the project;
+    ``_apply_view_settings`` pushes the values into the previews.'''
+    _reset_state(window)
+    window._project.view = ViewSettings()
+    window._apply_view_settings()
+    window._dirty = False
+
+    # Planning-tab grid toggle lands in the project view.
+    window._tabs.setCurrentIndex(0)
+    window._act_show_grid.setChecked(True)
+    assert window._project.view.grid_enabled is True
+    assert window._preview._grid_enabled is True
+    assert window._dirty is True
+
+    # Placement-tab grid toggle uses its own flag.
+    window._tabs.setCurrentIndex(1)
+    window._act_show_grid.setChecked(True)
+    assert window._project.view.placement_grid_enabled is True
+    assert window._placement_view._grid_enabled is True
+
+    # Scale / snap / labels are shared project-level values.
+    window._tabs.setCurrentIndex(0)
+    window._act_grid_scale[2.0].trigger()
+    window._act_snap.setChecked(True)
+    window._act_qty_labels.setChecked(True)
+    window._act_qty_positions["top"].trigger()
+    view = window._project.view
+    assert view.grid_scale == 2.0
+    assert view.grid_snap is True
+    assert view.quantity_labels_enabled is True
+    assert view.quantity_label_position == "top"
+    assert window._preview._grid_scale == 2.0
+    assert window._preview._grid_snap is True
+    assert window._preview._qty_enabled is True
+    assert window._preview._qty_position == "top"
+
+    # Restore pristine state for the following tests.
+    window._project.view = ViewSettings()
+    window._apply_view_settings()
+    window._dirty = False

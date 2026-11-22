@@ -2,8 +2,8 @@
 File:   test_project_io.py
 Brief:  Unit tests for JSON save/load of multi-block projects.
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from brickgen.core.project import (
     PrintLayout,
     PrintPiece,
     Project,
+    ViewSettings,
 )
 from brickgen.services.project_io import (
     PROJECT_SCHEMA_NAME,
@@ -85,7 +86,7 @@ def test_save_load_roundtrip(tmp_path: Path) -> None:
 
 # ------------------------------------------------------- saved file format
 def test_saved_file_has_correct_schema(tmp_path: Path) -> None:
-    '''Saved JSON must contain schema brickgen-project version 6.'''
+    '''Saved JSON must contain the brickgen-project schema marker and version.'''
     proj = Project(blocks=[BlockInstance()])
     path = save_project(proj, tmp_path / "project.json")
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -419,8 +420,14 @@ def test_load_v6_payload_backfills_rotated90(tmp_path: Path) -> None:
     payload["print_layout"] = {
         "beds": {"width": 220.0, "depth": 220.0, "count": 1, "gap": 4.0},
         "pieces": [
-            {"uid": "pc1", "block_uid": "blk_v6", "bed": 0,
-             "position_x": 8.0, "position_y": 8.0, "flipped": False},
+            {
+                "uid": "pc1",
+                "block_uid": "blk_v6",
+                "bed": 0,
+                "position_x": 8.0,
+                "position_y": 8.0,
+                "flipped": False,
+            },
         ],
     }
     path = tmp_path / "v6_pieces.json"
@@ -551,3 +558,71 @@ def test_save_includes_print_layout_key(tmp_path: Path) -> None:
     path = save_project(proj, tmp_path / "has_pl.json")
     text = path.read_text(encoding="utf-8")
     assert '"print_layout"' in text
+
+
+# ------------------------------------------------------------ view settings
+def test_save_includes_view_key(tmp_path: Path) -> None:
+    '''Saving a project writes "view" key into the JSON file.'''
+    proj = Project(blocks=[BlockInstance()])
+    path = save_project(proj, tmp_path / "has_view.json")
+    assert '"view"' in path.read_text(encoding="utf-8")
+
+
+def test_view_settings_roundtrip(tmp_path: Path) -> None:
+    '''Custom per-project view settings survive save/load unchanged.'''
+    proj = Project(blocks=[BlockInstance()])
+    proj.view.grid_enabled = True
+    proj.view.grid_scale = 5.0
+    proj.view.grid_snap = True
+    proj.view.placement_grid_enabled = True
+    proj.view.quantity_labels_enabled = True
+    proj.view.quantity_label_position = "top"
+
+    path = save_project(proj, tmp_path / "view.json")
+    loaded = load_project(path)
+    assert loaded.view == proj.view
+
+
+def test_invalid_view_value_raises(tmp_path: Path) -> None:
+    '''A payload with an out-of-domain view value must raise ProjectIOError.'''
+    payload = {
+        "schema": {"name": PROJECT_SCHEMA_NAME, "version": PROJECT_SCHEMA_VERSION},
+        "blocks": [],
+        "view": {"grid_scale": 0.0},
+    }
+    path = tmp_path / "bad_view.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ProjectIOError, match="Invalid project"):
+        load_project(path)
+
+
+def test_v7_payload_loads_with_default_view(tmp_path: Path) -> None:
+    '''A v7 payload without "view" loads with ViewSettings defaults.
+
+    Pre-v8 projects carry no view settings; loading falls back to the
+    factory defaults and the next save writes the current schema version.
+    '''
+    payload = {
+        "schema": {"name": PROJECT_SCHEMA_NAME, "version": 7},
+        "settings": {
+            field: getattr(BlockSettings(), field)
+            for field in (
+                "unit_size",
+                "wall_thickness",
+                "block_height",
+                "clearance_xy",
+                "clearance_z",
+            )
+        },
+        "blocks": [],
+        "print_layout": {"beds": {}, "pieces": []},
+    }
+    path = tmp_path / "v7.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    proj = load_project(path)
+    assert proj.view == ViewSettings()
+
+    resaved = save_project(proj, tmp_path / "resaved.json")
+    resaved_payload = json.loads(resaved.read_text(encoding="utf-8"))
+    assert resaved_payload["schema"]["version"] == PROJECT_SCHEMA_VERSION
+    assert resaved_payload["view"]["grid_scale"] == 0.5

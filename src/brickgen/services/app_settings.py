@@ -2,8 +2,8 @@
 File:   app_settings.py
 Brief:  Persistent application preferences (precisions, default format).
 Author: Mistress-Lukutar
-Date:   2026-11-21
-Version: v0.15.0
+Date:   2026-11-22
+Version: v0.16.0
 '''
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -19,17 +18,13 @@ from brickgen.services.export_service import SUPPORTED_FORMATS
 
 logger = logging.getLogger(__name__)
 
-# Anchor side of the per-block BOM quantity label (relative to each block).
-QuantityLabelPosition = Literal["left", "right", "top", "bottom"]
-QUANTITY_LABEL_POSITIONS: tuple[str, ...] = ("left", "right", "top", "bottom")
-
-# Grid cell scale presets offered by the Grid menu: the actual grid step is
-# ``unit_size * grid_scale`` mm (1.0 = one cell per Unit Size).
-GRID_SCALE_PRESETS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
-
 
 class AppSettings(BaseModel):
     '''Application-level preferences persisted across sessions.
+
+    View state (grids, snapping, BOM labels) is NOT stored here anymore:
+    since v0.16.0 it is per-project data in ``core.project.ViewSettings``
+    and travels inside the project file.
 
     Attributes:
         preview_tolerance: Tessellation tolerance and edge chord-deviation
@@ -38,16 +33,6 @@ class AppSettings(BaseModel):
         export_tolerance: Mesh tolerance for tessellated export formats
             (STL/AMF/3MF), mm.
         default_format: Format preselected in the export dialog.
-        quantity_labels_enabled: Show the BOM quantity label next to every
-            placed block in the preview (View menu toggle).
-        quantity_label_position: Anchor side of the quantity label,
-            relative to each block.
-        grid_enabled: Show the XY floor grid in the preview (Grid menu).
-        grid_scale: Grid cell scale factor; the grid step is
-            ``unit_size * grid_scale`` mm (1.0 = one cell per Unit Size).
-        grid_snap: Snap block movement to the grid step (Grid menu).
-        placement_grid_enabled: Show the floor grid on the print-placement
-            viewport.
     '''
 
     preview_tolerance: float = Field(default=0.15, gt=0, le=1.0)
@@ -55,15 +40,6 @@ class AppSettings(BaseModel):
     export_tolerance: float = Field(default=0.1, gt=0, le=1.0)
     export_angular_tolerance: float = Field(default=0.1, gt=0, le=1.0)
     default_format: str = "STEP"
-    quantity_labels_enabled: bool = False
-    quantity_label_position: QuantityLabelPosition = "right"
-    grid_enabled: bool = False
-    grid_scale: float = Field(default=0.5, gt=0, le=1000.0)
-    grid_snap: bool = False
-    placement_grid_enabled: bool = Field(
-        default=False,
-        description="Show the floor grid on the print-placement viewport.",
-    )
 
     model_config = {"extra": "forbid"}
 
@@ -96,7 +72,9 @@ def load_app_settings() -> AppSettings:
     '''Load application preferences, falling back to defaults.
 
     A missing, unreadable or invalid file yields factory defaults (with a
-    warning in the log), so the GUI always starts.
+    warning in the log), so the GUI always starts. Keys unknown to the
+    current model — e.g. the per-project view settings stored here before
+    v0.16.0 — are dropped with a note instead of failing the whole file.
 
     Returns:
         Loaded or default AppSettings.
@@ -106,6 +84,16 @@ def load_app_settings() -> AppSettings:
         return AppSettings()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            known = AppSettings.model_fields
+            unknown = set(payload) - known.keys()
+            if unknown:
+                logger.info(
+                    "App settings %s ignored legacy keys: %s",
+                    path,
+                    ", ".join(sorted(unknown)),
+                )
+                payload = {k: v for k, v in payload.items() if k in known}
         return AppSettings.model_validate(payload)
     except Exception as exc:  # noqa: BLE001 - any failure falls back to defaults
         logger.warning("App settings %s unreadable, using defaults: %s", path, exc)

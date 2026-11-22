@@ -2,7 +2,7 @@
 File:   test_jobs.py
 Brief:  Unit tests for JobQueue (process-based background job queue).
 Author: Mistress-Lukutar
-Date:   2026-11-21
+Date:   2026-11-22
 """
 
 import os
