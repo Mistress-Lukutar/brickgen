@@ -657,9 +657,11 @@ def test_grid_actors_created_and_cleared(preview: PreviewWidget) -> None:
     assert preview.grid_step() == pytest.approx(2.0)
     preview.set_grid_enabled(True)
     # Minor lines, major lines, X axis, Y axis, X labels, Y labels.
-    assert len(preview._grid_actors) >= 6
+    assert len(preview._grid_actors) >= 4
+    assert len(preview._grid_label_actors) >= 2
     preview.set_grid_enabled(False)
     assert preview._grid_actors == []
+    assert preview._grid_label_actors == []
 
 
 def test_grid_scale_extends_step(preview: PreviewWidget) -> None:
@@ -680,7 +682,8 @@ def test_grid_present_with_empty_scene(preview: PreviewWidget) -> None:
     preview.set_grid_enabled(True)
     # Clear the scene and call update_scene with empty lists.
     preview.update_scene([], [], [])
-    assert len(preview._grid_actors) >= 6
+    assert len(preview._grid_actors) >= 4
+    assert len(preview._grid_label_actors) >= 2
 
 
 def test_grid_survives_scene_update(preview: PreviewWidget) -> None:
@@ -692,7 +695,8 @@ def test_grid_survives_scene_update(preview: PreviewWidget) -> None:
     # Re-trigger the scene with the same data.
     meshes = [preview._scene_meshes[0]] if preview._scene_meshes else [_cube_mesh()]
     preview.update_scene(meshes, [BLOCK_COLOR], [_scene_meta(30.0, 20.0)])
-    assert len(preview._grid_actors) >= 6
+    assert len(preview._grid_actors) >= 4
+    assert len(preview._grid_label_actors) >= 2
     # The grid actor objects are the same instances (not rebuilt).
     for old_actor in grid_actors_before:
         assert old_actor in preview._grid_actors

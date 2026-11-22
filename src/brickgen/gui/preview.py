@@ -19,13 +19,50 @@ import pyvista as pv
 import vtk  # type: ignore[import-untyped]
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent, QWheelEvent
+from PySide6.QtGui import (
+    QCursor,
+    QKeyEvent,
+    QMouseEvent,
+    QSurfaceFormat,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import QRubberBand, QWidget
 from pyvistaqt import QtInteractor
 
 from brickgen.core.models import BlockSettings
 
 logger = logging.getLogger(__name__)
+
+
+def _use_compatibility_gl_profile() -> None:
+    '''Switch the pyvistaqt GL context to a compatibility profile.
+
+    pyvistaqt pins a desktop-GL 3.2 *core* process-wide QSurfaceFormat
+    (``rwi._default_format``) and forces ``MaximumHardwareLineWidth`` to 1
+    when its widget initializes. In a core context ``glLineWidth`` above
+    1.0 is illegal, so VTK renders every wider line through its wide-line
+    geometry shader — whose quad expansion draws fat, camera-angle
+    dependent bands. A compatibility profile keeps the native
+    constant-width rasterization (this project is Windows-first: desktop
+    GL always offers compatibility contexts). :meth:`PreviewWidget.
+    initializeGL` re-applies the hardware line-width limit afterwards.
+    '''
+    try:
+        from pyvistaqt import rwi as _rwi
+
+        original = _rwi._default_format  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - pyvistaqt layout changed: keep defaults
+        return
+
+    def compatibility_default_format() -> QSurfaceFormat:
+        fmt = original()
+        fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
+        return fmt
+
+    _rwi._default_format = compatibility_default_format  # type: ignore[attr-defined]
+
+
+_use_compatibility_gl_profile()
 
 # Tessellation tolerance for the interactive preview, mm.
 PREVIEW_TESSELLATION_TOLERANCE = 0.15
@@ -60,15 +97,25 @@ GRID_Z_OFFSET = -0.05
 # The colored axes sit slightly ABOVE the line plane: coplanar lines
 # z-fight into dashed bands when the plane is seen at a grazing angle.
 GRID_AXIS_Z_OFFSET = -0.02
+# World-anchored mm labels float this high above the axes (screen overlays:
+# z only matters for the 3D projection coherence).
+GRID_LABEL_Z = 0.2
 # Static half-extent of the floor grid, in cell steps.
 GRID_EXTENT_CELLS = 1000
 # mm coordinate labels span only ±WINDOW cells around the origin. Labels
 # render at a constant screen size, so letting them reach the full extent
 # crowds the far ones into wide bands at grazing view angles.
 GRID_LABEL_WINDOW_CELLS = 50
-# One mm label per axis at most every LABEL_SPACING mm / one line in 10.
-GRID_LABEL_SPACING_MM = 16.0
+# Zoom-adaptive axis labels: adjacent labels keep at least this on-screen
+# distance. The label step is the smallest power-of-two multiple of the
+# grid step whose spacing clears the threshold at the current camera.
+GRID_LABEL_MIN_SPACING_PX = 40.0
+GRID_LABEL_MAX_MULTIPLIER = 256
 GRID_MAJOR_EVERY = 10
+# Widest line the app ever renders (grid, axes, wireframe, feature edges
+# stay at or below this). It gates VTK's native ``glLineWidth`` path: see
+# ``PreviewWidget.initializeGL``.
+MAX_HARDWARE_LINE_WIDTH = 8.0
 # Snap: block move drags and G-grabs round to the grid step (Grid menu).
 # Floor-plane moves require the cursor ray to dip at least this sine below
 # the horizon (~5.7 deg); flatter views would explode pixel deltas.
@@ -103,7 +150,9 @@ INTERIOR_COLOR = "#1f3d5c"
 
 # Quantity label anchors, relative to each block (top view: +Y is up).
 LABEL_POSITIONS: tuple[str, ...] = ("left", "right", "top", "bottom")
-_LABEL_MARGIN_RATIO = 0.3  # of the larger half-size, plus 1 mm floor
+# Fixed gap between the quantity label anchor and the block face it
+# adjoins, mm - the same for every block size.
+_LABEL_MARGIN_MM = 1.5
 
 
 def solid_to_mesh(
@@ -474,6 +523,10 @@ class PreviewWidget(QtInteractor):
         self._grid_scale = 0.5
         self._grid_snap = False
         self._grid_actors: list[pv.Actor] = []
+        # Zoom-adaptive axis label actors, rebuilt whenever the per-axis
+        # spacing multipliers flip (X, Y) during camera navigation.
+        self._grid_label_actors: list[pv.Actor] = []
+        self._label_multipliers: tuple[int, int] = (1, 1)
         # SSAO state for incremental enable/disable.
         self._ssao_radius: float | None = None
         # Selection/navigation transient state. The left button picks up a
@@ -509,6 +562,10 @@ class PreviewWidget(QtInteractor):
         # Keyboard grabs (G) need the viewport to take and keep focus.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.enable_anti_aliasing("msaa")  # type: ignore[call-arg]  # pyvista stub bug
+        # Camera moves change the on-screen grid spacing: watch VTK-level
+        # interactions (e.g. native right-button zoom) and refresh the
+        # axis labels when their spacing multiplier flips.
+        self.iren.add_observer("InteractionEvent", self._on_camera_interaction)
 
     # ------------------------------------------------------------- scene API
     def update_scene(
@@ -582,6 +639,7 @@ class PreviewWidget(QtInteractor):
             # resets the camera on later actor additions whenever camera_set
             # is False, which would yank the view on the first selection.
             self.camera_set = True
+        self._refresh_grid_labels()
         logger.debug(
             "Preview scene: %d blocks / %d points total",
             len(self._scene_meshes),
@@ -681,14 +739,16 @@ class PreviewWidget(QtInteractor):
         The grid is centred at (0, 0) with a fixed extent; it is rebuilt only
         by ``set_grid_unit`` / ``set_grid_scale`` / ``set_grid_enabled``.
         '''
-        for actor in self._grid_actors:
+        for actor in (*self._grid_actors, *self._grid_label_actors):
             try:
                 self.remove_actor(actor)
             except Exception:  # noqa: BLE001 - actor may already be detached
                 pass
         self._grid_actors.clear()
+        self._grid_label_actors.clear()
         if self._grid_enabled:
             self._add_grid_actors()
+            self._refresh_grid_labels()
         self.render()
 
     def _add_grid_actors(self) -> None:
@@ -748,7 +808,6 @@ class PreviewWidget(QtInteractor):
         axis_x = self._add_grid_lines(axes[:1], color=GRID_AXIS_X_COLOR, line_width=2.5)
         axis_y = self._add_grid_lines(axes[1:], color=GRID_AXIS_Y_COLOR, line_width=2.5)
         self._grid_actors.extend([axis_x, axis_y])
-        self._add_grid_labels(step, center_x, center_y, half)
 
     def _add_grid_lines(
         self, segments: np.ndarray, color: str, line_width: float
@@ -766,45 +825,115 @@ class PreviewWidget(QtInteractor):
             reset_camera=False,
         )
 
-    def _add_grid_labels(
-        self, step: float, center_x: float, center_y: float, half: float
-    ) -> None:
-        '''mm coordinate labels along the X and Y axes.
+    def _refresh_grid_labels(self) -> None:
+        '''Rebuild the axis labels when the zoom-adaptive spacing changed.
 
-        One label per ``label_step`` mm where the spacing adapts to the step.
-        The labels span only ±:data:`GRID_LABEL_WINDOW_CELLS` cells around
-        the origin: they render at a constant screen size, so labels reaching
-        the full extent crowd into wide bands when the plane is seen at a
-        grazing angle (and the count stays bounded at any zoom).
+        Evaluates the per-axis spacing multipliers at the current camera and
+        rebuilds the label actors only when they differ from the rendered
+        ones (camera interaction handlers call this on every move; the
+        evaluation is two point projections, the rebuild is rare).
+
+        The grid must be on and its line actors present; otherwise this is
+        a no-op.
+        '''
+        if not self._grid_enabled or not self._grid_actors:
+            return
+        step = max(self.grid_step(), 1e-9)
+        multipliers = (
+            self._grid_label_multiplier(step, 0),
+            self._grid_label_multiplier(step, 1),
+        )
+        if multipliers == self._label_multipliers and self._grid_label_actors:
+            return
+        self._label_multipliers = multipliers
+        for actor in self._grid_label_actors:
+            try:
+                self.remove_actor(actor)
+            except Exception:  # noqa: BLE001 - actor may already be detached
+                pass
+        self._grid_label_actors.clear()
+        self._add_grid_labels(step, multipliers)
+        self.render()
+
+    def _on_camera_interaction(self, *_args: Any) -> None:
+        '''VTK InteractionEvent: re-evaluate the zoom-adaptive axis labels.'''
+        self._refresh_grid_labels()
+
+    def _grid_label_multiplier(self, step: float, axis: int) -> int:
+        '''Smallest power-of-two multiple of *step* keeping labels readable.
+
+        The on-screen length of one grid step is measured along *axis* at
+        the camera focal point (it shrinks toward 0 when the axis recedes
+        from the camera); the returned multiplier is the first power of two
+        whose spacing clears :data:`GRID_LABEL_MIN_SPACING_PX`.
 
         Args:
             step: Grid step in mm.
-            center_x: Grid center X (mm) the window is built around.
-            center_y: Grid center Y (mm) the window is built around.
-            half: Grid half-extent in mm (labels may span less).
+            axis: World axis index (0 = X, 1 = Y).
+
+        Returns:
+            Label spacing multiplier (1, 2, 4, ... capped at
+            :data:`GRID_LABEL_MAX_MULTIPLIER`).
         '''
-        label_half = min(half, GRID_LABEL_WINDOW_CELLS * step)
-        spacing = max(GRID_LABEL_SPACING_MM, label_half / 100.0)
-        label_step = step * max(1, int(math.ceil(spacing / step)))
-        offset = max(1.0, min(step * 1.5, label_step * 0.35))
-        z = 0.2
-        for axis, low, high in (
-            ("x", center_x - label_half, center_x + label_half),
-            ("y", center_y - label_half, center_y + label_half),
+        pixels = math.inf  # no renderer/camera yet: densest labels
+        try:
+            renderer = self.renderer
+            camera = renderer.GetActiveCamera()
+            focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
+            far = focal.copy()
+            far[axis] += step
+            renderer.SetWorldPoint(focal[0], focal[1], focal[2], 1.0)
+            renderer.WorldToDisplay()
+            x0, y0, _ = renderer.GetDisplayPoint()[:3]
+            renderer.SetWorldPoint(far[0], far[1], far[2], 1.0)
+            renderer.WorldToDisplay()
+            x1, y1, _ = renderer.GetDisplayPoint()[:3]
+            projected = math.hypot(x1 - x0, y1 - y0)
+            if math.isfinite(projected) and projected >= 0.0:
+                pixels = projected
+        except Exception:  # noqa: BLE001 - keep the densest fallback
+            pass
+        multiplier = 1
+        while (
+            multiplier * pixels < GRID_LABEL_MIN_SPACING_PX
+            and multiplier < GRID_LABEL_MAX_MULTIPLIER
         ):
-            first = int(math.ceil(low / label_step))
-            last = int(math.floor(high / label_step))
+            multiplier *= 2
+        return multiplier
+
+    def _add_grid_labels(self, step: float, multipliers: tuple[int, int]) -> None:
+        '''Zoom-adaptive mm coordinate labels directly on the X and Y axes.
+
+        One label per ``multiplier * step`` mm per axis, centered on the
+        axis lines (the multiplier keeps adjacent labels readable at the
+        current camera). The origin (0) is skipped: both axes would draw it
+        at the same spot. The labels span only ±:data:`GRID_LABEL_WINDOW_CELLS`
+        cells around the origin: they render at a constant screen size, so
+        labels reaching the full extent crowd into wide bands when the plane
+        is seen at a grazing angle (and the count stays bounded at any zoom).
+
+        Args:
+            step: Grid step in mm.
+            multipliers: Per-axis label spacing multipliers (X, Y), each a
+                power of two.
+        '''
+        label_half = min(GRID_EXTENT_CELLS, GRID_LABEL_WINDOW_CELLS) * step
+        for axis, multiplier in enumerate(multipliers):
+            label_step = step * multiplier
+            first = int(math.ceil(-label_half / label_step))
+            last = int(math.floor(label_half / label_step))
             values = np.arange(first, last + 1, dtype=np.int64) * label_step
+            values = values[values != 0.0]
             if len(values) > 400:  # defensive cap: pathological zoom levels
                 values = values[:: int(math.ceil(len(values) / 400))]
             if not len(values):
                 continue
             zeros = np.zeros(len(values))
-            if axis == "x":
-                points = np.stack([values, zeros - offset, zeros + z], axis=1)
+            if axis == 0:
+                points = np.stack([values, zeros, zeros + GRID_LABEL_Z], axis=1)
                 color = GRID_LABEL_X_COLOR
             else:
-                points = np.stack([zeros - offset, values, zeros + z], axis=1)
+                points = np.stack([zeros, values, zeros + GRID_LABEL_Z], axis=1)
                 color = GRID_LABEL_Y_COLOR
             actor = self.add_point_labels(
                 points,
@@ -818,8 +947,7 @@ class PreviewWidget(QtInteractor):
                 render=False,
             )
             if actor is not None:
-                self._grid_actors.append(actor)
-        self.render()
+                self._grid_label_actors.append(actor)
 
     def set_selection(self, selection: set[int], primary: int | None = None) -> None:
         '''Replace the scene selection programmatically (no signal).
@@ -1035,6 +1163,10 @@ class PreviewWidget(QtInteractor):
         With *tubes* the lines get real volume so they win the depth test
         against the surface (plain polylines z-fight with the mesh); the
         bare wireframe mode renders plain lines without a solid underneath.
+        Decoration geometry always sits on the block itself, so the tube
+        geometry shader only ever sees short in-front-of-camera segments -
+        the fat camera-angle dependent bands it draws for huge floor-grid
+        lines (whose endpoints fall behind the camera) cannot appear here.
         '''
         return self.add_mesh(
             mesh,
@@ -1299,17 +1431,22 @@ class PreviewWidget(QtInteractor):
         return origin + direction * t
 
     def _label_point(self, index: int) -> np.ndarray:
-        '''World anchor point of the quantity label of block *index*.'''
+        '''World anchor point of the quantity label of block *index*.
+
+        The label sits on the floor beside the block footprint (like the
+        grid axis labels) instead of hanging above the block top, at a
+        fixed gap from the face it adjoins regardless of the block size.
+        '''
         meta = self._scene_meta[index]
-        margin = max(meta['half_x'], meta['half_y']) * _LABEL_MARGIN_RATIO + 1.0
+        margin = _LABEL_MARGIN_MM
         x, y = meta['pos_x'], meta['pos_y']
         if self._qty_position == 'left':
-            return np.array([x - meta['half_x'] - margin, y, meta['top_z'] + 0.5])
+            return np.array([x - meta['half_x'] - margin, y, GRID_LABEL_Z])
         if self._qty_position == 'right':
-            return np.array([x + meta['half_x'] + margin, y, meta['top_z'] + 0.5])
+            return np.array([x + meta['half_x'] + margin, y, GRID_LABEL_Z])
         if self._qty_position == 'top':
-            return np.array([x, y + meta['half_y'] + margin, meta['top_z'] + 0.5])
-        return np.array([x, y - meta['half_y'] - margin, meta['top_z'] + 0.5])
+            return np.array([x, y + meta['half_y'] + margin, GRID_LABEL_Z])
+        return np.array([x, y - meta['half_y'] - margin, GRID_LABEL_Z])
 
     def _refresh_quantity_labels(self) -> None:
         '''Rebuild the per-block BOM quantity label actors.'''
@@ -1482,6 +1619,27 @@ class PreviewWidget(QtInteractor):
             event.accept()
             return
         super().wheelEvent(event)
+        self._refresh_grid_labels()
+
+    def initializeGL(self) -> None:  # noqa: N802 - Qt naming
+        '''GL context setup: restore the native wide-line rendering path.
+
+        pyvistaqt forces ``MaximumHardwareLineWidth`` to 1 inside its own
+        ``initializeGL`` (it pins a core-profile context where line widths
+        above 1 px are illegal). VTK then renders every wider line through
+        its wide-line geometry shader, whose quad expansion draws fat,
+        camera-angle dependent bands. With the compatibility profile from
+        :func:`_use_compatibility_gl_profile` the native ``glLineWidth``
+        path works and keeps every line width constant, so the hardware
+        limit is re-applied after pyvistaqt's reset here.
+        '''
+        super().initializeGL()
+        try:
+            render_window = self.render_window
+            if render_window is not None:
+                render_window.SetForceMaximumHardwareLineWidth(MAX_HARDWARE_LINE_WIDTH)
+        except Exception:  # noqa: BLE001 - window may already be torn down
+            pass
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         '''Route a rapid second click through the press handler.
@@ -1531,6 +1689,7 @@ class PreviewWidget(QtInteractor):
         camera.SetViewUp(*up)
         self.renderer.ResetCameraClippingRange()
         self.render()
+        self._refresh_grid_labels()
 
     def _pan_camera(self, last: QPoint, current: QPoint) -> None:
         '''Pan the camera so the world point under the cursor follows it.
@@ -1559,6 +1718,7 @@ class PreviewWidget(QtInteractor):
         camera.SetFocalPoint(*(focal + delta))
         renderer.ResetCameraClippingRange()
         self.render()
+        self._refresh_grid_labels()
 
     # ------------------------------------------------------ scene selection
     def _pick_scene(self, pos: QPoint) -> tuple[str, int] | None:
