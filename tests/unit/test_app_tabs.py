@@ -283,11 +283,13 @@ def test_view_settings_stored_in_project(window: MainWindow) -> None:
     assert window._preview._grid_enabled is True
     assert window._dirty is True
 
-    # Placement-tab grid toggle uses its own flag.
+    # Placement-tab grid toggle uses its own flag (per-bed grids, never the
+    # base class's infinite floor grid).
     window._tabs.setCurrentIndex(1)
     window._act_show_grid.setChecked(True)
     assert window._project.view.placement_grid_enabled is True
-    assert window._placement_view._grid_enabled is True
+    assert window._placement_view._bed_grid_enabled is True
+    assert window._placement_view._grid_actors == []
 
     # Scale / snap / labels are shared project-level values.
     window._tabs.setCurrentIndex(0)

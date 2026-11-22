@@ -741,6 +741,22 @@ class PreviewWidget(QtInteractor):
         '''Current grid step in mm (unit size * cell scale).'''
         return self._grid_unit * self._grid_scale
 
+    def _snap_move_target(self, x: float, y: float) -> tuple[float, float]:
+        '''Snap a move target to world-origin multiples of the grid step.
+
+        Hook for subclasses: PlacementView snaps relative to the zone under
+        the target instead, so pieces align with the per-bed grids.
+
+        Args:
+            x: Unsnapped world X of the move target.
+            y: Unsnapped world Y of the move target.
+
+        Returns:
+            The ``(x, y)`` target snapped to grid-step multiples.
+        '''
+        step = max(self.grid_step(), 1e-9)
+        return (round(x / step) * step, round(y / step) * step)
+
     # ------------------------------------------------------------- floor grid
     def _update_grid(self) -> None:
         '''Rebuild the static floor-grid actors around the world origin.
@@ -1328,9 +1344,7 @@ class PreviewWidget(QtInteractor):
         target_x = original_x + float(world[0] - self._grab_anchor[0])
         target_y = original_y + float(world[1] - self._grab_anchor[1])
         if self._grid_snap:
-            step = max(self.grid_step(), 1e-9)
-            target_x = round(target_x / step) * step
-            target_y = round(target_y / step) * step
+            target_x, target_y = self._snap_move_target(target_x, target_y)
         dx, dy = target_x - original_x, target_y - original_y
         if dx != 0.0 or dy != 0.0:
             self._grab_moved = True

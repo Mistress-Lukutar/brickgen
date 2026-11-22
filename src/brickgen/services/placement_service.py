@@ -256,6 +256,34 @@ def find_free_spot(
     return None
 
 
+def _stage_piece(
+    piece: PrintPiece,
+    w: float,
+    d: float,
+    staged_rects: list[tuple[float, float, float, float]],
+    beds: PrintBedSettings,
+) -> None:
+    '''Send a piece to staging at the first free staging spot.
+
+    Falls back to the piece's current coords when staging is full (overlap
+    allowed there, mirroring :func:`sync_pieces`).  *staged_rects* tracks
+    already-staged pieces as ``(cx, cy, w, d)`` zone-local rects and grows
+    by one entry per staged piece.
+
+    Args:
+        piece: The piece to stage (bed and position are mutated).
+        w: Orientation-aware piece width in mm.
+        d: Orientation-aware piece depth in mm.
+        staged_rects: Running list of staged piece rects.
+        beds: The project's ``PrintBedSettings``.
+    '''
+    piece.bed = PRINT_STAGING_BED
+    spot = find_free_spot(staged_rects, w, d, beds)
+    if spot is not None:
+        piece.position_x, piece.position_y = spot
+    staged_rects.append((piece.position_x, piece.position_y, w, d))
+
+
 @dataclasses.dataclass
 class SyncReport:
     '''Return value of :func:`sync_pieces`.
@@ -559,6 +587,12 @@ class DistributeReport:
 def distribute(project: Project, mode: str, bed_indices: list[int]) -> DistributeReport:
     '''Distribute pieces across selected beds, then shelf-pack each.
 
+    ``"even"`` balances total piece area across the selected beds (greedy
+    LPT) and shelf-packs every bed afterwards.  ``"by_color"`` gives every
+    color EXCLUSIVE consecutive beds — one print job per color: the color
+    packs into the next unused bed, spills onto further beds when one bed
+    is not enough, and never shares a bed with another color.
+
     Args:
         project: The active project.
         mode: Distribution mode (``"even"`` or ``"by_color"``).
@@ -588,21 +622,23 @@ def distribute(project: Project, mode: str, bed_indices: list[int]) -> Distribut
         if p.bed in selected or p.bed == PRINT_STAGING_BED
     ]
 
-    if mode == DISTRIBUTE_EVEN:
-        # Pre-filter oversized and unknown.
-        valid_pool: list[tuple[PrintPiece, float, float]] = []
-        for piece in pool_pieces:
-            uid = piece.block_uid
-            if uid not in fp:
-                piece.bed = PRINT_STAGING_BED
-                continue
-            w, d = fp[uid]
-            # Oversized in BOTH orientations can never fit.
-            if not (fits_bed(w, d, beds) or fits_bed(d, w, beds)):
-                piece.bed = PRINT_STAGING_BED
-                continue
-            valid_pool.append((piece, w, d))
+    # Shared pre-filter: unknown blocks and oversized pieces go to staging.
+    # Oversized pieces get a free staging spot so they do not overlap.
+    valid_pool: list[tuple[PrintPiece, float, float]] = []
+    staged_rects: list[tuple[float, float, float, float]] = []
+    for piece in pool_pieces:
+        uid = piece.block_uid
+        if uid not in fp:
+            piece.bed = PRINT_STAGING_BED
+            continue
+        w, d = fp[uid]
+        # Oversized in BOTH orientations can never fit.
+        if not (fits_bed(w, d, beds) or fits_bed(d, w, beds)):
+            _stage_piece(piece, w, d, staged_rects, beds)
+            continue
+        valid_pool.append((piece, w, d))
 
+    if mode == DISTRIBUTE_EVEN:
         # Sort LPT by area DESC (ties as in _pool_sort).
         valid_pool.sort(key=lambda t: (-t[1] * t[2], -max(t[1], t[2]), t[0].block_uid))
 
@@ -611,27 +647,33 @@ def distribute(project: Project, mode: str, bed_indices: list[int]) -> Distribut
         per_bed_pieces: dict[int, list[tuple[PrintPiece, float, float]]] = {
             b: [] for b in selected
         }
-
         for piece, w, d in valid_pool:
             area = w * d
             best_bed = min(selected, key=lambda b: assigned_area[b])
             per_bed_pieces[best_bed].append((piece, w, d))
             assigned_area[best_bed] += area
 
+        # Shelf-pack each assigned bed; pieces the shelf pack rejects (the
+        # area assignment overflowed the real packing) go to staging.
+        for bed_idx in selected:
+            pack_items = [(p.uid, w, d) for p, w, d in per_bed_pieces[bed_idx]]
+            placements, _leftovers = _shelf_pack(pack_items, beds)
+            placed_uids = set(placements)
+            for piece, w, d in per_bed_pieces[bed_idx]:
+                if piece.uid in placed_uids:
+                    cx, cy, rotated = placements[piece.uid]
+                    piece.bed = bed_idx
+                    piece.position_x = cx
+                    piece.position_y = cy
+                    piece.rotated90 = rotated
+                else:
+                    _stage_piece(piece, w, d, staged_rects, beds)
+
     elif mode == DISTRIBUTE_BY_COLOR:
-        # Group by color, filtering oversized and unknown.
+        # Group the valid pool by color.
         color_groups: dict[str, list[tuple[PrintPiece, float, float]]] = {}
-        for piece in pool_pieces:
-            uid = piece.block_uid
-            if uid not in fp:
-                piece.bed = PRINT_STAGING_BED
-                continue
-            w, d = fp[uid]
-            # Oversized in BOTH orientations can never fit.
-            if not (fits_bed(w, d, beds) or fits_bed(d, w, beds)):
-                piece.bed = PRINT_STAGING_BED
-                continue
-            color = colors.get(uid, "")
+        for piece, w, d in valid_pool:
+            color = colors.get(piece.block_uid, "")
             if color not in color_groups:
                 color_groups[color] = []
             color_groups[color].append((piece, w, d))
@@ -643,55 +685,36 @@ def distribute(project: Project, mode: str, bed_indices: list[int]) -> Distribut
         ]
         group_totals.sort(key=lambda t: (-t[1], t[0]))
 
-        # Capacity per bed.
-        capacity = (beds.width - 2 * beds.gap) * (beds.depth - 2 * beds.gap)
-
-        # Walk groups, fill beds sequentially.
-        color_area: dict[int, float] = {b: 0.0 for b in selected}
-        color_per_bed_pieces: dict[int, list[tuple[PrintPiece, float, float]]] = {
-            b: [] for b in selected
-        }
-
-        for color, _, items in group_totals:
-            # Sort items within group by area DESC (_pool_sort order).
+        # One print job per color: consume unused beds in selection order.
+        # A color never shares a bed with another color and spills onto
+        # further beds when one bed is not enough; pieces left when the
+        # beds run out go to staging.
+        free_beds = list(selected)
+        for _color, _area, items in group_totals:
             items_sorted = sorted(
                 items, key=lambda t: (-t[1] * t[2], -max(t[1], t[2]), t[0].block_uid)
             )
-            for piece, w, d in items_sorted:
-                area = w * d
-                placed_on_bed = False
-                for bed_idx in selected:
-                    if color_area[bed_idx] + area <= capacity:
-                        color_per_bed_pieces[bed_idx].append((piece, w, d))
-                        color_area[bed_idx] += area
-                        placed_on_bed = True
-                        break
-                if not placed_on_bed:
-                    piece.bed = PRINT_STAGING_BED
+            pending = items_sorted
+            while pending and free_beds:
+                bed_idx = free_beds.pop(0)
+                pack_items = [(p.uid, w, d) for p, w, d in pending]
+                placements, _leftovers = _shelf_pack(pack_items, beds)
+                if not placements:  # pragma: no cover - pre-filter guarantees a fit
+                    break
+                placed_uids = set(placements)
+                for piece, w, d in pending:
+                    if piece.uid in placed_uids:
+                        cx, cy, rotated = placements[piece.uid]
+                        piece.bed = bed_idx
+                        piece.position_x = cx
+                        piece.position_y = cy
+                        piece.rotated90 = rotated
+                pending = [t for t in pending if t[0].uid not in placed_uids]
+            for piece, w, d in pending:
+                _stage_piece(piece, w, d, staged_rects, beds)
 
     else:
         raise ValueError(f"unknown distribute mode: {mode!r}")
-
-    # Shelf-pack each selected bed with its assigned pieces via _shelf_pack.
-    for bed_idx in selected:
-        items_list = (
-            color_per_bed_pieces[bed_idx]
-            if mode == DISTRIBUTE_BY_COLOR
-            else per_bed_pieces[bed_idx]
-        )
-        pack_items: list[tuple[str, float, float]] = [
-            (p.uid, w, d) for p, w, d in items_list
-        ]
-        placements, leftovers_uids = _shelf_pack(pack_items, beds)
-
-        # Apply placements to matching pieces.
-        for piece, w, d in items_list:
-            if piece.uid in placements:
-                cx, cy, rotated = placements[piece.uid]
-                piece.bed = bed_idx
-                piece.position_x = cx
-                piece.position_y = cy
-                piece.rotated90 = rotated
 
     # Final counts from actual state after all beds processed.
     report.placed = sum(1 for p in pool_pieces if p.bed in selected)

@@ -569,10 +569,10 @@ def test_distribute_even_both_beds_used() -> None:
 
 
 def test_distribute_by_color_groups_on_separate_beds() -> None:
-    '''3 beds, red group (2 pieces 8x8), blue group (6 pieces 8x8).
+    '''3 beds, blue group (6 pieces 8x8), red group (2 pieces 8x8).
 
-    Blue fills bed 0 (shelf pack fits 3); red on bed 1.
-    With W=40,D=20,GAP=4 capacity=384: shelf pack limits placement.
+    One print job per color: blue packs bed 0 (3 fit) and spills onto bed 1
+    exclusively (3 more); red takes bed 2.  Nothing staged.
     '''
     beds = PrintBedSettings(width=40.0, depth=20.0, count=3, gap=4.0)
     proj = _make_project(
@@ -581,26 +581,35 @@ def test_distribute_by_color_groups_on_separate_beds() -> None:
         beds=beds,
     )
     sync_pieces(proj)
-    distribute(proj, DISTRIBUTE_BY_COLOR, [0, 1, 2])
+    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0, 1, 2])
 
-    # Blue (area 384) fills bed 0; red spills to bed 1.
-    # Shelf pack on W=40,D=20,GAP=4 can only fit 3 per row.
-    blue_on_0 = sum(
-        1 for p in proj.print_layout.pieces if p.block_uid == "blue" and p.bed == 0
-    )
-    assert blue_on_0 == 3  # Only 3 fit on bed 0 by shelf pack
-    red_on_1 = sum(
-        1 for p in proj.print_layout.pieces if p.block_uid == "red" and p.bed == 1
-    )
-    assert red_on_1 == 2
+    assert report.placed == 8
+    assert report.staged == 0
+    # Shelf pack on W=40,D=20,GAP=4 fits 3 per bed: blue = beds 0 + 1.
+    blue_beds = [p.bed for p in proj.print_layout.pieces if p.block_uid == "blue"]
+    assert blue_beds.count(0) == 3
+    assert blue_beds.count(1) == 3
+    # Red owns bed 2 exclusively.
+    red_beds = [p.bed for p in proj.print_layout.pieces if p.block_uid == "red"]
+    assert red_beds == [2, 2]
 
-    # Some blues are staged due to shelf pack limits.
-    blue_staged = sum(
-        1
-        for p in proj.print_layout.pieces
-        if p.block_uid == "blue" and p.bed == PRINT_STAGING_BED
+
+def test_distribute_by_color_never_mixes_beds() -> None:
+    '''Two colors never share a bed even when both would fit together.'''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
+    proj = _make_project(
+        BlockInstance(uid="red", cells_x=2, cells_y=2, color="#ff0000", quantity=1),
+        BlockInstance(uid="blue", cells_x=2, cells_y=2, color="#0000ff", quantity=1),
+        beds=beds,
     )
-    assert blue_staged == 3
+    sync_pieces(proj)
+    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0, 1])
+
+    assert report.placed == 2
+    assert report.staged == 0
+    bed_red = next(p.bed for p in proj.print_layout.pieces if p.block_uid == "red")
+    bed_blue = next(p.bed for p in proj.print_layout.pieces if p.block_uid == "blue")
+    assert bed_red != bed_blue
 
 
 def test_distribute_by_color_spill_to_second_bed() -> None:
@@ -613,10 +622,9 @@ def test_distribute_by_color_spill_to_second_bed() -> None:
     sync_pieces(proj)
     report = distribute(proj, DISTRIBUTE_BY_COLOR, [0, 1])
 
-    # 6 assigned to bed0 (capacity 384), 7th on bed1.
-    # Shelf pack: 3 on bed0, 1 on bed1, 3 staged.
-    assert report.placed == 4  # 3 on bed0 + 1 on bed1
-    assert report.staged == 3
+    # Shelf pack fits 3 per bed: bed0 + bed1 hold 6, the 7th is staged.
+    assert report.placed == 6
+    assert report.staged == 1
 
 
 def test_distribute_by_color_exact_fit() -> None:

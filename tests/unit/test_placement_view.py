@@ -102,19 +102,19 @@ def test_default_view_has_zone_overlays(
 ) -> None:
     '''Fresh view has zone overlays for the default 1 bed + staging.
 
-    Each bed/staging zone contributes a frame actor and a label PointLabels,
-    so 2 zones = 4 entries in _zone_actors.
+    Each bed/staging zone contributes a fill plate, a frame actor and a
+    label PointLabels, so 2 zones = 6 entries in _zone_actors.
     '''
-    assert len(placement_view_default._zone_actors) == 4
+    assert len(placement_view_default._zone_actors) == 6
 
 
 def test_set_print_beds_rebuilds_zones(
     placement_view_three_beds: PlacementView,
 ) -> None:
-    '''set_print_beds(count=3) rebuilds: 8 entries (4 frames + 4 labels).'''
+    '''set_print_beds(count=3) rebuilds: 12 entries (4 zones x 3 actors).'''
     view = placement_view_three_beds
-    # 3 beds + 1 staging = 4 zones; each zone has frame + label = 2 actors.
-    assert len(view._zone_actors) == 8
+    # 3 beds + 1 staging = 4 zones; each zone has fill + frame + label.
+    assert len(view._zone_actors) == 12
     assert view.beds().count == 3
 
 
@@ -124,11 +124,11 @@ def test_set_print_beds_no_duplicates(
     '''Changing bed count replaces old actors; no duplicates remain.'''
     view = placement_view_default
     initial_count = len(view._zone_actors)
-    assert initial_count == 4  # default: (1 bed + staging) * 2 (frame+label)
+    assert initial_count == 6  # default: (1 bed + staging) * 3 (fill+frame+label)
 
     view.set_print_beds(PrintBedSettings(count=3))
     new_count = len(view._zone_actors)
-    assert new_count == 8  # (3 beds + staging) * 2
+    assert new_count == 12  # (3 beds + staging) * 3
 
     # Old actors are gone (different list content).
     all_ids = {id(a) for a in view._zone_actors}
@@ -140,7 +140,7 @@ def test_update_scene_keeps_zone_actors_and_adds_pieces(
 ) -> None:
     '''update_scene with two pieces keeps zone actors and adds per-piece actors.'''
     view = placement_view_default
-    assert len(view._zone_actors) == 4
+    assert len(view._zone_actors) == 6
 
     mesh1 = _small_cube_mesh()
     mesh2 = _small_cube_mesh()
@@ -151,7 +151,7 @@ def test_update_scene_keeps_zone_actors_and_adds_pieces(
     )
 
     # Zone actors are untouched by update_scene.
-    assert len(view._zone_actors) == 4
+    assert len(view._zone_actors) == 6
 
     # Two block actors created with matching meta.
     assert len(view._block_actors) == 2
@@ -222,3 +222,53 @@ def test_picked_ray_at_bed_frame_does_not_select_piece(
     # _actor_map (the frame itself). Either way, no block index is resolved.
     piece_idx = view._actor_map.get(actor)
     assert piece_idx is None
+
+
+def test_grid_enabled_draws_per_bed_grids(
+    placement_view_three_beds: PlacementView,
+) -> None:
+    '''Grid toggle draws the combined minor+major bed grids, not the floor grid.
+
+    4 zones x 3 actors = 12, plus one minor and one major line mesh across
+    all beds = 14.  The base class's infinite floor grid stays empty.
+    '''
+    view = placement_view_three_beds
+    view.set_grid_enabled(True)
+    assert len(view._zone_actors) == 14
+    # The base infinite origin-centered grid must never be built here.
+    assert view._grid_actors == []
+
+    view.set_grid_enabled(False)
+    assert len(view._zone_actors) == 12
+
+
+def test_grid_unit_change_rebuilds_grids(
+    placement_view_three_beds: PlacementView,
+) -> None:
+    '''Changing the grid unit with grids on keeps the actor set consistent.'''
+    view = placement_view_three_beds
+    view.set_grid_enabled(True)
+    assert len(view._zone_actors) == 14
+
+    view.set_grid_unit(8.0)  # step 8 * 0.5 = 4 mm: same 2 line meshes
+    assert len(view._zone_actors) == 14
+    assert view._grid_actors == []
+
+
+def test_snap_move_target_is_zone_relative(
+    placement_view_three_beds: PlacementView,
+) -> None:
+    '''Snap rounds to zone-local grid multiples, not world origin ones.
+
+    Bed 1 origin x = 220 + 20 (BED_GAP_MM) = 240; default step = 4 * 0.5
+    = 2 mm.  Staging origin x = -240.
+    '''
+    view = placement_view_three_beds
+    # Bed 1: local 13.4 -> 14 (world 254); y 6.6 -> 6.
+    x, y = view._snap_move_target(253.4, 6.6)
+    assert x == pytest.approx(254.0)
+    assert y == pytest.approx(6.0)
+    # Staging: local 13.4 -> 14 (world -226).
+    x, y = view._snap_move_target(-226.6, 0.0)
+    assert x == pytest.approx(-226.0)
+    assert y == pytest.approx(0.0)

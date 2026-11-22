@@ -129,24 +129,24 @@ class PlacementPanel(QWidget):
 
         tools_layout.addLayout(from_to_row)
 
-        btn_row = QHBoxLayout()
+        # Full-width stacked buttons: a horizontal row of three would force
+        # a panel width far beyond the sidebar slot and clip on the right.
         self._btn_auto_place = QPushButton("Auto-place (selected beds)")
         self._btn_auto_place.clicked.connect(self._on_auto_place)
-        btn_row.addWidget(self._btn_auto_place)
+        tools_layout.addWidget(self._btn_auto_place)
 
         self._btn_distribute_color = QPushButton("Distribute by color")
         self._btn_distribute_color.clicked.connect(
             lambda: self._on_distribute(DISTRIBUTE_BY_COLOR)
         )
-        btn_row.addWidget(self._btn_distribute_color)
+        tools_layout.addWidget(self._btn_distribute_color)
 
         self._btn_distribute_even = QPushButton("Distribute evenly")
         self._btn_distribute_even.clicked.connect(
             lambda: self._on_distribute(DISTRIBUTE_EVEN)
         )
-        btn_row.addWidget(self._btn_distribute_even)
+        tools_layout.addWidget(self._btn_distribute_even)
 
-        tools_layout.addLayout(btn_row)
         inner.addWidget(self._tools_group)
 
         # --- Selected piece inspector group ---
@@ -185,16 +185,15 @@ class PlacementPanel(QWidget):
         self._cb_flip.toggled.connect(self._on_piece_flip_changed)
         insp_form.addRow(self._cb_flip)
 
-        btn_row2 = QHBoxLayout()
+        # Full-width stacked buttons (same reason as the tool buttons).
         self._btn_flip_sel = QPushButton("Flip selected")
         self._btn_flip_sel.clicked.connect(self._on_flip_selection)
-        btn_row2.addWidget(self._btn_flip_sel)
+        insp_form.addRow(self._btn_flip_sel)
 
         self._btn_stage_sel = QPushButton("Move to staging")
         self._btn_stage_sel.clicked.connect(self._on_stage_selection)
-        btn_row2.addWidget(self._btn_stage_sel)
+        insp_form.addRow(self._btn_stage_sel)
 
-        insp_form.addRow(btn_row2)
         inner.addWidget(self._inspector_group)
 
         # --- Status label ---
@@ -206,6 +205,15 @@ class PlacementPanel(QWidget):
 
         scroll.setWidget(container)
         layout.addWidget(scroll)
+
+        # The horizontal scrollbar is off, so anything narrower than the
+        # form's natural width would clip it: pin the panel to at least
+        # that width plus a scrollbar (mirrors the planning sidebar).
+        form_width = (
+            container.sizeHint().width() + scroll.verticalScrollBar().sizeHint().width()
+        )
+        self.setMinimumWidth(form_width)
+        scroll.setMinimumWidth(form_width)
 
     # --- Bed spinbox handlers ---
 
@@ -240,13 +248,17 @@ class PlacementPanel(QWidget):
             self._spin_to.setValue(self._spin_bed_count.value())
 
     def _on_auto_place(self) -> None:
-        '''Emit auto-place request for the selected bed range.'''
-        beds = list(range(self._spin_from.value(), self._spin_to.value() + 1))
+        '''Emit auto-place request for the selected bed range.
+
+        The spinboxes display 1-based bed numbers (as the viewport labels
+        do); the signal carries 0-based bed indices.
+        '''
+        beds = list(range(self._spin_from.value() - 1, self._spin_to.value()))
         self.auto_place_requested.emit(beds)
 
     def _on_distribute(self, mode: str) -> None:
-        '''Emit distribute request for the selected bed range.'''
-        beds = list(range(self._spin_from.value(), self._spin_to.value() + 1))
+        '''Emit distribute request for the selected bed range (0-based).'''
+        beds = list(range(self._spin_from.value() - 1, self._spin_to.value()))
         self.distribute_requested.emit(mode, beds)
 
     # --- Piece inspector handlers ---

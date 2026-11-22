@@ -622,7 +622,13 @@ class MainWindow(QMainWindow):
 
     def _finalize_layout(self) -> None:
         '''Apply the final splitter sizes and re-layout the library cards.'''
-        sidebar_w = self._sidebar.minimumWidth()
+        # The stack hosts both sidebar pages; the splitter slot must fit the
+        # wider of the two or the hidden page's controls get clipped.
+        sidebar_w = max(
+            self._sidebar.minimumWidth(),
+            self._placement_panel.minimumWidth(),
+        )
+        self._sidebar_stack.setMinimumWidth(sidebar_w)
         library_w = self._library.minimumWidth()
         preview_w = max(self._splitter.width() - sidebar_w - library_w, 200)
         self._splitter.setSizes([sidebar_w, preview_w, library_w])
