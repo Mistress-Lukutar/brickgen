@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, cast
 
 import cadquery as cq
@@ -509,6 +509,10 @@ class PreviewWidget(QtInteractor):
         self._block_actors: list[list[pv.Actor]] = []
         self._outline_actors: dict[int, pv.Actor] = {}
         self._qty_actors: dict[int, Any] = {}
+        # Anchor-point PolyData of each quantity label pipeline (keyed like
+        # _qty_actors): drag updates only reassign these points instead of
+        # rebuilding the actors (see _move_quantity_labels).
+        self._qty_points: dict[int, pv.PolyData] = {}
         self._actor_map: dict[pv.Actor, int] = {}
         self._selection: set[int] = set()
         self._primary: int | None = None
@@ -985,7 +989,7 @@ class PreviewWidget(QtInteractor):
         outline = self._outline_actors.get(index)
         if outline is not None:
             outline.SetPosition(float(x), float(y), 0.0)
-        self._refresh_quantity_labels()
+        self._move_quantity_labels([index])
         self.render()
 
     def set_block_colors(self, colors: dict[int, str]) -> None:
@@ -1048,6 +1052,7 @@ class PreviewWidget(QtInteractor):
         self._block_actors.clear()
         self._outline_actors.clear()
         self._qty_actors.clear()
+        self._qty_points.clear()
         self._actor_map.clear()
 
     def _build_block_actors(self, index: int) -> list[pv.Actor]:
@@ -1388,7 +1393,7 @@ class PreviewWidget(QtInteractor):
             outline = self._outline_actors.get(index)
             if outline is not None:
                 outline.SetPosition(x, y, 0.0)
-        self._refresh_quantity_labels()
+        self._move_quantity_labels(originals)
         self.render()
 
     def _cursor_on_floor(self, pos: QPoint) -> np.ndarray | None:
@@ -1449,28 +1454,70 @@ class PreviewWidget(QtInteractor):
         return np.array([x, y - meta['half_y'] - margin, GRID_LABEL_Z])
 
     def _refresh_quantity_labels(self) -> None:
-        '''Rebuild the per-block BOM quantity label actors.'''
-        for actor in self._qty_actors.values():
-            try:
-                self.remove_actor(actor)
-            except Exception:  # noqa: BLE001 - actor may already be detached
-                pass
+        '''Rebuild the per-block BOM quantity label actors.
+
+        Each label is its own tiny pipeline (single-point PolyData -> label
+        hierarchy -> placement mapper -> 2D overlay actor). The anchor
+        PolyData is kept in ``_qty_points`` so a drag only reassigns the
+        moved points (:meth:`_move_quantity_labels`) instead of rebuilding
+        actors every frame. Everything is added with ``render=False``: the
+        caller renders once after the batch (an ``add_point_labels``/default
+        ``add_actor`` render here would cost one full viewport render per
+        label per call).
+        '''
+        for index in list(self._qty_actors):
+            self.remove_actor(
+                f'quantity_{index}',  # type: ignore[arg-type]  # pyvista stub bug
+                reset_camera=False,
+                render=False,
+            )
         self._qty_actors.clear()
+        self._qty_points.clear()
         if not self._qty_enabled or not self._scene_meshes:
             return
+        # Shared text property (mirrors the previous add_point_labels args:
+        # size 13, bold, no shape/background, always on top of the scene).
+        text_property = pv.TextProperty(font_size=13, bold=True, color='#d8dde2')
         for index, meta in enumerate(self._scene_meta):
-            actor = self.add_point_labels(
-                np.array([self._label_point(index)]),
-                [f"×{meta['quantity']}"],
-                always_visible=True,
-                show_points=False,
-                shape=None,
-                font_size=13,
-                text_color='#d8dde2',
+            pd = pv.PolyData(self._label_point(index).reshape(1, 3))
+            labels = vtk.vtkStringArray()
+            labels.SetName('labels')
+            labels.InsertNextValue(f"×{meta['quantity']}")
+            pd.GetPointData().AddArray(labels)
+            hierarchy = vtk.vtkPointSetToLabelHierarchy()
+            hierarchy.SetInputData(pd)
+            hierarchy.SetLabelArrayName('labels')
+            hierarchy.SetTextProperty(text_property)
+            mapper = vtk.vtkLabelPlacementMapper()
+            mapper.SetInputConnection(hierarchy.GetOutputPort())
+            mapper.SetShapeToNone()
+            actor = vtk.vtkActor2D()
+            actor.SetMapper(mapper)
+            self.add_actor(
+                actor,
                 name=f'quantity_{index}',
                 reset_camera=False,
+                pickable=False,
+                render=False,
             )
+            self._qty_points[index] = pd
             self._qty_actors[index] = actor
+
+    def _move_quantity_labels(self, indices: Iterable[int]) -> None:
+        '''Reposition the quantity labels of *indices* in place.
+
+        Runs on every mouse-move frame of a drag/grab move: only the single
+        anchor point of each affected pipeline is reassigned, the hierarchy
+        re-executes on the next render, and no actors are rebuilt. The one
+        ``render()`` after the batch comes from the caller.
+
+        Args:
+            indices: Scene indices of the moved blocks.
+        '''
+        for index in indices:
+            pd = self._qty_points.get(index)
+            if pd is not None:
+                pd.points = self._label_point(index).reshape(1, 3)
 
     # ------------------------------------------------ scene input (Qt events)
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
