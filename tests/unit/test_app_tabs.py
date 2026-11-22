@@ -26,8 +26,11 @@ from brickgen.core.project import (  # noqa: E402
 from brickgen.gui.app import MainWindow  # noqa: E402
 from brickgen.services.placement_service import (  # noqa: E402
     BED_GAP_MM,
+    block_footprints,
     local_position,
+    piece_dims,
     sync_pieces,
+    world_position,
 )
 
 # vtk 9.6 numpy_support sets .shape on arrays, deprecated in numpy 2.5; the
@@ -178,8 +181,9 @@ def test_bed_count_clamp(window: MainWindow) -> None:
 
 
 def test_move_piece_between_zones(window: MainWindow) -> None:
-    '''Beds count 2; move piece 0 to world_x = beds.width + BED_GAP_MM/2 + 5.0
-    -> piece 0.bed == 1 and local position computed via local_position.'''
+    '''Beds count 2; a drop past the zone-assignment boundary lands the piece
+    in bed 1, CLAMPED so its footprint stays inside bed 1's margins (a drop
+    past the edge must not poke into the neighboring bed).'''
     _reset_state(window)
 
     beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
@@ -189,15 +193,57 @@ def test_move_piece_between_zones(window: MainWindow) -> None:
     pieces = window._project.print_layout.pieces
     assert len(pieces) >= 1
 
-    # Move piece 0 to bed 1 zone.
-    target_wx = beds.width + BED_GAP_MM / 2.0 + 5.0  # just past the boundary
+    # Move piece 0 to bed 1 zone (5 mm past the boundary, outside bed 1's
+    # left margin: the raw local x would be negative).
+    target_wx = beds.width + BED_GAP_MM / 2.0 + 5.0
     moves = {0: (target_wx, 10.0)}
     window._on_placement_pieces_moved(moves)
 
     assert pieces[0].bed == 1
-    expected_local = local_position(target_wx, 10.0, 1, beds)
+    fp = block_footprints(window._project)
+    w, d = piece_dims(pieces[0], fp)
+    assert pieces[0].position_x == pytest.approx(beds.gap + w / 2, abs=0.01)
+    # y was already inside the margins: kept as dropped.
+    assert pieces[0].position_y == pytest.approx(10.0, abs=0.01)
+
+    # A drop inside the valid area keeps the exact local position.
+    target_wx2 = beds.width + BED_GAP_MM + 60.0
+    window._on_placement_pieces_moved({0: (target_wx2, 30.0)})
+    expected_local = local_position(target_wx2, 30.0, 1, beds)
     assert pieces[0].position_x == pytest.approx(expected_local[0], abs=0.01)
     assert pieces[0].position_y == pytest.approx(expected_local[1], abs=0.01)
+
+
+def test_move_piece_resolves_overlap(window: MainWindow) -> None:
+    '''Dropping a piece onto another shifts it to the nearest free spot.'''
+    _reset_state(window)
+
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0)
+    window._project.print_layout.beds = beds
+    window._project.blocks[0].quantity = 2
+    window._sync_placement()
+    pieces = window._project.print_layout.pieces
+    assert len(pieces) == 2
+
+    # Drop piece 1 exactly onto piece 0.
+    wx, wy = world_position(pieces[0], beds)
+    window._on_placement_pieces_moved({1: (wx, wy)})
+
+    # Piece 1 was shifted to the nearest conflict-free spot, piece 0 kept
+    # its position; nothing overlaps.
+    fp = block_footprints(window._project)
+    w0, d0 = piece_dims(pieces[0], fp)
+    w1, d1 = piece_dims(pieces[1], fp)
+    separated_x = (
+        abs(pieces[0].position_x - pieces[1].position_x)
+        >= (w0 + w1) / 2 + beds.gap - 1e-6
+    )
+    separated_y = (
+        abs(pieces[0].position_y - pieces[1].position_y)
+        >= (d0 + d1) / 2 + beds.gap - 1e-6
+    )
+    assert separated_x or separated_y
+    assert pieces[1].bed == 0
 
 
 def test_auto_place_handler(window: MainWindow) -> None:
@@ -311,3 +357,35 @@ def test_view_settings_stored_in_project(window: MainWindow) -> None:
     window._project.view = ViewSettings()
     window._apply_view_settings()
     window._dirty = False
+
+
+def test_enforce_no_overlap_repairs_packed_state(window: MainWindow) -> None:
+    '''The post-pack invariant repair fixes any overlapping piece pair.'''
+    _reset_state(window)
+
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0)
+    window._project.print_layout.beds = beds
+    window._project.blocks[0].quantity = 2
+    window._sync_placement()
+    pieces = window._project.print_layout.pieces
+    assert len(pieces) == 2
+
+    # Simulate an overlap reaching the viewport (e.g. from a stale path):
+    # piece 1 sits exactly on piece 0.
+    pieces[1].bed = 0
+    pieces[1].position_x = pieces[0].position_x
+    pieces[1].position_y = pieces[0].position_y
+
+    window._enforce_no_overlap()
+
+    fp = block_footprints(window._project)
+    w0, d0 = piece_dims(pieces[0], fp)
+    w1, d1 = piece_dims(pieces[1], fp)
+    separated_x = abs(pieces[0].position_x - pieces[1].position_x) >= (
+        w0 + w1
+    ) / 2 + beds.gap - 1e-6
+    separated_y = abs(pieces[0].position_y - pieces[1].position_y) >= (
+        d0 + d1
+    ) / 2 + beds.gap - 1e-6
+    assert separated_x or separated_y
+    assert pieces[1].bed == 0

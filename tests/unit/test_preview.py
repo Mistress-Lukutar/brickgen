@@ -36,6 +36,7 @@ from brickgen.gui.preview import (  # noqa: E402  # see filterwarnings note abov
     PART_TUBE,
     make_face_classifier,
     orbit_offset,
+    piece_variant_mesh,
     semantic_edges,
     solid_to_mesh,
 )
@@ -337,3 +338,37 @@ def test_orbit_offset_preserves_radius() -> None:
     up = np.array([0.0, 0.0, 1.0])
     rotated, _ = orbit_offset(offset, up, azimuth_deg=33.0, elevation_deg=17.0)
     assert np.linalg.norm(rotated) == pytest.approx(np.linalg.norm(offset))
+
+
+# ========================================================= piece variant meshes
+
+
+def test_piece_variant_mesh_rotated_swaps_bounds() -> None:
+    '''Rotated variant swaps the footprint; the base mesh stays untouched.'''
+    mesh = pv.Cube(x_length=8, y_length=4, z_length=2).triangulate()
+    variant = piece_variant_mesh(mesh, rotated90=True, flipped=False, lift_z=0.0)
+    xmin, xmax, ymin, ymax, zmin, zmax = variant.bounds
+    assert (xmax - xmin, ymax - ymin) == pytest.approx((4.0, 8.0))
+    # Centered on origin like the base mesh.
+    assert (xmin + xmax) / 2 == pytest.approx(0.0)
+    assert (ymin + ymax) / 2 == pytest.approx(0.0)
+    # The base mesh was not mutated.
+    bxmin, bxmax, bymin, bymax, _, _ = mesh.bounds
+    assert (bxmax - bxmin, bymax - bymin) == pytest.approx((8.0, 4.0))
+
+
+def test_piece_variant_mesh_flipped_lifts_onto_positive_z() -> None:
+    '''Flipped variant mirrors z and lifts so the mesh stays on z >= 0.'''
+    mesh = pv.Cube(x_length=4, y_length=4, z_length=6, center=(0, 0, 3)).triangulate()
+    variant = piece_variant_mesh(mesh, rotated90=False, flipped=True, lift_z=6.0)
+    _, _, _, _, zmin, zmax = variant.bounds
+    assert zmin == pytest.approx(0.0)
+    assert zmax == pytest.approx(6.0)
+
+
+def test_piece_variant_mesh_untransformed_returns_copy() -> None:
+    '''No rotation/flip requested: an equal-bbox copy comes back.'''
+    mesh = pv.Cube(x_length=8, y_length=4, z_length=2).triangulate()
+    variant = piece_variant_mesh(mesh, rotated90=False, flipped=False, lift_z=0.0)
+    assert variant.bounds == mesh.bounds
+    assert variant is not mesh

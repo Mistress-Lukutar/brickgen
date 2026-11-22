@@ -8,6 +8,8 @@ Version: v0.16.0
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from brickgen.core.project import (
@@ -24,11 +26,15 @@ from brickgen.services.placement_service import (
     bed_origin,
     block_colors,
     block_footprints,
+    clamp_into_zone,
     distribute,
     find_free_spot,
     fits_bed,
     local_position,
+    nearest_free_spot,
     piece_dims,
+    resolve_manual_moves,
+    resolve_piece_placements,
     staging_origin,
     sync_pieces,
     world_position,
@@ -58,6 +64,46 @@ def _make_project(
     if beds is not None:
         project.print_layout.beds = beds
     return project
+
+
+def _assert_bed_invariants(proj: Project, beds: PrintBedSettings) -> None:
+    '''Every piece on a real bed stays in bounds and ``gap``-clear of others.
+
+    In-bounds means the piece footprint lies inside
+    ``[gap, width-gap] x [gap, depth-gap]``; clearance means every pair on
+    the same bed is separated by at least ``gap`` on one axis.
+
+    Args:
+        proj: The project whose pieces are checked.
+        beds: The project's ``PrintBedSettings``.
+    '''
+    fp = block_footprints(proj)
+    by_bed: dict[int, list[PrintPiece]] = {}
+    for piece in proj.print_layout.pieces:
+        if piece.bed == PRINT_STAGING_BED:
+            continue
+        w, d = piece_dims(piece, fp)
+        assert piece.position_x - w / 2 >= beds.gap - 1e-6
+        assert piece.position_x + w / 2 <= beds.width - beds.gap + 1e-6
+        assert piece.position_y - d / 2 >= beds.gap - 1e-6
+        assert piece.position_y + d / 2 <= beds.depth - beds.gap + 1e-6
+        by_bed.setdefault(piece.bed, []).append(piece)
+    for bed_pieces in by_bed.values():
+        for i, p1 in enumerate(bed_pieces):
+            w1, d1 = piece_dims(p1, fp)
+            for p2 in bed_pieces[i + 1 :]:
+                w2, d2 = piece_dims(p2, fp)
+                separated_x = (
+                    abs(p1.position_x - p2.position_x)
+                    >= (w1 + w2) / 2 + beds.gap - 1e-6
+                )
+                separated_y = (
+                    abs(p1.position_y - p2.position_y)
+                    >= (d1 + d2) / 2 + beds.gap - 1e-6
+                )
+                assert separated_x or separated_y, (
+                    f"pieces {p1.uid} and {p2.uid} overlap or violate the gap"
+                )
 
 
 # ================================================================== zone geometry
@@ -388,11 +434,10 @@ def test_distribute_by_color_unknown_uid_staged() -> None:
 
 
 def test_auto_place_positions_and_counts() -> None:
-    '''auto_place repacks selected beds with exact positions.
+    '''auto_place repacks selected beds: counts, margins and no overlaps.
 
-    2 beds; block 4x2 (16x8) qty 1, block 2x2 (8x8) qty 2.
-    After sync + auto_place([0,1]): all three fit bed 0.
-    Positions: 16x8 at (12,8); first 8x8 at (28,8); second 8x8 at (40,8).
+    2 beds; block 4x2 (16x8) qty 1, block 2x2 (8x8) qty 2 — all three fit
+    bed 0 (MaxRects places them centered on it), bed 1 stays empty.
     '''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
     proj = _make_project(
@@ -408,37 +453,26 @@ def test_auto_place_positions_and_counts() -> None:
     assert report.per_bed[0] == 3
     assert report.per_bed.get(1, 0) == 0  # bed 1 has no pieces (all fit on bed 0)
 
-    # Verify positions.
-    piece_map: dict[str, list] = {}
-    for p in proj.print_layout.pieces:
-        piece_map.setdefault(p.block_uid, []).append(p)
+    # Every piece landed on bed 0, inside the margins, gap-clear.
+    assert all(p.bed == 0 for p in proj.print_layout.pieces)
+    _assert_bed_invariants(proj, beds)
 
-    # Block A (16x8) at (12, 8).
-    assert len(piece_map["A"]) == 1
-    a_p = piece_map["A"][0]
-    assert a_p.bed == 0
-    assert a_p.position_x == pytest.approx(12.0)
-    assert a_p.position_y == pytest.approx(8.0)
-
-    # Block B pieces at (28, 8) and (40, 8).
-    assert len(piece_map["B"]) == 2
-    bs = sorted(piece_map["B"], key=lambda p: p.position_x)
-    assert bs[0].bed == 0
-    assert bs[0].position_x == pytest.approx(28.0)
-    assert bs[1].bed == 0
-    assert bs[1].position_x == pytest.approx(40.0)
-
-    # No overlap, all within gap margins.
-    for p in proj.print_layout.pieces:
-        assert p.position_x >= 4 + 4  # gap + half_width
-        assert p.position_x <= 220 - 4 - 4
-        assert p.position_y >= 4 + 4
-        assert p.position_y <= 220 - 4 - 4
-
-    # Bed 1 untouched.
-    for p in proj.print_layout.pieces:
-        if p.bed == 1:
-            pytest.fail("no piece should be on bed 1")
+    # The three-piece cluster is centered on the bed.
+    fp = block_footprints(proj)
+    min_x = min(
+        p.position_x - piece_dims(p, fp)[0] / 2 for p in proj.print_layout.pieces
+    )
+    max_x = max(
+        p.position_x + piece_dims(p, fp)[0] / 2 for p in proj.print_layout.pieces
+    )
+    min_y = min(
+        p.position_y - piece_dims(p, fp)[1] / 2 for p in proj.print_layout.pieces
+    )
+    max_y = max(
+        p.position_y + piece_dims(p, fp)[1] / 2 for p in proj.print_layout.pieces
+    )
+    assert (min_x + max_x) / 2 == pytest.approx(beds.width / 2)
+    assert (min_y + max_y) / 2 == pytest.approx(beds.depth / 2)
 
 
 def test_auto_place_non_selected_bed_untouched() -> None:
@@ -753,8 +787,9 @@ def test_auto_place_rotates_to_fit() -> None:
     piece = proj.print_layout.pieces[0]
     assert piece.bed == 0
     assert piece.rotated90 is True
-    assert piece.position_x == pytest.approx(4.0)  # gap 0 + 8/2
-    assert piece.position_y == pytest.approx(8.0)  # gap 0 + 16/2
+    # Single centered piece on the 12x24 bed (gap 0).
+    assert piece.position_x == pytest.approx(6.0)
+    assert piece.position_y == pytest.approx(12.0)
 
 
 def test_auto_place_prefers_unrotated() -> None:
@@ -764,7 +799,7 @@ def test_auto_place_prefers_unrotated() -> None:
     auto_place(proj, [0])
     piece = proj.print_layout.pieces[0]
     assert piece.rotated90 is False
-    assert piece.position_x == pytest.approx(12.0)  # gap 4 + 16/2
+    assert piece.position_x == pytest.approx(110.0)  # centered on the 220 mm bed
 
 
 def test_auto_place_rotation_nonoverlap() -> None:
@@ -830,3 +865,200 @@ def test_distribute_keeps_rotation_flag_consistent() -> None:
         assert piece.position_x + w / 2 <= beds.width
         assert piece.position_y - d / 2 >= 0
         assert piece.position_y + d / 2 <= beds.depth
+
+
+# ================================================================== MaxRects packing
+
+
+def test_auto_place_reuses_holes_beyond_shelf() -> None:
+    '''MaxRects fills the strips around a big block that shelf packing wasted.
+
+    Bed 36x36, one 28x28 block, seven 8x8 blocks: a row-wise pack fits only
+    4 squares (one row below, none beside — the row is full), while MaxRects
+    packs all seven (3 in the top strip + 4 stacked in the right column).
+    '''
+    beds = PrintBedSettings(width=36.0, depth=36.0, count=1, gap=0.0)
+    proj = _make_project(
+        BlockInstance(uid="big", cells_x=7, cells_y=7, quantity=1),
+        BlockInstance(uid="small", cells_x=2, cells_y=2, quantity=7),
+        beds=beds,
+    )
+    sync_pieces(proj)
+    report = auto_place(proj, [0])
+
+    assert report.placed == 8
+    assert report.staged == 0
+    _assert_bed_invariants(proj, beds)
+
+
+def test_auto_place_stress_no_overlap_in_bounds() -> None:
+    '''Seeded mixed blocks: every placed piece stays in bounds and gap-clear.'''
+    rng = random.Random(42)
+    blocks = [
+        BlockInstance(
+            uid=f"b{i}",
+            cells_x=rng.randint(1, 8),
+            cells_y=rng.randint(1, 8),
+            color="#800000",
+            quantity=rng.randint(2, 20),
+        )
+        for i in range(12)
+    ]
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
+    proj = _make_project(*blocks, beds=beds)
+    sync_pieces(proj)
+    report = auto_place(proj, [0, 1])
+
+    assert report.placed + report.staged == sum(b.quantity for b in blocks)
+    _assert_bed_invariants(proj, beds)
+
+
+def test_distribute_even_stress_invariants() -> None:
+    '''Distribute even: placed pieces never overlap or leave the beds.'''
+    rng = random.Random(7)
+    blocks = [
+        BlockInstance(
+            uid=f"e{i}",
+            cells_x=rng.randint(1, 6),
+            cells_y=rng.randint(1, 6),
+            color="#008000",
+            quantity=rng.randint(2, 12),
+        )
+        for i in range(10)
+    ]
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=3, gap=4.0)
+    proj = _make_project(*blocks, beds=beds)
+    sync_pieces(proj)
+    report = distribute(proj, DISTRIBUTE_EVEN, [0, 1, 2])
+
+    assert report.placed + report.staged == sum(b.quantity for b in blocks)
+    _assert_bed_invariants(proj, beds)
+
+
+def test_distribute_by_color_stress_invariants() -> None:
+    '''Distribute by color: placed pieces never overlap or leave the beds.'''
+    rng = random.Random(11)
+    colors = ["#ff0000", "#00ff00", "#0000ff", "#ffff00"]
+    blocks = [
+        BlockInstance(
+            uid=f"c{i}",
+            cells_x=rng.randint(1, 6),
+            cells_y=rng.randint(1, 6),
+            color=colors[i % len(colors)],
+            quantity=rng.randint(2, 12),
+        )
+        for i in range(10)
+    ]
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=4, gap=4.0)
+    proj = _make_project(*blocks, beds=beds)
+    sync_pieces(proj)
+    report = distribute(proj, DISTRIBUTE_BY_COLOR, [0, 1, 2, 3])
+
+    assert report.placed + report.staged == sum(b.quantity for b in blocks)
+    _assert_bed_invariants(proj, beds)
+
+    # One print job per color: no bed holds two colors.
+    colors_map = block_colors(proj)
+    bed_colors: dict[int, set[str]] = {}
+    for piece in proj.print_layout.pieces:
+        if piece.bed != PRINT_STAGING_BED:
+            bed_colors.setdefault(piece.bed, set()).add(colors_map[piece.block_uid])
+    assert all(len(cs) == 1 for cs in bed_colors.values())
+
+
+# ========================================================= manual move resolution
+
+
+def test_clamp_into_zone_keeps_footprint_inside() -> None:
+    '''clamp_into_zone pulls the piece center into the zone margins.'''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0)
+    proj = _make_project(BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=1))
+    sync_pieces(proj)
+    piece = proj.print_layout.pieces[0]
+    fp = block_footprints(proj)
+
+    piece.position_x, piece.position_y = -5.0, 500.0
+    clamp_into_zone(piece, fp, beds)
+    assert piece.position_x == pytest.approx(8.0)  # gap 4 + 8/2
+    assert piece.position_y == pytest.approx(212.0)  # 220 - 4 - 8/2
+
+
+def test_nearest_free_spot_shifts_to_closest_side() -> None:
+    '''A request inside an occupant resolves to the closest free center.'''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0)
+    placed = [(60.0, 60.0, 16.0, 8.0)]
+    spot = nearest_free_spot(placed, 8.0, 8.0, beds, 60.0, 60.0)
+    # Free centers 12 mm away: (60, 48) below and (60, 72) above; the tie
+    # breaks to the lower y.
+    assert spot == (60.0, 48.0)
+
+
+def test_nearest_free_spot_full_zone_returns_none() -> None:
+    '''No conflict-free candidate in a packed zone → None.'''
+    beds = PrintBedSettings(width=40.0, depth=20.0, count=1, gap=4.0)
+    placed = [(20.0, 8.0, 32.0, 8.0), (20.0, 16.0, 32.0, 8.0)]
+    assert nearest_free_spot(placed, 8.0, 8.0, beds, 20.0, 10.0) is None
+
+
+def test_resolve_manual_moves_keeps_valid_drop() -> None:
+    '''A drop in free space keeps its exact position and zone.'''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
+    proj = _make_project(BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2))
+    sync_pieces(proj)
+    resolve_manual_moves(
+        proj.print_layout.pieces, block_footprints(proj), beds, {1: (100.0, 100.0)}
+    )
+    piece = proj.print_layout.pieces[1]
+    assert piece.bed == 0
+    assert piece.position_x == pytest.approx(100.0)
+    assert piece.position_y == pytest.approx(100.0)
+
+
+def test_resolve_manual_moves_repairs_overlap() -> None:
+    '''A drop onto another piece shifts to the nearest conflict-free spot.'''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0)
+    proj = _make_project(BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2))
+    sync_pieces(proj)
+    # Piece 0 sits at (8, 8); drop piece 1 right on top of it.
+    resolve_manual_moves(
+        proj.print_layout.pieces, block_footprints(proj), beds, {1: (8.0, 8.0)}
+    )
+    p0, p1 = proj.print_layout.pieces
+    assert p1.bed == 0
+    assert (p1.position_x, p1.position_y) == pytest.approx((20.0, 8.0))
+    _assert_bed_invariants(proj, beds)
+    # Piece 0 untouched.
+    assert (p0.position_x, p0.position_y) == pytest.approx((8.0, 8.0))
+
+
+def test_resolve_manual_moves_stages_when_zone_full() -> None:
+    '''A drop into a packed zone stages the piece at a free staging spot.'''
+    beds = PrintBedSettings(width=20.0, depth=20.0, count=1, gap=4.0)
+    proj = _make_project(BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2))
+    sync_pieces(proj)
+    # Only one 8x8 piece fits the 20x20 bed: piece 0 on the bed, piece 1
+    # staged by sync.  Force piece 1 onto the (full) bed.
+    resolve_manual_moves(
+        proj.print_layout.pieces, block_footprints(proj), beds, {1: (12.0, 12.0)}
+    )
+    p1 = proj.print_layout.pieces[1]
+    assert p1.bed == PRINT_STAGING_BED
+    # Staged at the free staging spot, not on top of bed pieces.
+    assert p1.position_x == pytest.approx(8.0)
+    assert p1.position_y == pytest.approx(8.0)
+
+
+def test_resolve_piece_placements_repairs_bed_change_overlap() -> None:
+    '''resolve_piece_placements repairs pre-positioned pieces (bed change).'''
+    beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
+    proj = _make_project(BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2))
+    sync_pieces(proj)
+    p0, p1 = proj.print_layout.pieces
+    # Simulate a bed change that lands piece 1 on top of piece 0 on bed 0.
+    p1.bed = 0
+    p1.position_x, p1.position_y = p0.position_x, p0.position_y
+    resolve_piece_placements(
+        proj.print_layout.pieces, block_footprints(proj), beds, [p1]
+    )
+    _assert_bed_invariants(proj, beds)
+    assert p1.bed == 0

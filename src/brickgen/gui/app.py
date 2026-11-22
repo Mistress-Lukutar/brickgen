@@ -59,6 +59,7 @@ from brickgen.core.project import (
     BlockInstance,
     BlockLayout,
     PrintBedSettings,
+    PrintPiece,
     Project,
 )
 from brickgen.gui.grid_editor import CellGridEditor, CellState
@@ -72,6 +73,7 @@ from brickgen.gui.preview import (
     MODE_SOLID,
     PreviewWidget,
     mesh_from_arrays,
+    piece_variant_mesh,
 )
 from brickgen.services.app_settings import load_app_settings, save_app_settings
 from brickgen.services.export_service import SUPPORTED_FORMATS
@@ -79,13 +81,16 @@ from brickgen.services.placement_service import (
     auto_place,
     block_colors,
     block_footprints,
+    clamp_into_zone,
     distribute,
+    fallback_spot,
     find_free_spot,
     local_position,
     piece_dims,
+    resolve_manual_moves,
+    resolve_piece_placements,
     sync_pieces,
     world_position,
-    zone_for_world_x,
 )
 from brickgen.services.print_export import collect_all_beds
 from brickgen.services.project_io import load_project, save_project
@@ -1926,11 +1931,33 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------- placement sync
 
+    def _enforce_no_overlap(self) -> None:
+        '''Repair any overlapping piece pair before the scene renders.
+
+        Belt-and-braces after packing: auto_place/distribute are
+        fuzz-verified overlap-free, but this guarantees the no-overlap
+        invariant for EVERY path that reaches the viewport — a piece that
+        overlaps another in its zone shifts to the nearest free spot (or
+        staging when full) exactly like a repaired manual move.
+        '''
+        pieces = self._project.print_layout.pieces
+        before = [(p.bed, p.position_x, p.position_y) for p in pieces]
+        resolve_piece_placements(
+            pieces,
+            block_footprints(self._project),
+            self._project.print_layout.beds,
+            list(pieces),
+        )
+        after = [(p.bed, p.position_x, p.position_y) for p in pieces]
+        if before != after:
+            self._mark_dirty()
+
     def _sync_placement(self) -> None:
         '''Reconcile pieces with blocks and rebuild the placement scene.'''
         report = sync_pieces(self._project)
         if report.added or report.removed:
             self._mark_dirty()
+        self._enforce_no_overlap()
         self._refresh_placement_scene()
         self._placement_panel.sync_inspector(
             self._project.print_layout.pieces,
@@ -1977,14 +2004,12 @@ class MainWindow(QMainWindow):
                 key = (blk_idx, piece.flipped, piece.rotated90)
                 variant = self._mesh_variants.get(key)
                 if variant is None:
-                    variant = base_mesh.copy()
-                    if piece.rotated90:
-                        # 90 deg about Z: footprint swaps (matches export).
-                        variant.rotate_z(90.0)
-                    if piece.flipped:
-                        # 180 deg about X: pins down; lift onto z >= 0.
-                        variant.rotate_x(180.0)
-                        variant.translate((0.0, 0.0, heights.get(piece.block_uid, 0)))
+                    variant = piece_variant_mesh(
+                        base_mesh,
+                        piece.rotated90,
+                        piece.flipped,
+                        heights.get(piece.block_uid, 0),
+                    )
                     self._mesh_variants[key] = variant
                 mesh = variant
 
@@ -2079,17 +2104,17 @@ class MainWindow(QMainWindow):
         )
 
     def _on_placement_pieces_moved(self, moves: dict) -> None:
-        '''Commit moved piece positions to the project.'''
-        beds = self._project.print_layout.beds
-        for index, (wx, wy) in moves.items():
-            if not 0 <= index < len(self._project.print_layout.pieces):
-                continue
-            zone = zone_for_world_x(wx, beds)
-            lx, ly = local_position(wx, wy, zone, beds)
-            piece = self._project.print_layout.pieces[index]
-            piece.bed = zone
-            piece.position_x = lx
-            piece.position_y = ly
+        '''Commit moved piece positions to the project (collision-safe).
+
+        Drops past a zone edge are clamped into the zone; drops onto other
+        pieces shift to the nearest conflict-free spot instead.
+        '''
+        resolve_manual_moves(
+            self._project.print_layout.pieces,
+            block_footprints(self._project),
+            self._project.print_layout.beds,
+            moves,
+        )
         self._mark_dirty()
         self._refresh_placement_scene()
         self._placement_panel.sync_inspector(
@@ -2103,13 +2128,56 @@ class MainWindow(QMainWindow):
         if self._tabs.currentIndex() == 1:
             self._set_status(self._placement_summary())
 
+    def _move_pieces_to_staging(self, pieces: list[PrintPiece]) -> None:
+        '''Stage pieces at free staging spots (fallback: keep coords).
+
+        Args:
+            pieces: The pieces to stage (mutated in place).
+        '''
+        beds = self._project.print_layout.beds
+        fps = block_footprints(self._project)
+        for piece in pieces:
+            piece.bed = PRINT_STAGING_BED
+            w, d = piece_dims(piece, fps) if piece.block_uid in fps else (0.0, 0.0)
+            existing: list[tuple[float, float, float, float]] = [
+                (p.position_x, p.position_y, *piece_dims(p, fps))
+                for p in self._project.print_layout.pieces
+                if p.bed == PRINT_STAGING_BED and p.uid != piece.uid
+            ]
+            spot = find_free_spot(existing, w, d, beds)
+            if spot is None:
+                spot = fallback_spot(existing, w, d, beds)
+            if spot is not None:
+                piece.position_x, piece.position_y = spot
+
     def _on_placement_beds_changed(self, beds: PrintBedSettings) -> None:
-        '''Apply new bed settings to the project.'''
+        '''Apply new bed settings to the project.
+
+        Pieces referencing removed beds or sticking out of the resized bed
+        rectangle are moved to staging, so no piece ever stays out of
+        bounds after a bed resize.
+        '''
         self._project.print_layout.beds = beds
-        # Pieces with bed >= new count -> staging.
+        footprints = block_footprints(self._project)
+        outside: list[PrintPiece] = []
         for piece in self._project.print_layout.pieces:
-            if piece.bed >= 0 and piece.bed >= beds.count:
-                piece.bed = PRINT_STAGING_BED
+            if piece.bed == PRINT_STAGING_BED:
+                continue
+            if piece.bed >= beds.count:
+                outside.append(piece)
+                continue
+            if piece.block_uid not in footprints:
+                continue
+            w, d = piece_dims(piece, footprints)
+            if (
+                piece.position_x - w / 2 < beds.gap - 1e-6
+                or piece.position_x + w / 2 > beds.width - beds.gap + 1e-6
+                or piece.position_y - d / 2 < beds.gap - 1e-6
+                or piece.position_y + d / 2 > beds.depth - beds.gap + 1e-6
+            ):
+                outside.append(piece)
+        if outside:
+            self._move_pieces_to_staging(outside)
         self._placement_view.set_print_beds(beds)
         self._placement_panel.set_beds(beds)
         self._mark_dirty()
@@ -2118,6 +2186,7 @@ class MainWindow(QMainWindow):
     def _on_placement_auto_place(self, indices: list[int]) -> None:
         '''Handle auto-place request.'''
         report = auto_place(self._project, indices)
+        self._enforce_no_overlap()
         self._mark_dirty()
         self._refresh_placement_scene()
         self._placement_panel.sync_inspector(
@@ -2136,6 +2205,7 @@ class MainWindow(QMainWindow):
     def _on_placement_distribute(self, mode: str, indices: list[int]) -> None:
         '''Handle distribute request.'''
         report = distribute(self._project, mode, indices)
+        self._enforce_no_overlap()
         self._mark_dirty()
         self._refresh_placement_scene()
         self._placement_panel.sync_inspector(
@@ -2152,36 +2222,45 @@ class MainWindow(QMainWindow):
             )
 
     def _on_piece_bed_changed(self, bed: int) -> None:
-        '''Move selected pieces to a different bed.'''
+        '''Move selected pieces to a different bed (collision-safe).'''
         if not self._pselection:
             return
         beds = self._project.print_layout.beds
+        fps = block_footprints(self._project)
+        moved: list[PrintPiece] = []
         for idx in sorted(self._pselection):
             if idx >= len(self._project.print_layout.pieces):
                 continue
             piece = self._project.print_layout.pieces[idx]
             # Preserve world position: compute current zone, then local in target.
             wx, wy = world_position(piece, beds)
-            lx, ly = local_position(wx, wy, bed, beds)
             piece.bed = bed
-            piece.position_x = lx
-            piece.position_y = ly
+            piece.position_x, piece.position_y = local_position(wx, wy, bed, beds)
+            clamp_into_zone(piece, fps, beds)
+            moved.append(piece)
+        resolve_piece_placements(self._project.print_layout.pieces, fps, beds, moved)
         self._mark_dirty()
         self._after_placement_change()
 
     def _on_piece_position_changed(self, x: float, y: float) -> None:
-        '''Apply delta position to selected pieces.'''
+        '''Apply delta position to selected pieces (collision-safe).'''
         if not self._pselection or self._pprimary is None:
             return
+        beds = self._project.print_layout.beds
+        fps = block_footprints(self._project)
         primary = self._project.print_layout.pieces[self._pprimary]
         dx = x - primary.position_x
         dy = y - primary.position_y
+        moved: list[PrintPiece] = []
         for idx in sorted(self._pselection):
             if idx >= len(self._project.print_layout.pieces):
                 continue
             piece = self._project.print_layout.pieces[idx]
             piece.position_x += dx
             piece.position_y += dy
+            clamp_into_zone(piece, fps, beds)
+            moved.append(piece)
+        resolve_piece_placements(self._project.print_layout.pieces, fps, beds, moved)
         self._mark_dirty()
         self._after_placement_change()
 
@@ -2206,23 +2285,12 @@ class MainWindow(QMainWindow):
 
     def _on_stage_selection(self) -> None:
         '''Move selected pieces to staging.'''
-        beds = self._project.print_layout.beds
-        for idx in sorted(self._pselection):
-            if idx >= len(self._project.print_layout.pieces):
-                continue
-            piece = self._project.print_layout.pieces[idx]
-            piece.bed = PRINT_STAGING_BED
-            # Try to find a free spot; fall back to current coords.
-            fps = block_footprints(self._project)
-            w, d = piece_dims(piece, fps) if piece.block_uid in fps else (0.0, 0.0)
-            existing: list[tuple[float, float, float, float]] = [
-                (p.position_x, p.position_y, *piece_dims(p, fps))
-                for p in self._project.print_layout.pieces
-                if p.bed == PRINT_STAGING_BED and p.uid != piece.uid
-            ]
-            spot = find_free_spot(existing, w, d, beds)
-            if spot is not None:
-                piece.position_x, piece.position_y = spot
+        pieces = [
+            self._project.print_layout.pieces[idx]
+            for idx in sorted(self._pselection)
+            if idx < len(self._project.print_layout.pieces)
+        ]
+        self._move_pieces_to_staging(pieces)
         self._mark_dirty()
         self._after_placement_change()
 

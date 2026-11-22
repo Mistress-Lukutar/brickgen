@@ -355,6 +355,43 @@ def mesh_from_arrays(data: dict) -> pv.PolyData:
     return mesh
 
 
+def piece_variant_mesh(
+    base_mesh: pv.PolyData,
+    rotated90: bool,
+    flipped: bool,
+    lift_z: float,
+) -> pv.PolyData:
+    '''Build the print-placement mesh variant of one piece orientation.
+
+    Rotated pieces turn 90 degrees about Z (footprint swaps, matching the
+    export); flipped pieces turn 180 degrees about X (pins down) and are
+    lifted so the geometry stays on ``z >= 0``.
+
+    Note: the pyvista transform methods must have their RESULT assigned —
+    newer pyvista releases return a transformed copy instead of mutating
+    in place, so calling them without assignment silently renders the
+    untransformed mesh (overlapping pieces in the placement viewport).
+
+    Args:
+        base_mesh: The untransformed block mesh (centered at origin).
+        rotated90: Rotate 90 degrees about Z.
+        flipped: Rotate 180 degrees about X (pins down).
+        lift_z: Z translation applied after the flip (``total_height``).
+
+    Returns:
+        The transformed mesh copy (the input mesh is left untouched).
+    '''
+    variant = base_mesh.copy()
+    if rotated90:
+        # 90 deg about Z: footprint swaps (matches export).
+        variant = variant.rotate_z(90.0)
+    if flipped:
+        # 180 deg about X: pins down; lift onto z >= 0.
+        variant = variant.rotate_x(180.0)
+        variant = variant.translate((0.0, 0.0, lift_z))
+    return variant
+
+
 def build_preview_mesh(
     model: cq.Workplane,
     settings: BlockSettings,
