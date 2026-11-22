@@ -3,7 +3,7 @@ File:   test_project_io.py
 Brief:  Unit tests for JSON save/load of multi-block projects.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.17.0
+Version: v0.18.0
 '''
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from brickgen.core.project import (
     PrintBedSettings,
     PrintLayout,
     PrintPiece,
+    PrintToolsSettings,
     Project,
     ViewSettings,
 )
@@ -626,3 +627,73 @@ def test_v7_payload_loads_with_default_view(tmp_path: Path) -> None:
     resaved_payload = json.loads(resaved.read_text(encoding="utf-8"))
     assert resaved_payload["schema"]["version"] == PROJECT_SCHEMA_VERSION
     assert resaved_payload["view"]["grid_scale"] == 0.5
+
+
+# ------------------------------------------------------------- tools state
+def test_tools_state_roundtrip(tmp_path: Path) -> None:
+    '''Custom placement tools state survives save/load unchanged.'''
+    proj = Project(
+        blocks=[BlockInstance()],
+        print_layout=PrintLayout(
+            beds=PrintBedSettings(count=4),
+            tools=PrintToolsSettings(
+                auto_from=2,
+                auto_to=3,
+                distribute_by_color=False,
+                distribute_evenly=False,
+            ),
+        ),
+    )
+
+    path = save_project(proj, tmp_path / "tools.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["print_layout"]["tools"] == {
+        "auto_from": 2,
+        "auto_to": 3,
+        "distribute_by_color": False,
+        "distribute_evenly": False,
+    }
+
+    loaded = load_project(path)
+    assert loaded.print_layout.tools == proj.print_layout.tools
+
+
+def test_load_v8_payload_defaults_tools(tmp_path: Path) -> None:
+    '''A v8 payload without print_layout.tools loads with defaults.
+
+    v9 added the tools state; pre-v9 projects have no "tools" key, so
+    loading falls back to the factory defaults and the next save writes
+    the current schema version.
+    '''
+    proj = Project(blocks=[BlockInstance()])
+    payload = {
+        "schema": {"name": PROJECT_SCHEMA_NAME, "version": 8},
+        "settings": {
+            field: getattr(BlockSettings(), field)
+            for field in (
+                "unit_size",
+                "wall_thickness",
+                "block_height",
+                "clearance_xy",
+                "clearance_z",
+            )
+        },
+        "blocks": [b.model_dump() for b in proj.blocks],
+        # A v8 print_layout carries no "tools" key at all.
+        "print_layout": {"beds": {}, "pieces": []},
+        "view": {},
+    }
+    path = tmp_path / "v8.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    loaded = load_project(path)
+    assert loaded.print_layout.tools == PrintToolsSettings()
+
+    resaved = save_project(loaded, tmp_path / "resaved.json")
+    resaved_payload = json.loads(resaved.read_text(encoding="utf-8"))
+    assert resaved_payload["schema"]["version"] == PROJECT_SCHEMA_VERSION
+    assert resaved_payload["print_layout"]["tools"] == {
+        "auto_from": 1,
+        "auto_to": 1,
+        "distribute_by_color": True,
+        "distribute_evenly": True,
+    }

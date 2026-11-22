@@ -3,7 +3,7 @@ File:   test_app_tabs.py
 Brief:  Integration tests for the MainWindow tab integration (S4).
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.17.0
+Version: v0.18.0
 '''
 
 from __future__ import annotations
@@ -153,6 +153,31 @@ def test_flip_selected_piece(window: MainWindow) -> None:
     window._on_piece_flip_changed(True)
     assert pieces[0].flipped is True
     assert window._dirty is True
+
+
+def test_frame_selection_picks_primary(window: MainWindow) -> None:
+    '''A rubber-band payload (selection, None) picks the lowest selected
+    index as primary, so the inspector stays active on framed selections.
+
+    The frame selection emits no primary (no piece was clicked); without
+    the fallback the "Selected piece" group stayed disabled although move
+    operations worked fine.
+    '''
+    _reset_state(window)
+    window._project.blocks[0].quantity = 2
+    window._sync_placement()
+    assert len(window._project.print_layout.pieces) == 2
+
+    window._on_placement_selection((frozenset({0, 1}), None))
+    assert window._pselection == {0, 1}
+    assert window._pprimary == 0
+    assert window._placement_panel._inspector_group.isEnabled()
+
+    # An empty frame selection keeps the inspector disabled.
+    window._on_placement_selection((frozenset(), None))
+    assert window._pselection == set()
+    assert window._pprimary is None
+    assert not window._placement_panel._inspector_group.isEnabled()
 
 
 def test_bed_count_clamp(window: MainWindow) -> None:
@@ -381,11 +406,13 @@ def test_enforce_no_overlap_repairs_packed_state(window: MainWindow) -> None:
     fp = block_footprints(window._project)
     w0, d0 = piece_dims(pieces[0], fp)
     w1, d1 = piece_dims(pieces[1], fp)
-    separated_x = abs(pieces[0].position_x - pieces[1].position_x) >= (
-        w0 + w1
-    ) / 2 + beds.gap - 1e-6
-    separated_y = abs(pieces[0].position_y - pieces[1].position_y) >= (
-        d0 + d1
-    ) / 2 + beds.gap - 1e-6
+    separated_x = (
+        abs(pieces[0].position_x - pieces[1].position_x)
+        >= (w0 + w1) / 2 + beds.gap - 1e-6
+    )
+    separated_y = (
+        abs(pieces[0].position_y - pieces[1].position_y)
+        >= (d0 + d1) / 2 + beds.gap - 1e-6
+    )
     assert separated_x or separated_y
     assert pieces[1].bed == 0

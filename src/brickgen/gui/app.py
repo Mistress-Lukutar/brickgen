@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.17.0
+Version: v0.18.0
 '''
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ from brickgen.core.project import (
     BlockLayout,
     PrintBedSettings,
     PrintPiece,
+    PrintToolsSettings,
     Project,
 )
 from brickgen.gui.grid_editor import CellGridEditor, CellState
@@ -200,6 +201,7 @@ class MainWindow(QMainWindow):
         # Placement view init.
         self._placement_view.set_print_beds(self._project.print_layout.beds)
         self._placement_panel.set_beds(self._project.print_layout.beds)
+        self._placement_panel.set_tools(self._project.print_layout.tools)
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
     # ------------------------------------------------------------------ tabs
@@ -663,12 +665,12 @@ class MainWindow(QMainWindow):
         self._placement_panel.auto_place_requested.connect(
             self._on_placement_auto_place
         )
+        self._placement_panel.tools_changed.connect(self._on_placement_tools_changed)
         self._placement_panel.piece_bed_changed.connect(self._on_piece_bed_changed)
         self._placement_panel.piece_position_changed.connect(
             self._on_piece_position_changed
         )
         self._placement_panel.piece_flip_changed.connect(self._on_piece_flip_changed)
-        self._placement_panel.flip_selection_requested.connect(self._on_flip_selection)
         self._placement_panel.stage_selection_requested.connect(
             self._on_stage_selection
         )
@@ -834,6 +836,7 @@ class MainWindow(QMainWindow):
         self._sync_all()
         self._placement_view.set_print_beds(self._project.print_layout.beds)
         self._placement_panel.set_beds(self._project.print_layout.beds)
+        self._placement_panel.set_tools(self._project.print_layout.tools)
         self._on_generate()
         self._set_status("New project created.")
 
@@ -868,6 +871,7 @@ class MainWindow(QMainWindow):
         self._sync_all()
         self._placement_view.set_print_beds(self._project.print_layout.beds)
         self._placement_panel.set_beds(self._project.print_layout.beds)
+        self._placement_panel.set_tools(self._project.print_layout.tools)
         self._on_generate()
         self._set_status(f"Project opened: {Path(path).name}")
 
@@ -2085,10 +2089,17 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------- placement handlers
 
     def _on_placement_selection(self, payload: object) -> None:
-        '''Sync placement selection state.'''
+        '''Sync placement selection state.
+
+        A rubber-band (frame) selection carries no primary — no piece was
+        clicked; the lowest selected index becomes the primary so the
+        inspector stays active on framed selections.
+        '''
         selection, primary = cast(tuple[frozenset, int | None], payload)
         n_pieces = len(self._project.print_layout.pieces)
         self._pselection = {i for i in selection if 0 <= i < n_pieces}
+        if primary is None and self._pselection:
+            primary = min(self._pselection)
         self._pprimary = primary
         self._placement_panel.sync_inspector(
             self._project.print_layout.pieces,
@@ -2176,6 +2187,16 @@ class MainWindow(QMainWindow):
             self._move_pieces_to_staging(outside)
         self._placement_view.set_print_beds(beds)
         self._placement_panel.set_beds(beds)
+        # Clamp the persisted auto-place range into the new bed count and
+        # re-sync the tools widgets from the normalized values.
+        tools = self._project.print_layout.tools
+        auto_from = max(1, min(tools.auto_from, beds.count))
+        auto_to = max(auto_from, min(tools.auto_to, beds.count))
+        if (auto_from, auto_to) != (tools.auto_from, tools.auto_to):
+            self._project.print_layout.tools = tools.model_copy(
+                update={"auto_from": auto_from, "auto_to": auto_to}
+            )
+        self._placement_panel.set_tools(self._project.print_layout.tools)
         self._mark_dirty()
         self._sync_placement()
 
@@ -2255,15 +2276,10 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
         self._after_placement_change()
 
-    def _on_flip_selection(self) -> None:
-        '''Toggle flip on all selected pieces.'''
-        for idx in sorted(self._pselection):
-            if idx >= len(self._project.print_layout.pieces):
-                continue
-            p = self._project.print_layout.pieces[idx]
-            p.flipped = not p.flipped
+    def _on_placement_tools_changed(self, tools: PrintToolsSettings) -> None:
+        '''Store the placement tools state in the project (persisted JSON).'''
+        self._project.print_layout.tools = tools
         self._mark_dirty()
-        self._after_placement_change()
 
     def _on_stage_selection(self) -> None:
         '''Move selected pieces to staging.'''

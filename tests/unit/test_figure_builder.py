@@ -3,7 +3,7 @@ File:   test_figure_builder.py
 Brief:  Unit tests for blocks with excluded cells (figure variants).
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.17.0
+Version: v0.18.0
 '''
 
 from __future__ import annotations

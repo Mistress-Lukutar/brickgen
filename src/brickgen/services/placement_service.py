@@ -3,7 +3,7 @@ File:   placement_service.py
 Brief:  Print-placement layout engine: zone geometry, sync and auto-place.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.17.0
+Version: v0.18.0
 '''
 
 from __future__ import annotations

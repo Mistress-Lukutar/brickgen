@@ -4,7 +4,7 @@ Brief:  Left-sidebar panel for the print-placement tab: bed configuration,
         placement tools and the selected-piece inspector.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.17.0
+Version: v0.18.0
 '''
 
 from __future__ import annotations
@@ -25,7 +25,31 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from brickgen.core.project import PRINT_STAGING_BED, PrintBedSettings, PrintPiece
+from brickgen.core.project import (
+    PRINT_STAGING_BED,
+    PrintBedSettings,
+    PrintPiece,
+    PrintToolsSettings,
+)
+
+
+class _FlipCheckBox(QCheckBox):
+    '''"Flip 180\u00b0" checkbox with tri-state display and click-to-all
+    semantics.
+
+    The state mirrors the whole selection (checked when every selected
+    piece is flipped, unchecked when none is, partially checked when the
+    selection mixes both), but a user click never lands on the partial
+    state: a click on a checked or partially-checked box clears the flip
+    on all selected pieces, a click on an unchecked box flips them all.
+    '''
+
+    def nextCheckState(self) -> None:  # noqa: N802 - Qt naming
+        '''Click/keyboard toggle: unchecked -> checked, otherwise unchecked.'''
+        if self.checkState() == Qt.CheckState.Unchecked:
+            self.setCheckState(Qt.CheckState.Checked)
+        else:
+            self.setCheckState(Qt.CheckState.Unchecked)
 
 
 class PlacementPanel(QWidget):
@@ -35,10 +59,10 @@ class PlacementPanel(QWidget):
     beds_changed = Signal(object)  # PrintBedSettings
     # list[int] 0-based bed indices, "Distribute by color", "Distribute evenly"
     auto_place_requested = Signal(object, bool, bool)
+    tools_changed = Signal(object)  # PrintToolsSettings
     piece_bed_changed = Signal(int)  # target bed index or PRINT_STAGING_BED
     piece_position_changed = Signal(float, float)  # delta for primary's zone-local pos
     piece_flip_changed = Signal(bool)  # flip state for ALL selected pieces
-    flip_selection_requested = Signal()
     stage_selection_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -132,6 +156,7 @@ class PlacementPanel(QWidget):
         self._cb_by_color.setToolTip(
             "Auto-place never mixes piece colors on one bed (one print job per color)."
         )
+        self._cb_by_color.toggled.connect(self._on_tool_flag_changed)
         tools_layout.addWidget(self._cb_by_color)
 
         self._cb_even = QCheckBox("Distribute evenly")
@@ -140,6 +165,7 @@ class PlacementPanel(QWidget):
             "Auto-place spreads pieces across all selected beds instead of "
             "filling one bed before moving to the next."
         )
+        self._cb_even.toggled.connect(self._on_tool_flag_changed)
         tools_layout.addWidget(self._cb_even)
 
         # Full-width stacked buttons: a horizontal row of three would force
@@ -182,15 +208,11 @@ class PlacementPanel(QWidget):
         self._spin_piece_y.valueChanged.connect(self._on_piece_position_changed)
         insp_form.addRow("Y, mm", self._spin_piece_y)
 
-        self._cb_flip = QCheckBox("Flip 180\u00b0 (pins down)")
-        self._cb_flip.toggled.connect(self._on_piece_flip_changed)
+        self._cb_flip = _FlipCheckBox("Flip 180\u00b0 (pins down)")
+        self._cb_flip.checkStateChanged.connect(self._on_piece_flip_state_changed)
         insp_form.addRow(self._cb_flip)
 
         # Full-width stacked buttons (same reason as the tool buttons).
-        self._btn_flip_sel = QPushButton("Flip selected")
-        self._btn_flip_sel.clicked.connect(self._on_flip_selection)
-        insp_form.addRow(self._btn_flip_sel)
-
         self._btn_stage_sel = QPushButton("Move to staging")
         self._btn_stage_sel.clicked.connect(self._on_stage_selection)
         insp_form.addRow(self._btn_stage_sel)
@@ -231,22 +253,47 @@ class PlacementPanel(QWidget):
         self.beds_changed.emit(beds)
 
     def _on_from_changed(self) -> None:
-        '''Adjust from/to range constraints.'''
+        '''User edit of "Beds from": clamp the range and emit the tools
+        state (programmatic sync never clamps or emits).'''
+        if self._syncing:
+            return
         to_val = self._spin_to.value()
         from_val = self._spin_from.value()
         if from_val > to_val:
             self._spin_from.setValue(to_val)
         elif from_val < 1:
             self._spin_from.setValue(1)
+        self._emit_tools()
 
     def _on_to_changed(self) -> None:
-        '''Adjust from/to range constraints.'''
+        '''User edit of "Beds to": clamp the range and emit the tools
+        state (programmatic sync never clamps or emits).'''
+        if self._syncing:
+            return
         to_val = self._spin_to.value()
         from_val = self._spin_from.value()
         if to_val < from_val:
             self._spin_to.setValue(from_val)
         elif to_val > self._spin_bed_count.value():
             self._spin_to.setValue(self._spin_bed_count.value())
+        self._emit_tools()
+
+    def _on_tool_flag_changed(self, _checked: bool) -> None:
+        '''A distribute modifier checkbox changed: emit the tools state.'''
+        self._emit_tools()
+
+    def _emit_tools(self) -> None:
+        '''Emit the current tools state (suppressed during programmatic sync).'''
+        if self._syncing:
+            return
+        self.tools_changed.emit(
+            PrintToolsSettings(
+                auto_from=self._spin_from.value(),
+                auto_to=self._spin_to.value(),
+                distribute_by_color=self._cb_by_color.isChecked(),
+                distribute_evenly=self._cb_even.isChecked(),
+            )
+        )
 
     def _on_auto_place(self) -> None:
         '''Emit auto-place request for the selected bed range.
@@ -280,15 +327,15 @@ class PlacementPanel(QWidget):
         y = self._spin_piece_y.value()
         self.piece_position_changed.emit(x, y)
 
-    def _on_piece_flip_changed(self, checked: bool) -> None:
-        '''Flip checkbox toggled.'''
+    def _on_piece_flip_state_changed(self, state: Qt.CheckState) -> None:
+        '''Flip checkbox state changed by the user: apply to ALL selected.
+
+        ``nextCheckState`` guarantees the user-driven state is fully
+        checked or unchecked, never partial.
+        '''
         if self._syncing:
             return
-        self.piece_flip_changed.emit(checked)
-
-    def _on_flip_selection(self) -> None:
-        '''Flip selected button clicked.'''
-        self.flip_selection_requested.emit()
+        self.piece_flip_changed.emit(state == Qt.CheckState.Checked)
 
     def _on_stage_selection(self) -> None:
         '''Move to staging button clicked.'''
@@ -322,6 +369,18 @@ class PlacementPanel(QWidget):
         finally:
             self._syncing = False
 
+    def set_tools(self, tools: PrintToolsSettings) -> None:
+        '''Sync the tools widgets (bed range, distribute modifiers) from
+        the project.'''
+        self._syncing = True
+        try:
+            self._spin_from.setValue(tools.auto_from)
+            self._spin_to.setValue(tools.auto_to)
+            self._cb_by_color.setChecked(tools.distribute_by_color)
+            self._cb_even.setChecked(tools.distribute_evenly)
+        finally:
+            self._syncing = False
+
     def sync_inspector(
         self,
         pieces: list[PrintPiece],
@@ -337,8 +396,10 @@ class PlacementPanel(QWidget):
         Otherwise show primary piece: summary label
         "Piece {i+1} of {n} \u00b7 block {cx}x{cy} \u00b7 Bed {k}"
         (k = "staging" or 1-based),
-        bed spin (0..count), x/y spins from piece.position_x/y, flip checkbox
-        from piece.flipped.
+        bed spin (0..count), x/y spins from the primary piece.position_x/y,
+        flip checkbox as the tri-state of the whole selection (checked when
+        every selected piece is flipped, unchecked when none is, partially
+        checked when mixed).
         '''
         self._syncing = True
         try:
@@ -389,8 +450,15 @@ class PlacementPanel(QWidget):
             self._spin_piece_x.setValue(piece.position_x)
             self._spin_piece_y.setValue(piece.position_y)
 
-            # Flip checkbox.
-            self._cb_flip.setChecked(piece.flipped)
+            # Flip checkbox: tri-state over the whole selection, not just
+            # the primary piece.
+            flips = [pieces[i].flipped for i in sel_sorted if i < len(pieces)]
+            if flips and all(flips):
+                self._cb_flip.setCheckState(Qt.CheckState.Checked)
+            elif flips and not any(flips):
+                self._cb_flip.setCheckState(Qt.CheckState.Unchecked)
+            else:
+                self._cb_flip.setCheckState(Qt.CheckState.PartiallyChecked)
 
         finally:
             self._syncing = False

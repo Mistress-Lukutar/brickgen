@@ -3,7 +3,7 @@ File:   project.py
 Brief:  Project and placed-block models for the multi-block GUI scene.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.17.0
+Version: v0.18.0
 '''
 
 from __future__ import annotations
@@ -284,7 +284,7 @@ class PrintBedSettings(BaseModel):
         description="Number of print beds.",
     )
     gap: float = Field(
-        default=4.0,
+        default=1.0,
         ge=_GAP_MIN,
         le=_GAP_MAX,
         description="Spacing between pieces and to bed edges, mm.",
@@ -359,8 +359,48 @@ class PrintPiece(BaseModel):
         return _validate_finite(value, "position must be a finite number")
 
 
+class PrintToolsSettings(BaseModel):
+    '''Print-placement tools state: auto-place bed range and modifiers.
+
+    The bed range is stored 1-based exactly as the tools panel displays it
+    and is normalized (clamped into the existing beds, from <= to) by
+    :class:`PrintLayout`, so the persisted values are always usable.
+    Model config:
+        extra: "forbid" — rejects unknown keys to catch payload typos.
+    '''
+
+    model_config = {"extra": "forbid"}
+
+    auto_from: int = Field(
+        default=1,
+        ge=1,
+        le=_BED_COUNT_MAX,
+        description="First bed (1-based) of the auto-place range.",
+    )
+    auto_to: int = Field(
+        default=1,
+        ge=1,
+        le=_BED_COUNT_MAX,
+        description="Last bed (1-based) of the auto-place range.",
+    )
+    distribute_by_color: bool = Field(
+        default=True,
+        description=(
+            "Auto-place never mixes piece colors on one bed (one print job per color)."
+        ),
+    )
+    distribute_evenly: bool = Field(
+        default=True,
+        description=(
+            "Auto-place spreads pieces across all selected beds instead of "
+            "filling one bed before moving to the next."
+        ),
+    )
+
+
 class PrintLayout(BaseModel):
-    '''Print-placement state of a project: bed configuration and pieces.'''
+    '''Print-placement state of a project: bed configuration, pieces and
+    the auto-place tools state.'''
 
     model_config = {"extra": "forbid"}
 
@@ -372,16 +412,30 @@ class PrintLayout(BaseModel):
         default_factory=list,
         description="Placement pieces: one per physical copy of a block.",
     )
+    tools: PrintToolsSettings = Field(
+        default_factory=PrintToolsSettings,
+        description="Placement tools state: auto-place range and modifiers.",
+    )
 
     @model_validator(mode="after")
     def _validate_pieces(self) -> PrintLayout:
-        '''Every piece.bed must reference an existing bed or staging.'''
+        '''Every piece.bed must reference an existing bed or staging; the
+        tools bed range is normalized into the existing beds.'''
         for piece in self.pieces:
             if not (piece.bed == PRINT_STAGING_BED or 0 <= piece.bed < self.beds.count):
                 raise SettingsValidationError(
                     f"piece {piece.uid} references bed {piece.bed}, "
                     f"but only {self.beds.count} beds exist"
                 )
+        # A shrunken bed count (or hand-edited JSON) can leave the stored
+        # auto-place range outside the existing beds: clamp it instead of
+        # failing the whole project.
+        auto_from = max(1, min(self.tools.auto_from, self.beds.count))
+        auto_to = max(auto_from, min(self.tools.auto_to, self.beds.count))
+        if (auto_from, auto_to) != (self.tools.auto_from, self.tools.auto_to):
+            self.tools = self.tools.model_copy(
+                update={"auto_from": auto_from, "auto_to": auto_to}
+            )
         return self
 
 
@@ -500,6 +554,7 @@ __all__ = [
     "PRINT_STAGING_BED",
     "PrintBedSettings",
     "PrintPiece",
+    "PrintToolsSettings",
     "PrintLayout",
     "ViewSettings",
     "QuantityLabelPosition",

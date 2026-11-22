@@ -3,7 +3,7 @@ File:   test_project.py
 Brief:  Unit tests for Project and BlockInstance models.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.17.0
+Version: v0.18.0
 '''
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from brickgen.core.project import (
     PrintBedSettings,
     PrintLayout,
     PrintPiece,
+    PrintToolsSettings,
     Project,
     ViewSettings,
 )
@@ -223,7 +224,7 @@ def test_print_bed_settings_defaults() -> None:
     assert bs.width == 220.0
     assert bs.depth == 220.0
     assert bs.count == 1
-    assert bs.gap == 4.0
+    assert bs.gap == 1.0
 
 
 def test_print_bed_settings_rejects_invalid_width() -> None:
@@ -342,6 +343,45 @@ def test_project_default_print_layout() -> None:
     assert isinstance(proj.print_layout, PrintLayout)
     assert proj.print_layout.beds.count == 1
     assert proj.print_layout.pieces == []
+
+
+# ------------------------------------------------------ PrintToolsSettings
+def test_print_tools_settings_defaults() -> None:
+    '''PrintToolsSettings exposes the factory defaults and PrintLayout
+    carries them when no explicit tools state is given.'''
+    tools = PrintToolsSettings()
+    assert tools.auto_from == 1
+    assert tools.auto_to == 1
+    assert tools.distribute_by_color is True
+    assert tools.distribute_evenly is True
+    assert PrintLayout().tools == tools
+
+
+def test_print_layout_tools_range_clamped_to_beds() -> None:
+    '''The auto-place range is clamped into the existing beds (e.g. after
+    a bed count shrank), so persisted values stay usable.'''
+    layout = PrintLayout(
+        beds=PrintBedSettings(count=2),
+        tools=PrintToolsSettings(auto_from=1, auto_to=5),
+    )
+    assert layout.tools.auto_from == 1
+    assert layout.tools.auto_to == 2
+
+
+def test_print_layout_tools_range_normalized() -> None:
+    '''from > to (hand-edited JSON) normalizes to from <= to.'''
+    layout = PrintLayout(
+        beds=PrintBedSettings(count=4),
+        tools=PrintToolsSettings(auto_from=3, auto_to=1),
+    )
+    assert layout.tools.auto_from == 3
+    assert layout.tools.auto_to == 3
+    layout = PrintLayout(
+        beds=PrintBedSettings(count=1),
+        tools=PrintToolsSettings(auto_from=3, auto_to=1),
+    )
+    assert layout.tools.auto_from == 1
+    assert layout.tools.auto_to == 1
 
 
 def test_project_with_valid_pieces_validates() -> None:

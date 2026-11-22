@@ -3,7 +3,7 @@ File:   test_placement_service.py
 Brief:  Unit tests for print-placement layout engine.
 Author: Mistress-Lukutar
 Date:   2026-11-22
-Version: v0.17.0
+Version: v0.18.0
 '''
 
 from __future__ import annotations
@@ -274,6 +274,7 @@ def test_sync_pieces_new_block_creates_two() -> None:
     '''New project, 1 block (uid "a", 2x2, qty 2) → 2 pieces on bed 0.'''
     proj = _make_project(
         BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2),
+        beds=PrintBedSettings(gap=4.0),
     )
     report = sync_pieces(proj)
     assert report.added == 2
@@ -1112,7 +1113,9 @@ def test_resolve_manual_moves_keeps_valid_drop() -> None:
 def test_resolve_manual_moves_repairs_overlap() -> None:
     '''A drop onto another piece shifts to the nearest conflict-free spot.'''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=1, gap=4.0)
-    proj = _make_project(BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2))
+    proj = _make_project(
+        BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2), beds=beds
+    )
     sync_pieces(proj)
     # Piece 0 sits at (8, 8); drop piece 1 right on top of it.
     resolve_manual_moves(
@@ -1146,7 +1149,9 @@ def test_resolve_manual_moves_stages_when_zone_full() -> None:
 def test_resolve_piece_placements_repairs_bed_change_overlap() -> None:
     '''resolve_piece_placements repairs pre-positioned pieces (bed change).'''
     beds = PrintBedSettings(width=220.0, depth=220.0, count=2, gap=4.0)
-    proj = _make_project(BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2))
+    proj = _make_project(
+        BlockInstance(uid="a", cells_x=2, cells_y=2, quantity=2), beds=beds
+    )
     sync_pieces(proj)
     p0, p1 = proj.print_layout.pieces
     # Simulate a bed change that lands piece 1 on top of piece 0 on bed 0.
