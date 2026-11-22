@@ -3,7 +3,7 @@ File:   test_project.py
 Brief:  Unit tests for Project and BlockInstance models.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations
@@ -14,7 +14,11 @@ from brickgen.core.exceptions import SettingsValidationError
 from brickgen.core.models import BlockSettings
 from brickgen.core.project import (
     DEFAULT_BLOCK_COLOR,
+    PRINT_STAGING_BED,
     BlockInstance,
+    PrintBedSettings,
+    PrintLayout,
+    PrintPiece,
     Project,
 )
 
@@ -207,3 +211,146 @@ def test_project_roundtrip() -> None:
     )
     roundtripped = Project.model_validate(proj.model_dump())
     assert roundtripped == proj
+
+
+# ------------------------------------------------------- PrintBedSettings
+def test_print_bed_settings_defaults() -> None:
+    '''PrintBedSettings must expose the documented defaults.'''
+    bs = PrintBedSettings()
+    assert bs.width == 220.0
+    assert bs.depth == 220.0
+    assert bs.count == 1
+    assert bs.gap == 4.0
+
+
+def test_print_bed_settings_rejects_invalid_width() -> None:
+    '''Width below 10 or above 2000 must raise.'''
+    with pytest.raises(Exception):
+        PrintBedSettings(width=5.0)
+    with pytest.raises(Exception):
+        PrintBedSettings(width=3000.0)
+
+
+def test_print_bed_settings_rejects_invalid_count() -> None:
+    '''Count 0 and count 65 must raise.'''
+    with pytest.raises(Exception):
+        PrintBedSettings(count=0)
+    with pytest.raises(Exception):
+        PrintBedSettings(count=65)
+
+
+def test_print_bed_settings_rejects_invalid_gap() -> None:
+    '''Gap -1 and gap 101 must raise.'''
+    with pytest.raises(Exception):
+        PrintBedSettings(gap=-1.0)
+    with pytest.raises(Exception):
+        PrintBedSettings(gap=101.0)
+
+
+# ------------------------------------------------------- BlockInstance.uid
+def test_block_instance_uid_is_nonempty() -> None:
+    '''A BlockInstance must always have a non-empty uid.'''
+    inst = BlockInstance()
+    assert len(inst.uid) > 0
+
+
+def test_block_instance_uids_differ() -> None:
+    '''Two freshly created instances must have distinct uids.'''
+    inst1 = BlockInstance()
+    inst2 = BlockInstance()
+    assert inst1.uid != inst2.uid
+
+
+# ------------------------------------------------------- PrintPiece
+def test_print_piece_defaults() -> None:
+    '''PrintPiece defaults: bed == staging, uid auto-assigned, no rotation.'''
+    piece = PrintPiece(block_uid="abc123")
+    assert piece.bed == PRINT_STAGING_BED
+    assert len(piece.uid) > 0
+    assert piece.flipped is False
+    assert piece.rotated90 is False
+
+
+def test_print_piece_empty_block_uid_rejected() -> None:
+    '''An empty block_uid must raise SettingsValidationError.'''
+    with pytest.raises(SettingsValidationError):
+        PrintPiece(block_uid="")
+
+
+def test_print_piece_bed_negative_two_rejected() -> None:
+    '''bed == -2 is below PRINT_STAGING_BED and must be rejected.'''
+    with pytest.raises(SettingsValidationError, match="bed"):
+        PrintPiece(block_uid="abc", bed=-2)
+
+
+def test_print_piece_nan_position_rejected() -> None:
+    '''NaN position_x / position_y must raise SettingsValidationError.'''
+    with pytest.raises(SettingsValidationError, match="position"):
+        PrintPiece(block_uid="abc", position_x=float("nan"))
+    with pytest.raises(SettingsValidationError, match="position"):
+        PrintPiece(block_uid="abc", position_y=float("inf"))
+
+
+# ------------------------------------------------------- PrintLayout
+def test_print_layout_valid_pieces_pass() -> None:
+    '''Valid pieces with staging or valid bed indices must pass.'''
+    layout = PrintLayout(
+        beds=PrintBedSettings(count=2),
+        pieces=[
+            PrintPiece(block_uid="a", bed=-1),
+            PrintPiece(block_uid="b", bed=0),
+            PrintPiece(block_uid="c", bed=1),
+        ],
+    )
+    assert len(layout.pieces) == 3
+
+
+def test_print_layout_bed_out_of_range_rejected() -> None:
+    '''piece with bed 1 when count==1 must raise SettingsValidationError.'''
+    with pytest.raises(SettingsValidationError, match="references bed"):
+        PrintLayout(
+            beds=PrintBedSettings(count=1),
+            pieces=[PrintPiece(block_uid="x", bed=1)],
+        )
+
+
+def test_print_layout_bed_0_count_2_passes() -> None:
+    '''bed 0 with count 2 must pass.'''
+    layout = PrintLayout(
+        beds=PrintBedSettings(count=2),
+        pieces=[PrintPiece(block_uid="x", bed=0)],
+    )
+    assert len(layout.pieces) == 1
+
+
+def test_print_layout_bed_minus_one_always_passes() -> None:
+    '''Staging (bed -1) must always pass regardless of count.'''
+    layout = PrintLayout(
+        beds=PrintBedSettings(count=1),
+        pieces=[PrintPiece(block_uid="x", bed=-1)],
+    )
+    assert len(layout.pieces) == 1
+
+
+# ------------------------------------------------------- Project.print_layout
+def test_project_default_print_layout() -> None:
+    '''A project without explicit print_layout gets defaults.'''
+    proj = Project()
+    assert isinstance(proj.print_layout, PrintLayout)
+    assert proj.print_layout.beds.count == 1
+    assert proj.print_layout.pieces == []
+
+
+def test_project_with_valid_pieces_validates() -> None:
+    '''A project with pieces validates when bed indices are in range.'''
+    proj = Project(
+        print_layout=PrintLayout(
+            beds=PrintBedSettings(count=2),
+            pieces=[
+                PrintPiece(block_uid="a", bed=0),
+                PrintPiece(block_uid="b", bed=1),
+                PrintPiece(block_uid="c", bed=-1),
+            ],
+        )
+    )
+    assert len(proj.print_layout.pieces) == 3

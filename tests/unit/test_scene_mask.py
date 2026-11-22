@@ -3,7 +3,7 @@ File:   test_scene_mask.py
 Brief:  Unit tests for the per-block rebuild mask of the GUI scene engine.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations

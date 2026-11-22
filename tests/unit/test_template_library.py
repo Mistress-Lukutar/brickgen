@@ -3,7 +3,7 @@ File:   test_template_library.py
 Brief:  Unit tests for the template library service.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations

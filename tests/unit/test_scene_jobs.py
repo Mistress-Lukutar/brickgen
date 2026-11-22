@@ -3,7 +3,7 @@ File:   test_scene_jobs.py
 Brief:  Worker-handler tests for multi-block scene build and export.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 import os
@@ -124,24 +124,42 @@ def test_build_scene_handler():
 
 
 # ===========================================================================
-# Test 2: test_export_scene_handler
+# Test 2: test_export_print_handler
 # ===========================================================================
 
 
-def test_export_scene_handler():
-    '''Export a two-block scene to STEP and verify the output file.'''
+def test_export_print_handler():
+    '''Export one print bed (two pieces) to STEP and verify the output file.'''
     q = JobQueue()
     results = _collect_results(q)
 
     with tempfile.NamedTemporaryFile(suffix='.step', delete=False) as tmp:
         tmp_path = tmp.name
 
+    bed_payload = {
+        'index': 0,
+        'path': tmp_path,
+        'pieces': [
+            {
+                'settings': BLOCK_A['settings'],
+                'position_x': 0.0,
+                'position_y': 0.0,
+                'flipped': False,
+            },
+            {
+                'settings': BLOCK_B['settings'],
+                'position_x': 20.0,
+                'position_y': 0.0,
+                'flipped': False,
+            },
+        ],
+    }
+
     try:
         q.submit(
-            'export_scene',
+            'export_print',
             {
-                'blocks': [BLOCK_A, BLOCK_B],
-                'path': tmp_path,
+                'beds': [bed_payload],
                 'format': 'STEP',
                 'tolerance': 0.1,
                 'angular': 0.1,
@@ -154,7 +172,9 @@ def test_export_scene_handler():
         _, result = results[0]
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert 'written' in result
-        written_path = result['written']
+        written_list = result['written']
+        assert isinstance(written_list, list) and len(written_list) == 1
+        written_path = written_list[0]
         from pathlib import Path as _Path  # noqa: E402
 
         assert _Path(written_path).exists(), f'{written_path} does not exist'
@@ -165,21 +185,20 @@ def test_export_scene_handler():
 
 
 # ===========================================================================
-# Test 3: test_export_scene_empty_rejected
+# Test 3: test_export_print_empty_rejected
 # ===========================================================================
 
 
-def test_export_scene_empty_rejected():
-    '''An empty blocks list raises a JobError mentioning "no blocks".'''
+def test_export_print_empty_rejected():
+    '''An empty beds list raises a JobError mentioning "no beds".'''
     q = JobQueue()
     results = _collect_results(q)
 
     try:
         q.submit(
-            'export_scene',
+            'export_print',
             {
-                'blocks': [],
-                'path': tempfile.mktemp(suffix='.step'),
+                'beds': [],
                 'format': 'STEP',
                 'tolerance': 0.1,
                 'angular': 0.1,
@@ -191,7 +210,7 @@ def test_export_scene_empty_rejected():
         assert len(results) == 1
         _, result = results[0]
         assert isinstance(result, JobError), f'Expected JobError, got {type(result)}'
-        assert 'no blocks' in str(result.exc) or 'no blocks' in result.message
+        assert 'no beds' in str(result.exc) or 'no beds' in result.message
 
     finally:
         q.close()

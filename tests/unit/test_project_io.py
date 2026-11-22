@@ -3,7 +3,7 @@ File:   test_project_io.py
 Brief:  Unit tests for JSON save/load of multi-block projects.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations
@@ -18,9 +18,17 @@ from brickgen.core.models import BlockSettings
 from brickgen.core.project import (
     LAYOUT_FIELDS,
     BlockInstance,
+    PrintBedSettings,
+    PrintLayout,
+    PrintPiece,
     Project,
 )
-from brickgen.services.project_io import load_project, save_project
+from brickgen.services.project_io import (
+    PROJECT_SCHEMA_NAME,
+    PROJECT_SCHEMA_VERSION,
+    load_project,
+    save_project,
+)
 
 
 # ----------------------------------------------------------- roundtrip
@@ -77,13 +85,13 @@ def test_save_load_roundtrip(tmp_path: Path) -> None:
 
 # ------------------------------------------------------- saved file format
 def test_saved_file_has_correct_schema(tmp_path: Path) -> None:
-    '''Saved JSON must contain schema brickgen-project version 5.'''
+    '''Saved JSON must contain schema brickgen-project version 6.'''
     proj = Project(blocks=[BlockInstance()])
     path = save_project(proj, tmp_path / "project.json")
     payload = json.loads(path.read_text(encoding="utf-8"))
 
-    assert payload["schema"]["name"] == "brickgen-project"
-    assert payload["schema"]["version"] == 5
+    assert payload["schema"]["name"] == PROJECT_SCHEMA_NAME
+    assert payload["schema"]["version"] == PROJECT_SCHEMA_VERSION
 
 
 def test_saved_settings_has_no_layout_fields(tmp_path: Path) -> None:
@@ -327,3 +335,219 @@ def test_invalid_block_color_raises(tmp_path: Path) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ProjectIOError, match="Invalid project"):
         load_project(path)
+
+
+# ------------------------------------------------------- v6 migration from v5
+def _build_v5_payload(blocks: list[dict] | None = None) -> dict:
+    '''Build a v5-style project payload for testing migration.'''
+    return {
+        "schema": {"name": PROJECT_SCHEMA_NAME, "version": 5},
+        "settings": {
+            "unit_size": 6.4,
+            "wall_thickness": 0.8,
+            "block_height": 3.2,
+            "clearance_xy": -0.15,
+            "clearance_z": 0.1,
+        },
+        "blocks": blocks or [],
+    }
+
+
+def test_load_v5_payload_adds_block_uids(tmp_path: Path) -> None:
+    '''Loading a v5 payload succeeds; every block gets a non-empty uid.'''
+    payload = _build_v5_payload(
+        [
+            {"cells_x": 2, "cells_y": 2},
+            {"cells_x": 1, "cells_y": 1},
+        ]
+    )
+    path = tmp_path / "v5.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    proj = load_project(path)
+
+    assert len(proj.blocks) == 2
+    for block in proj.blocks:
+        assert len(block.uid) > 0
+    assert proj.blocks[0].uid != proj.blocks[1].uid
+
+
+def test_load_v5_payload_has_print_layout_defaults(tmp_path: Path) -> None:
+    '''V5 load yields print_layout with default beds (count 1) and no pieces.'''
+    payload = _build_v5_payload([{"cells_x": 2, "cells_y": 2}])
+    path = tmp_path / "v5_pl.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    proj = load_project(path)
+
+    assert proj.print_layout.beds.count == 1
+    assert proj.print_layout.pieces == []
+
+
+def test_load_v5_payload_with_print_layout_adds_piece_uids(tmp_path: Path) -> None:
+    '''Pieces missing uid in an existing print_layout gain one; bed preserved.'''
+    payload = _build_v5_payload(
+        [
+            {"cells_x": 2, "cells_y": 2},
+        ]
+    )
+    payload["print_layout"] = {
+        "beds": {"width": 200.0, "depth": 200.0, "count": 1, "gap": 5.0},
+        "pieces": [
+            {"block_uid": "abc", "bed": 0, "position_x": 10.0},
+            {"block_uid": "def", "bed": -1},
+        ],
+    }
+    path = tmp_path / "v5_pl_pieces.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    proj = load_project(path)
+
+    assert len(proj.print_layout.pieces) == 2
+    for piece in proj.print_layout.pieces:
+        assert len(piece.uid) > 0
+    assert proj.print_layout.pieces[0].bed == 0
+    assert proj.print_layout.pieces[1].bed == -1
+
+
+def test_load_v6_payload_backfills_rotated90(tmp_path: Path) -> None:
+    '''Loading a v6 payload migrates it to v7: pieces gain rotated90=False.'''
+    payload = _build_v5_payload([{"cells_x": 2, "cells_y": 2}])
+    # A v6 payload: uids already present (simulate a saved v6 file).
+    payload["schema"] = {"name": PROJECT_SCHEMA_NAME, "version": 6}
+    payload["blocks"][0]["uid"] = "blk_v6"
+    payload["print_layout"] = {
+        "beds": {"width": 220.0, "depth": 220.0, "count": 1, "gap": 4.0},
+        "pieces": [
+            {"uid": "pc1", "block_uid": "blk_v6", "bed": 0,
+             "position_x": 8.0, "position_y": 8.0, "flipped": False},
+        ],
+    }
+    path = tmp_path / "v6_pieces.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    proj = load_project(path)
+
+    assert proj.print_layout.pieces[0].rotated90 is False
+    assert proj.print_layout.pieces[0].uid == "pc1"
+    # Saving again writes the CURRENT schema version.
+    reloaded = load_project(save_project(proj, tmp_path / "resaved.json"))
+    assert reloaded.print_layout.pieces[0].rotated90 is False
+
+
+def test_roundtrip_project_with_print_layout(tmp_path: Path) -> None:
+    '''Project with explicit uids and print_layout round-trips exactly.'''
+    block_a_uid = "aaaa1111bbbb2222cccc3333"
+    block_b_uid = "dddd4444eeee5555ffff6666"
+
+    piece1 = PrintPiece(
+        uid="piece_0001",
+        block_uid=block_a_uid,
+        bed=0,
+        position_x=50.0,
+        position_y=30.0,
+        flipped=False,
+        rotated90=True,
+    )
+    piece2 = PrintPiece(
+        uid="piece_0002",
+        block_uid=block_b_uid,
+        bed=1,
+        position_x=-20.0,
+        position_y=70.0,
+        flipped=True,
+        rotated90=True,
+    )
+    piece3 = PrintPiece(
+        uid="piece_0003",
+        block_uid=block_a_uid,
+        bed=-1,
+        position_x=0.0,
+        position_y=0.0,
+        flipped=False,
+    )
+
+    proj = Project(
+        settings=BlockSettings(
+            unit_size=6.4,
+            wall_thickness=0.8,
+            block_height=3.2,
+            clearance_xy=-0.15,
+            clearance_z=0.1,
+        ),
+        blocks=[
+            BlockInstance(uid=block_a_uid, cells_x=2, cells_y=2),
+            BlockInstance(uid=block_b_uid, cells_x=3, cells_y=3),
+        ],
+        print_layout=PrintLayout(
+            beds=PrintBedSettings(count=2, width=180.0, depth=250.0, gap=2.5),
+            pieces=[piece1, piece2, piece3],
+        ),
+    )
+
+    path = save_project(proj, tmp_path / "roundtrip.json")
+    loaded = load_project(path)
+
+    # Block uids survive
+    assert loaded.blocks[0].uid == block_a_uid
+    assert loaded.blocks[1].uid == block_b_uid
+
+    # Bed settings survive exactly
+    assert loaded.print_layout.beds.count == 2
+    assert loaded.print_layout.beds.width == 180.0
+    assert loaded.print_layout.beds.depth == 250.0
+    assert loaded.print_layout.beds.gap == 2.5
+
+    # Pieces survive exactly
+    assert len(loaded.print_layout.pieces) == 3
+    assert loaded.print_layout.pieces[0].uid == "piece_0001"
+    assert loaded.print_layout.pieces[0].bed == 0
+    assert loaded.print_layout.pieces[0].position_x == 50.0
+    assert loaded.print_layout.pieces[0].flipped is False
+    assert loaded.print_layout.pieces[0].rotated90 is True
+
+    assert loaded.print_layout.pieces[1].uid == "piece_0002"
+    assert loaded.print_layout.pieces[1].bed == 1
+    assert loaded.print_layout.pieces[1].position_y == 70.0
+    assert loaded.print_layout.pieces[1].flipped is True
+    assert loaded.print_layout.pieces[1].rotated90 is True
+
+    assert loaded.print_layout.pieces[2].uid == "piece_0003"
+    assert loaded.print_layout.pieces[2].bed == -1
+
+
+def test_v4_chain_migration_gains_uid(tmp_path: Path) -> None:
+    '''Loading a v4 payload yields blocks with uid after chained migration.'''
+    payload = {
+        "schema": {"name": PROJECT_SCHEMA_NAME, "version": 4},
+        "settings": {
+            "unit_size": 8.0,
+            "wall_thickness": 1.0,
+            "block_height": 5.0,
+            "clearance_xy": -0.25,
+            "clearance_z": 0.0,
+            "pins_enabled": True,
+            "tubes_enabled": True,
+        },
+        "blocks": [
+            {"cells_x": 2, "cells_y": 2},
+            {"cells_x": 1, "cells_y": 1},
+        ],
+    }
+    path = tmp_path / "v4_uid.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    proj = load_project(path)
+
+    assert len(proj.blocks) == 2
+    for block in proj.blocks:
+        assert len(block.uid) > 0
+    assert proj.blocks[0].uid != proj.blocks[1].uid
+
+
+def test_save_includes_print_layout_key(tmp_path: Path) -> None:
+    '''Saving a project writes "print_layout" key into the JSON file.'''
+    proj = Project(blocks=[BlockInstance()])
+    path = save_project(proj, tmp_path / "has_pl.json")
+    text = path.read_text(encoding="utf-8")
+    assert '"print_layout"' in text

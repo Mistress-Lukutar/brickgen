@@ -1,0 +1,394 @@
+'''
+File:   placement_panel.py
+Brief:  Left-sidebar panel for the print-placement tab: bed configuration,
+        placement tools and the selected-piece inspector.
+Author: Mistress-Lukutar
+Date:   2026-11-21
+Version: v0.15.0
+'''
+
+from __future__ import annotations
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from brickgen.core.project import PRINT_STAGING_BED, PrintBedSettings, PrintPiece
+from brickgen.services.placement_service import (
+    DISTRIBUTE_BY_COLOR,
+    DISTRIBUTE_EVEN,
+)
+
+
+class PlacementPanel(QWidget):
+    '''Left-sidebar panel for the print-placement tab: bed configuration,
+    placement tools and the selected-piece inspector.'''
+
+    beds_changed = Signal(object)           # PrintBedSettings
+    auto_place_requested = Signal(object)   # list[int] 0-based bed indices
+    distribute_requested = Signal(str, object)  # mode str, list[int]
+    piece_bed_changed = Signal(int)         # target bed index or PRINT_STAGING_BED
+    piece_position_changed = Signal(float, float)  # delta for primary's zone-local pos
+    piece_flip_changed = Signal(bool)       # flip state for ALL selected pieces
+    flip_selection_requested = Signal()
+    stage_selection_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        '''Create the panel with all groups inside a scroll area.'''
+        super().__init__(parent)
+        self._syncing = False
+        self._build_ui()
+
+    # ------------------------------------------------------------------ UI
+
+    def _build_ui(self) -> None:
+        '''Build the complete widget tree.'''
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidgetResizable(True)
+
+        container = QWidget()
+        inner = QVBoxLayout(container)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(10)
+
+        # --- Print beds group ---
+        self._beds_group = QGroupBox("Print beds (project)")
+        beds_form = QFormLayout(self._beds_group)
+        beds_form.setVerticalSpacing(8)
+
+        self._spin_bed_width = QDoubleSpinBox()
+        self._spin_bed_width.setRange(10.0, 2000.0)
+        self._spin_bed_width.setDecimals(1)
+        self._spin_bed_width.setSingleStep(1.0)
+        self._spin_bed_width.setSuffix(" mm")
+        self._spin_bed_width.valueChanged.connect(self._on_beds_changed)
+
+        self._spin_bed_depth = QDoubleSpinBox()
+        self._spin_bed_depth.setRange(10.0, 2000.0)
+        self._spin_bed_depth.setDecimals(1)
+        self._spin_bed_depth.setSingleStep(1.0)
+        self._spin_bed_depth.setSuffix(" mm")
+        self._spin_bed_depth.valueChanged.connect(self._on_beds_changed)
+
+        self._spin_bed_count = QSpinBox()
+        self._spin_bed_count.setRange(1, 64)
+        self._spin_bed_count.setSingleStep(1)
+        self._spin_bed_count.valueChanged.connect(self._on_beds_changed)
+
+        self._spin_piece_gap = QDoubleSpinBox()
+        self._spin_piece_gap.setRange(0.0, 100.0)
+        self._spin_piece_gap.setDecimals(1)
+        self._spin_piece_gap.setSingleStep(0.5)
+        self._spin_piece_gap.setSuffix(" mm")
+        self._spin_piece_gap.valueChanged.connect(self._on_beds_changed)
+
+        beds_form.addRow("Bed width, mm", self._spin_bed_width)
+        beds_form.addRow("Bed depth, mm", self._spin_bed_depth)
+        beds_form.addRow("Bed count", self._spin_bed_count)
+        beds_form.addRow("Piece gap, mm", self._spin_piece_gap)
+
+        inner.addWidget(self._beds_group)
+
+        # --- Tools group ---
+        self._tools_group = QGroupBox("Tools")
+        tools_layout = QVBoxLayout(self._tools_group)
+        tools_layout.setSpacing(8)
+
+        from_to_row = QHBoxLayout()
+        self._spin_from = QSpinBox()
+        self._spin_from.setRange(1, 64)
+        self._spin_from.setSingleStep(1)
+        self._spin_from.valueChanged.connect(self._on_from_changed)
+        from_to_row.addWidget(QLabel("Beds from:"))
+        from_to_row.addWidget(self._spin_from)
+
+        self._spin_to = QSpinBox()
+        self._spin_to.setRange(1, 64)
+        self._spin_to.setSingleStep(1)
+        self._spin_to.valueChanged.connect(self._on_to_changed)
+        from_to_row.addWidget(QLabel("Beds to:"))
+        from_to_row.addWidget(self._spin_to)
+
+        tools_layout.addLayout(from_to_row)
+
+        btn_row = QHBoxLayout()
+        self._btn_auto_place = QPushButton("Auto-place (selected beds)")
+        self._btn_auto_place.clicked.connect(self._on_auto_place)
+        btn_row.addWidget(self._btn_auto_place)
+
+        self._btn_distribute_color = QPushButton("Distribute by color")
+        self._btn_distribute_color.clicked.connect(
+            lambda: self._on_distribute(DISTRIBUTE_BY_COLOR)
+        )
+        btn_row.addWidget(self._btn_distribute_color)
+
+        self._btn_distribute_even = QPushButton("Distribute evenly")
+        self._btn_distribute_even.clicked.connect(
+            lambda: self._on_distribute(DISTRIBUTE_EVEN)
+        )
+        btn_row.addWidget(self._btn_distribute_even)
+
+        tools_layout.addLayout(btn_row)
+        inner.addWidget(self._tools_group)
+
+        # --- Selected piece inspector group ---
+        self._inspector_group = QGroupBox("Selected piece")
+        self._inspector_group.setEnabled(False)
+        insp_form = QFormLayout(self._inspector_group)
+        insp_form.setVerticalSpacing(8)
+
+        self._lbl_inspector_summary = QLabel("No piece selected")
+        self._lbl_inspector_summary.setWordWrap(True)
+        insp_form.addRow(self._lbl_inspector_summary)
+
+        self._spin_piece_bed = QSpinBox()
+        self._spin_piece_bed.setRange(0, 1)
+        self._spin_piece_bed.setSpecialValueText("Staging")
+        self._spin_piece_bed.valueChanged.connect(self._on_piece_bed_changed)
+        insp_form.addRow("Bed", self._spin_piece_bed)
+
+        self._spin_piece_x = QDoubleSpinBox()
+        self._spin_piece_x.setRange(-100000.0, 100000.0)
+        self._spin_piece_x.setDecimals(2)
+        self._spin_piece_x.setSingleStep(1.0)
+        self._spin_piece_x.setSuffix(" mm")
+        self._spin_piece_x.valueChanged.connect(self._on_piece_position_changed)
+        insp_form.addRow("X, mm", self._spin_piece_x)
+
+        self._spin_piece_y = QDoubleSpinBox()
+        self._spin_piece_y.setRange(-100000.0, 100000.0)
+        self._spin_piece_y.setDecimals(2)
+        self._spin_piece_y.setSingleStep(1.0)
+        self._spin_piece_y.setSuffix(" mm")
+        self._spin_piece_y.valueChanged.connect(self._on_piece_position_changed)
+        insp_form.addRow("Y, mm", self._spin_piece_y)
+
+        self._cb_flip = QCheckBox("Flip 180\u00b0 (pins down)")
+        self._cb_flip.toggled.connect(self._on_piece_flip_changed)
+        insp_form.addRow(self._cb_flip)
+
+        btn_row2 = QHBoxLayout()
+        self._btn_flip_sel = QPushButton("Flip selected")
+        self._btn_flip_sel.clicked.connect(self._on_flip_selection)
+        btn_row2.addWidget(self._btn_flip_sel)
+
+        self._btn_stage_sel = QPushButton("Move to staging")
+        self._btn_stage_sel.clicked.connect(self._on_stage_selection)
+        btn_row2.addWidget(self._btn_stage_sel)
+
+        insp_form.addRow(btn_row2)
+        inner.addWidget(self._inspector_group)
+
+        # --- Status label ---
+        self._status_label = QLabel("Ready.")
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet("color: #0a6;")
+        inner.addWidget(self._status_label)
+        inner.addStretch(1)
+
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+    # --- Bed spinbox handlers ---
+
+    def _on_beds_changed(self) -> None:
+        '''Any bed control changed: emit the updated PrintBedSettings.'''
+        if self._syncing:
+            return
+        beds = PrintBedSettings(
+            width=self._spin_bed_width.value(),
+            depth=self._spin_bed_depth.value(),
+            count=self._spin_bed_count.value(),
+            gap=self._spin_piece_gap.value(),
+        )
+        self.beds_changed.emit(beds)
+
+    def _on_from_changed(self) -> None:
+        '''Adjust from/to range constraints.'''
+        to_val = self._spin_to.value()
+        from_val = self._spin_from.value()
+        if from_val > to_val:
+            self._spin_from.setValue(to_val)
+        elif from_val < 1:
+            self._spin_from.setValue(1)
+
+    def _on_to_changed(self) -> None:
+        '''Adjust from/to range constraints.'''
+        to_val = self._spin_to.value()
+        from_val = self._spin_from.value()
+        if to_val < from_val:
+            self._spin_to.setValue(from_val)
+        elif to_val > self._spin_bed_count.value():
+            self._spin_to.setValue(self._spin_bed_count.value())
+
+    def _on_auto_place(self) -> None:
+        '''Emit auto-place request for the selected bed range.'''
+        beds = list(range(self._spin_from.value(), self._spin_to.value() + 1))
+        self.auto_place_requested.emit(beds)
+
+    def _on_distribute(self, mode: str) -> None:
+        '''Emit distribute request for the selected bed range.'''
+        beds = list(range(self._spin_from.value(), self._spin_to.value() + 1))
+        self.distribute_requested.emit(mode, beds)
+
+    # --- Piece inspector handlers ---
+
+    def _on_piece_bed_changed(self, value: int) -> None:
+        '''Bed spinbox changed: emit the target bed index.'''
+        if self._syncing:
+            return
+        # 0 -> staging, v>=1 -> v-1 (0-based bed index)
+        if value == 0:
+            self.piece_bed_changed.emit(PRINT_STAGING_BED)
+        else:
+            self.piece_bed_changed.emit(value - 1)
+
+    def _on_piece_position_changed(self, _value: float) -> None:
+        '''X or Y spinbox changed: emit the current values.'''
+        if self._syncing:
+            return
+        x = self._spin_piece_x.value()
+        y = self._spin_piece_y.value()
+        self.piece_position_changed.emit(x, y)
+
+    def _on_piece_flip_changed(self, checked: bool) -> None:
+        '''Flip checkbox toggled.'''
+        if self._syncing:
+            return
+        self.piece_flip_changed.emit(checked)
+
+    def _on_flip_selection(self) -> None:
+        '''Flip selected button clicked.'''
+        self.flip_selection_requested.emit()
+
+    def _on_stage_selection(self) -> None:
+        '''Move to staging button clicked.'''
+        self.stage_selection_requested.emit()
+
+    # --- Public sync methods ---
+
+    def set_beds(self, beds: PrintBedSettings) -> None:
+        '''Sync the bed spinboxes (and from/to ranges) from the project.'''
+        self._syncing = True
+        try:
+            self._spin_bed_width.setValue(beds.width)
+            self._spin_bed_depth.setValue(beds.depth)
+            self._spin_bed_count.setRange(1, 64)
+            self._spin_bed_count.setValue(beds.count)
+            # Clamp the bed count value if it exceeded the new max.
+            if self._spin_bed_count.value() > beds.count:
+                self._spin_bed_count.setValue(beds.count)
+
+            # Update from/to spinbox ranges and clamp values.
+            self._spin_from.setRange(1, beds.count)
+            self._spin_to.setRange(1, beds.count)
+            if self._spin_from.value() > beds.count:
+                self._spin_from.setValue(beds.count)
+            if self._spin_to.value() > beds.count:
+                self._spin_to.setValue(beds.count)
+
+            # Update piece bed spin max (count+1 for staging option).
+            self._spin_piece_bed.setRange(0, beds.count)
+
+        finally:
+            self._syncing = False
+
+    def sync_inspector(
+        self,
+        pieces: list[PrintPiece],
+        footprints: dict[str, tuple[float, float]],
+        colors: dict[str, str],
+        blocks: list,  # BlockInstance list
+        selection: set[int],
+        primary: int | None,
+    ) -> None:
+        '''Refresh the inspector from the given selection.
+
+        Empty selection disables the group and shows "No piece selected".
+        Otherwise show primary piece: summary label
+        "Piece {i+1} of {n} \u00b7 block {cx}x{cy} \u00b7 Bed {k}"
+        (k = "staging" or 1-based),
+        bed spin (0..count), x/y spins from piece.position_x/y, flip checkbox
+        from piece.flipped.
+        '''
+        self._syncing = True
+        try:
+            if not selection or primary is None:
+                self._inspector_group.setEnabled(False)
+                self._lbl_inspector_summary.setText("No piece selected")
+                return
+
+            self._inspector_group.setEnabled(True)
+            sel_sorted = sorted(selection)
+            idx = sel_sorted.index(primary)
+            n = len(sel_sorted)
+
+            # Get the primary piece.
+            piece = pieces[primary] if primary < len(pieces) else None
+            if piece is None:
+                self._inspector_group.setEnabled(False)
+                self._lbl_inspector_summary.setText("No piece selected")
+                return
+
+            # The piece's block is found by uid — piece indices are unrelated
+            # to block indices.
+            block_instance = next(
+                (b for b in blocks if b.uid == piece.block_uid), None
+            )
+            cx, cy = (
+                (block_instance.cells_x, block_instance.cells_y)
+                if block_instance is not None
+                else (1, 1)
+            )
+
+            bed_num = piece.bed
+            if bed_num == PRINT_STAGING_BED:
+                bed_str = "staging"
+            else:
+                bed_str = str(bed_num + 1)  # 1-based for display
+
+            summary = (
+                f"Piece {idx + 1} of {n} \u00b7 block {cx}x{cy} \u00b7 Bed {bed_str}"
+            )
+            self._lbl_inspector_summary.setText(summary)
+
+            # Bed spin: 0 = staging, v = v+1 for display.
+            if piece.bed == PRINT_STAGING_BED:
+                self._spin_piece_bed.setValue(0)
+            else:
+                self._spin_piece_bed.setValue(piece.bed + 1)
+
+            # X/Y spins.
+            self._spin_piece_x.setValue(piece.position_x)
+            self._spin_piece_y.setValue(piece.position_y)
+
+            # Flip checkbox.
+            self._cb_flip.setChecked(piece.flipped)
+
+        finally:
+            self._syncing = False
+
+    def set_status(self, text: str, error: bool = False) -> None:
+        '''Set the status label with green (ok) or red (error) styling.'''
+        self._status_label.setText(text)
+        self._status_label.setStyleSheet(
+            "color: #0a6;" if not error else "color: #b00;"
+        )

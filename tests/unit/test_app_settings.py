@@ -3,7 +3,7 @@ File:   test_app_settings.py
 Brief:  Unit tests for persistent application preferences.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations
@@ -103,3 +103,16 @@ def test_grid_scale_presets_include_defaults() -> None:
     '''The Grid menu offers the documented scale presets incl. 0.5 / 1 / 10.'''
     for scale in (0.25, 0.5, 1.0, 2.0, 5.0, 10.0):
         assert scale in asm.GRID_SCALE_PRESETS
+
+
+def test_placement_grid_enabled_default_and_roundtrip(isolated_settings: Path) -> None:
+    '''placement_grid_enabled defaults to False and survives save/load.'''
+    default = load_app_settings()
+    assert default.placement_grid_enabled is False
+
+    settings = AppSettings(placement_grid_enabled=True)
+    save_app_settings(settings)
+    loaded = load_app_settings()
+    assert loaded.placement_grid_enabled is True
+    # Round-trip preserves all other fields too.
+    assert loaded == settings

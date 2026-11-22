@@ -3,7 +3,7 @@ File:   export_service.py
 Brief:  Export of generated solids to STEP/STL/AMF/3MF/SVG/VRML/BREP files.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations

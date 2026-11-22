@@ -3,7 +3,7 @@ File:   preferences.py
 Brief:  Modal preferences dialog: precisions and default export format.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations

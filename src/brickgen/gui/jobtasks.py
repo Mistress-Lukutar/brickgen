@@ -3,7 +3,7 @@ File:   jobtasks.py
 Brief:  Child-process task handlers for the process-based JobQueue.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 
 Each handler is invoked inside a child process; heavy modules (cadquery, pyvista,
 OCC) are imported lazily inside the handler so the first job pays the import cost.
@@ -337,54 +337,46 @@ def _handle_export(payload: dict) -> dict:
     return {'written': str(written)}
 
 
-@handler('export_scene')
-def _handle_export_scene(payload: dict) -> dict:
-    '''Build every block, translate it to its scene position and export the
-    whole scene as one compound model file.
+@handler('export_print')
+def _handle_export_print(payload: dict) -> dict:
+    '''Export the print placement: one compound file per bed.
 
     Args:
         payload: Dict with keys::
 
-            'blocks': list of block dicts (same shape as build_scene).
-            'path': str output file path.
-            'format': str export format (e.g. 'STEP').
+            'beds': list of dicts ``{'index': int, 'path': str,
+                    'pieces': [entry dicts]}`` where each entry matches the
+                    shape produced by ``print_export.collect_bed_entries``.
+            'format': str export format (e.g. 'STL').
             'tolerance': float tessellation tolerance in mm (optional, 0.1).
             'angular': float angular tolerance in rad (optional, 0.1).
 
     Returns:
-        ``{'written': <str>}`` with the resolved output path.
+        ``{'written': [str, ...]}`` with the resolved output paths, one
+        per bed.
 
     Raises:
-        ValueError: If 'blocks' is empty.
+        ValueError: If 'beds' is empty.
     '''
-    from brickgen.core.builder import build_block
-    from brickgen.core.models import BlockSettings
     from brickgen.services.export_service import export_model as _export_model
+    from brickgen.services.print_export import bed_compound as _bed_compound
 
     tolerance = payload.get('tolerance', 0.1)
     angular = payload.get('angular', 0.1)
-    blocks_list = payload['blocks']
+    beds_list = payload['beds']
 
-    if not blocks_list:
-        raise ValueError('scene has no blocks')
+    if not beds_list:
+        raise ValueError('no beds with pieces')
 
-    solids: list[cq.Shape] = []
-    for entry in blocks_list:
-        settings = BlockSettings.model_validate(entry['settings'])
-        model = build_block(settings)
-        shape = cast(cq.Shape, model.val())
-        px = entry.get('position_x', 0.0)
-        py = entry.get('position_y', 0.0)
-        translated = shape.translate((px, py, 0.0))
-        solids.append(translated)
-
-    compound = cq.Compound.makeCompound(solids)
-    wrapper = cq.Workplane(obj=compound)
-    written = _export_model(
-        wrapper,
-        Path(payload['path']),
-        payload['format'],
-        tolerance=tolerance,
-        angular_tolerance=angular,
-    )
-    return {'written': str(written)}
+    written: list[str] = []
+    for bed in beds_list:
+        compound = _bed_compound(bed['pieces'])
+        path = _export_model(
+            compound,
+            Path(bed['path']),
+            payload['format'],
+            tolerance=tolerance,
+            angular_tolerance=angular,
+        )
+        written.append(str(path))
+    return {'written': written}

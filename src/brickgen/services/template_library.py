@@ -3,7 +3,7 @@ File:   template_library.py
 Brief:  Template library: block layout templates from builtin and user dirs.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations

@@ -3,7 +3,7 @@ File:   app_settings.py
 Brief:  Persistent application preferences (precisions, default format).
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ class AppSettings(BaseModel):
         grid_scale: Grid cell scale factor; the grid step is
             ``unit_size * grid_scale`` mm (1.0 = one cell per Unit Size).
         grid_snap: Snap block movement to the grid step (Grid menu).
+        placement_grid_enabled: Show the floor grid on the print-placement
+            viewport.
     '''
 
     preview_tolerance: float = Field(default=0.15, gt=0, le=1.0)
@@ -58,6 +60,10 @@ class AppSettings(BaseModel):
     grid_enabled: bool = False
     grid_scale: float = Field(default=0.5, gt=0, le=1000.0)
     grid_snap: bool = False
+    placement_grid_enabled: bool = Field(
+        default=False,
+        description="Show the floor grid on the print-placement viewport.",
+    )
 
     model_config = {"extra": "forbid"}
 

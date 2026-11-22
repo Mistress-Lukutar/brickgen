@@ -3,7 +3,7 @@ File:   test_preview_widget.py
 Brief:  Offscreen PreviewWidget tests: selection scheme, camera navigation, modes.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations

@@ -3,12 +3,13 @@ File:   project.py
 Brief:  Project and placed-block models for the multi-block GUI scene.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations
 
 import re
+import uuid
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -44,6 +45,30 @@ LAYOUT_FIELDS: tuple[str, ...] = (
 
 _QUANTITY_MAX = 100000
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+# Print-placement piece.bed value meaning "not placed on any bed".
+PRINT_STAGING_BED = -1
+_BED_COUNT_MAX = 64
+_BED_SIZE_MIN, _BED_SIZE_MAX = 10.0, 2000.0
+_GAP_MIN, _GAP_MAX = 0.0, 100.0
+
+
+def _validate_finite(value: float, message: str) -> float:
+    '''Reject non-finite values (NaN / inf).
+
+    Args:
+        value: The numeric value to check.
+        message: Error message to raise on failure.
+
+    Returns:
+        The original *value* when finite.
+
+    Raises:
+        SettingsValidationError: When *value* is NaN or infinite.
+    '''
+    if not value < float("inf") or value != value:
+        raise SettingsValidationError(message)
+    return value
 
 
 class BlockLayout(BaseModel):
@@ -153,6 +178,13 @@ class BlockInstance(BlockLayout):
     geometry is inherited from the parent :class:`Project.settings`.
     '''
 
+    uid: str = Field(
+        default_factory=lambda: uuid.uuid4().hex,
+        description=(
+            "Stable unique id linking print-placement pieces to this block "
+            "across edits."
+        ),
+    )
     position_x: float = Field(
         default=0.0,
         description=(
@@ -178,6 +210,14 @@ class BlockInstance(BlockLayout):
         ),
     )
 
+    @field_validator("uid")
+    @classmethod
+    def _validate_uid(cls, value: str) -> str:
+        '''Ensure uid is a non-empty stripped string.'''
+        if not value.strip():
+            raise SettingsValidationError("uid must be a non-empty string")
+        return value
+
     @field_validator("quantity")
     @classmethod
     def _validate_quantity(cls, value: int) -> int:
@@ -200,9 +240,138 @@ class BlockInstance(BlockLayout):
     @classmethod
     def _validate_position(cls, value: float) -> float:
         '''Reject non-finite position values (NaN / inf).'''
-        if not value < float("inf") or value != value:
-            raise SettingsValidationError("position must be a finite number")
+        return _validate_finite(value, "position must be a finite number")
+
+
+class PrintBedSettings(BaseModel):
+    '''Print-bed configuration shared by every bed of the project.
+
+    All beds are identical rectangles; ``gap`` is the spacing used by
+    auto-placement both between pieces and from the bed edges.
+    Model config:
+        extra: "forbid" — rejects unknown keys to catch payload typos.
+    '''
+
+    model_config = {"extra": "forbid"}
+
+    width: float = Field(
+        default=220.0,
+        ge=_BED_SIZE_MIN,
+        le=_BED_SIZE_MAX,
+        description="Bed X extent, mm.",
+    )
+    depth: float = Field(
+        default=220.0,
+        ge=_BED_SIZE_MIN,
+        le=_BED_SIZE_MAX,
+        description="Bed Y extent, mm.",
+    )
+    count: int = Field(
+        default=1,
+        ge=1,
+        le=_BED_COUNT_MAX,
+        description="Number of print beds.",
+    )
+    gap: float = Field(
+        default=4.0,
+        ge=_GAP_MIN,
+        le=_GAP_MAX,
+        description="Spacing between pieces and to bed edges, mm.",
+    )
+
+
+class PrintPiece(BaseModel):
+    '''One physical copy of a block on the print-placement tabs.
+
+    A block with quantity N produces N pieces (copy index is implicit in
+    the list order). ``bed`` is -1 (staging zone) or a bed index; the
+    position is the piece footprint CENTER in bed-local mm (staging-local
+    when staged). ``flipped`` rotates the piece 180 degrees about the X
+    axis so the pins point down.
+    Model config:
+        extra: "forbid" — rejects unknown keys to catch payload typos.
+    '''
+
+    model_config = {"extra": "forbid"}
+
+    uid: str = Field(
+        default_factory=lambda: uuid.uuid4().hex,
+        description="Stable piece id.",
+    )
+    block_uid: str = Field(
+        description=("uid of the BlockInstance this piece is a copy of."),
+    )
+    bed: int = Field(
+        default=PRINT_STAGING_BED,
+        description="Bed index, or -1 for the staging zone.",
+    )
+    position_x: float = Field(
+        default=0.0,
+        description="Piece footprint center, zone-local X, mm.",
+    )
+    position_y: float = Field(
+        default=0.0,
+        description="Piece footprint center, zone-local Y, mm.",
+    )
+    flipped: bool = Field(
+        default=False,
+        description="180-deg rotation: pins point down.",
+    )
+    rotated90: bool = Field(
+        default=False,
+        description=(
+            "Piece rotated 90 degrees about Z by the packing algorithm; "
+            "the footprint swaps (depth becomes X)."
+        ),
+    )
+
+    @field_validator("uid", "block_uid")
+    @classmethod
+    def _validate_uid_field(cls, value: str) -> str:
+        '''Ensure uid / block_uid are non-empty stripped strings.'''
+        if not value.strip():
+            raise SettingsValidationError("uid and block_uid must be non-empty strings")
         return value
+
+    @field_validator("bed")
+    @classmethod
+    def _validate_bed(cls, value: int) -> int:
+        '''Reject bed values below PRINT_STAGING_BED.'''
+        if value < PRINT_STAGING_BED:
+            raise SettingsValidationError("bed must be -1 (staging) or a bed index")
+        return value
+
+    @field_validator("position_x", "position_y")
+    @classmethod
+    def _validate_position(cls, value: float) -> float:
+        '''Reject non-finite position values (NaN / inf).'''
+        return _validate_finite(value, "position must be a finite number")
+
+
+class PrintLayout(BaseModel):
+    '''Print-placement state of a project: bed configuration and pieces.'''
+
+    model_config = {"extra": "forbid"}
+
+    beds: PrintBedSettings = Field(
+        default_factory=PrintBedSettings,
+        description="Print-bed configuration (all beds identical).",
+    )
+    pieces: list[PrintPiece] = Field(
+        default_factory=list,
+        description="Placement pieces: one per physical copy of a block.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_pieces(self) -> PrintLayout:
+        '''Every piece.bed must reference an existing bed or staging.'''
+        for piece in self.pieces:
+            if not (piece.bed == PRINT_STAGING_BED or 0 <= piece.bed < self.beds.count):
+                raise SettingsValidationError(
+                    f"piece {piece.uid} references bed {piece.bed}, "
+                    f"but only {self.beds.count} beds exist"
+                )
+        return self
 
 
 class Project(BaseModel):
@@ -233,6 +402,10 @@ class Project(BaseModel):
         default_factory=list,
         description="List of placed block instances in the scene.",
     )
+    print_layout: PrintLayout = Field(
+        default_factory=PrintLayout,
+        description="Print-placement state: bed configuration and pieces.",
+    )
 
     def block_settings(self, index: int) -> BlockSettings:
         '''Full BlockSettings of the placed block at *index*.
@@ -259,4 +432,8 @@ __all__ = [
     "SHARED_SETTING_FIELDS",
     "BLOCK_FLAG_FIELDS",
     "LAYOUT_FIELDS",
+    "PRINT_STAGING_BED",
+    "PrintBedSettings",
+    "PrintPiece",
+    "PrintLayout",
 ]

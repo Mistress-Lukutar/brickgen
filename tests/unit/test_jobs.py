@@ -396,17 +396,28 @@ def test_app_generation_and_export_smoke():
     w._on_add_block()
     _wait_until(lambda: len(w._preview._block_actors) == 2, timeout=180.0)
 
-    # Export the applied scene exactly like _on_export does after its dialog.
+    # Export the print layout exactly like _on_export_print does after its
+    # dialogs: collect bed entries from the current project, one file per bed.
+    from brickgen.services.placement_service import sync_pieces
+    from brickgen.services.print_export import collect_all_beds
+
+    sync_pieces(w._project)
+    beds_payload, _skipped = collect_all_beds(w._project)
+    assert beds_payload, 'expected at least one bed with pieces after sync'
     out = os.path.join(tempfile.gettempdir(), 'brickgen_app_export_smoke.step')
-    context = w._applied_context
+    # Every bed needs its own destination path (the worker writes one file
+    # per bed); the first one is the assertion target.
+    for i, bed in enumerate(beds_payload):
+        bed['path'] = os.path.join(
+            tempfile.gettempdir(), f'brickgen_app_export_smoke_bed{i}.step'
+        )
     payload = {
-        'blocks': context['payload']['blocks'],
-        'path': out,
+        'beds': beds_payload,
         'format': 'STEP',
         'tolerance': 0.1,
         'angular': 0.1,
     }
-    job_id = w._jobs.submit('export_scene', payload)
+    job_id = w._jobs.submit('export_print', payload)
     w._export_meta[job_id] = out
 
     _wait_until(lambda: job_id not in w._export_meta, timeout=120.0)

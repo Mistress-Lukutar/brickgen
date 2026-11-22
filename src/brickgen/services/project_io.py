@@ -3,13 +3,14 @@ File:   project_io.py
 Brief:  JSON save/load of multi-block GUI projects with legacy settings migration.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations
 
 import json
 import logging
+import uuid
 from pathlib import Path
 
 from brickgen.core.exceptions import ProjectIOError
@@ -27,11 +28,12 @@ logger = logging.getLogger(__name__)
 
 PROJECT_SCHEMA_KEY = "schema"
 PROJECT_SCHEMA_NAME = "brickgen-project"
-PROJECT_SCHEMA_VERSION = 5
-# Versions accepted by load_project: v4 payloads are migrated on the fly
+PROJECT_SCHEMA_VERSION = 7
+# Versions accepted by load_project: v4/v5 payloads are migrated on the fly
 # (v4 kept pins/tubes flags on the shared settings, v5 moved them onto
-# each block).
-_MIGRATABLE_VERSIONS = (4, 5)
+# each block, v6 added print_layout and block uids, v7 added the per-piece
+# rotated90 flag).
+_MIGRATABLE_VERSIONS = (4, 5, 6, 7)
 
 
 def save_project(project: Project, path: Path) -> Path:
@@ -57,6 +59,7 @@ def save_project(project: Project, path: Path) -> Path:
             field: getattr(project.settings, field) for field in SHARED_SETTING_FIELDS
         },
         "blocks": [block.model_dump() for block in project.blocks],
+        "print_layout": project.print_layout.model_dump(),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,10 +75,10 @@ def save_project(project: Project, path: Path) -> Path:
 def load_project(path: Path) -> Project:
     '''Load a project from a JSON file.
 
-    Supports the current project schema (v5), the previous v4 schema
-    (per-block pins/tubes flags backfilled from the shared settings) and
-    legacy single-block preset files that lack a ``blocks`` key or carry
-    the old ``brickgen-settings`` schema marker.
+    Supports the current project schema (v6), previous v5 (per-block
+    pins/tubes flags) and v4 (pins/tubes on shared settings), with
+    automatic migration, plus legacy single-block preset files that lack
+    a ``blocks`` key or carry the old ``brickgen-settings`` schema marker.
 
     Args:
         path: Source ``*.json`` path.
@@ -121,7 +124,12 @@ def load_project(path: Path) -> Project:
             )
         payload = {k: v for k, v in payload.items() if k != PROJECT_SCHEMA_KEY}
         if version != PROJECT_SCHEMA_VERSION:
-            payload = _migrate_v4_blocks(payload)
+            if version < 5:
+                payload = _migrate_v4_blocks(payload)
+            if version < 6:
+                payload = _migrate_v5_to_v6(payload)
+            if version < 7:
+                payload = _migrate_v6_to_v7(payload)
     else:
         raise ProjectIOError(f"{path} is not a {PROJECT_SCHEMA_NAME} project")
 
@@ -181,4 +189,56 @@ def _migrate_v4_blocks(payload: dict) -> dict:
         if isinstance(block, dict):
             for field in BLOCK_FLAG_FIELDS:
                 block.setdefault(field, shared.get(field, True))
+    return payload
+
+
+def _migrate_v5_to_v6(payload: dict) -> dict:
+    '''Backfill uids and print_layout on a v5 payload.
+
+    v5 did not store ``uid`` on blocks or a ``print_layout`` dict; v6 adds
+    both so that print-placement pieces can be stably linked to their block
+    definitions across edits.
+
+    Args:
+        payload: The parsed project dict (schema key already removed).
+
+    Returns:
+        The payload with every block carrying a ``uid`` and a populated
+        ``print_layout`` dict.
+    '''
+    for block in payload.get("blocks") or []:
+        if isinstance(block, dict):
+            block.setdefault("uid", uuid.uuid4().hex)
+
+    layout = payload.get("print_layout")
+    if not isinstance(layout, dict):
+        payload["print_layout"] = {}
+    else:
+        pieces = layout.setdefault("pieces", [])
+        for piece in pieces:
+            if isinstance(piece, dict):
+                piece.setdefault("uid", uuid.uuid4().hex)
+        layout.setdefault("beds", {})
+
+    return payload
+
+
+def _migrate_v6_to_v7(payload: dict) -> dict:
+    '''Backfill the per-piece rotated90 flag on a v6 payload.
+
+    v7 adds ``rotated90`` (90-degree packing rotation set by the placement
+    engine); v6 pieces did not store it, so every piece dict gains the
+    ``False`` default.
+
+    Args:
+        payload: The parsed project dict (schema key already removed).
+
+    Returns:
+        The payload with every piece carrying an explicit ``rotated90``.
+    '''
+    layout = payload.get("print_layout")
+    if isinstance(layout, dict):
+        for piece in layout.get("pieces") or []:
+            if isinstance(piece, dict):
+                piece.setdefault("rotated90", False)
     return payload

@@ -36,3 +36,4 @@ output/
 # OS
 Thumbs.db
 .DS_Store
+pytest_out.txt

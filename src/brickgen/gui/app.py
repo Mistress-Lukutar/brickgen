@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-21
-Version: v0.14.0
+Version: v0.15.0
 '''
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, cast
 
+import pyvista as pv
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QShowEvent
 from PySide6.QtWidgets import (
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QMainWindow,
@@ -35,6 +37,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -49,13 +53,17 @@ from brickgen.core.models import (
 from brickgen.core.project import (
     BLOCK_FLAG_FIELDS,
     LAYOUT_FIELDS,
+    PRINT_STAGING_BED,
     BlockInstance,
     BlockLayout,
+    PrintBedSettings,
     Project,
 )
 from brickgen.gui.grid_editor import CellGridEditor, CellState
 from brickgen.gui.jobs import SKIPPED, JobError, JobQueue
 from brickgen.gui.library import TemplateLibraryPanel
+from brickgen.gui.placement_panel import PlacementPanel
+from brickgen.gui.placement_view import PlacementView
 from brickgen.gui.preferences import PreferencesDialog
 from brickgen.gui.preview import (
     DISPLAY_MODES,
@@ -70,6 +78,19 @@ from brickgen.services.app_settings import (
     save_app_settings,
 )
 from brickgen.services.export_service import SUPPORTED_FORMATS
+from brickgen.services.placement_service import (
+    auto_place,
+    block_colors,
+    block_footprints,
+    distribute,
+    find_free_spot,
+    local_position,
+    piece_dims,
+    sync_pieces,
+    world_position,
+    zone_for_world_x,
+)
+from brickgen.services.print_export import collect_all_beds
 from brickgen.services.project_io import load_project, save_project
 from brickgen.services.template_library import Template
 
@@ -80,31 +101,6 @@ _SIDE_OFFSETS = {"+X": (1, 0), "-X": (-1, 0), "+Y": (0, 1), "-Y": (0, -1)}
 
 # Debounce for automatic regeneration after any parameter change, ms.
 AUTO_GENERATE_DELAY_MS = 250
-
-
-def resolve_export_target(path: str, selected_filter: str) -> tuple[str, str]:
-    '''Derive the export format and a matching file path.
-
-    The selected filter defines the format; when the typed file name has a
-    different suffix it is replaced so the saved file always matches the
-    chosen format (``block.step`` + 3MF filter -> ``block.3mf``). With the
-    "All files" filter the typed suffix is used, falling back to STEP.
-
-    Args:
-        path: File name as typed by the user.
-        selected_filter: Filter string returned by the file dialog.
-
-    Returns:
-        Tuple of (corrected path, export format name).
-    '''
-    formats = list(SUPPORTED_FORMATS)  # STEP first, dict insertion order
-    file_format = next(
-        (fmt for fmt in formats if selected_filter.startswith(fmt)), None
-    )
-    if file_format is None:
-        suffix = Path(path).suffix.lstrip(".").upper()
-        file_format = suffix if suffix in SUPPORTED_FORMATS else "STEP"
-    return str(Path(path).with_suffix("." + file_format.lower())), file_format
 
 
 class MainWindow(QMainWindow):
@@ -150,10 +146,30 @@ class MainWindow(QMainWindow):
         self._committed_epoch: dict[int, int] = {}  # block index -> applied epoch
         self._jobs.job_done.connect(self._on_job_done)
 
+        # Placement tab state.
+        self._pselection: set[int] = set()
+        self._pprimary: int | None = None
+        self._block_meshes: list[pv.PolyData | None] = []
+        # Orientation mesh variants keyed (block index, flipped, rotated90):
+        # every piece shares one of the four per-block variants.
+        self._mesh_variants: dict[tuple[int, bool, bool], pv.PolyData] = {}
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Sidebar stack: page 0 = planning sidebar, page 1 = placement panel.
+        self._sidebar_stack = QStackedWidget()
         self._sidebar = self._build_sidebar()
-        splitter.addWidget(self._sidebar)
-        splitter.addWidget(self._build_preview_pane())
+        self._sidebar_stack.addWidget(self._sidebar)
+        self._placement_panel = PlacementPanel()
+        self._sidebar_stack.addWidget(self._placement_panel)
+
+        # Tab widget: page 0 = planning preview, page 1 = placement view.
+        self._tabs = QTabWidget()
+        self._tabs.addTab(self._build_preview_pane(), "Planning")
+        self._placement_view = PlacementView()
+        self._tabs.addTab(self._placement_view, "Print placement")
+
+        splitter.addWidget(self._sidebar_stack)
+        splitter.addWidget(self._tabs)
         self._library = TemplateLibraryPanel(self._selected_block_layout, self._jobs)
         self._library.apply_requested.connect(self._on_template_selected)
         splitter.addWidget(self._library)
@@ -180,6 +196,50 @@ class MainWindow(QMainWindow):
         self._sync_all()
         self._connect_auto_generate()
         self._on_generate()
+
+        # Placement view init.
+        self._placement_view.set_print_beds(self._project.print_layout.beds)
+        self._placement_panel.set_beds(self._project.print_layout.beds)
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+
+    # ------------------------------------------------------------------ tabs
+
+    def _active_preview(self) -> PreviewWidget:
+        '''Return the currently active preview widget.'''
+        if self._tabs.currentIndex() == 0:
+            return self._preview
+        return self._placement_view
+
+    def _on_tab_changed(self, index: int) -> None:
+        '''Switch the sidebar page, library visibility and view-menu state.'''
+        self._sidebar_stack.setCurrentIndex(index)
+        self._library.setVisible(index == 0)
+
+        # Enable/disable quantity actions only on planning tab.
+        self._act_qty_labels.setEnabled(index == 0)
+
+        # Refresh "Show grid" checked state from the active preview.
+        self._refresh_grid_action_state()
+
+        # When entering tab 1: push shared settings into placement view.
+        if index == 1:
+            self._placement_view.set_grid_unit(self._project.settings.unit_size)
+            self._placement_view.set_grid_scale(self._app_settings.grid_scale)
+            self._placement_view.set_snap_enabled(self._app_settings.grid_snap)
+            self._placement_view.set_grid_enabled(
+                self._app_settings.placement_grid_enabled
+            )
+            self._placement_view.set_print_beds(self._project.print_layout.beds)
+            self._sync_placement()
+
+    def _refresh_grid_action_state(self) -> None:
+        '''Update the "Show grid" action checked state from the active preview.'''
+        if self._tabs.currentIndex() == 0:
+            self._act_show_grid.setChecked(self._app_settings.grid_enabled)
+        else:
+            self._act_show_grid.setChecked(
+                self._app_settings.placement_grid_enabled
+            )
 
     # ------------------------------------------------------------------ menus
     def _build_menus(self) -> None:
@@ -212,9 +272,9 @@ class MainWindow(QMainWindow):
         self._act_remove_blocks.triggered.connect(self._on_remove_blocks)
         file_menu.addAction(self._act_remove_blocks)
         file_menu.addSeparator()
-        act_export = QAction("&Export Scene...", self)
+        act_export = QAction("&Export Print Layout...", self)
         act_export.setShortcut("Ctrl+E")
-        act_export.triggered.connect(self._on_export)
+        act_export.triggered.connect(self._on_export_print)
         file_menu.addAction(act_export)
         file_menu.addSeparator()
         act_prefs = QAction("S&ettings...", self)
@@ -234,7 +294,7 @@ class MainWindow(QMainWindow):
             act_mode.setCheckable(True)
             act_mode.setChecked(mode == MODE_SOLID)
             act_mode.triggered.connect(
-                lambda checked=False, m=mode: self._preview.set_display_mode(m)
+                lambda checked=False, m=mode: self._active_preview().set_display_mode(m)
             )
             mode_group.addAction(act_mode)
             view_menu.addAction(act_mode)
@@ -257,11 +317,11 @@ class MainWindow(QMainWindow):
             position_menu.addAction(act_pos)
 
         grid_menu = self.menuBar().addMenu("&Grid")
-        act_show_grid = QAction("Show &grid", self)
-        act_show_grid.setCheckable(True)
-        act_show_grid.setChecked(self._app_settings.grid_enabled)
-        act_show_grid.toggled.connect(self._on_grid_show)
-        grid_menu.addAction(act_show_grid)
+        self._act_show_grid = QAction("Show &grid", self)
+        self._act_show_grid.setCheckable(True)
+        self._act_show_grid.setChecked(self._app_settings.grid_enabled)
+        self._act_show_grid.toggled.connect(self._on_grid_show)
+        grid_menu.addAction(self._act_show_grid)
         grid_menu.addSeparator()
         scale_menu = grid_menu.addMenu("Cell &scale")
         scale_group = QActionGroup(self)
@@ -526,7 +586,7 @@ class MainWindow(QMainWindow):
         return self._cell_group
 
     def _build_preview_pane(self) -> QWidget:
-        '''Build the scene preview area (settings moved to the File menu).'''
+        '''Build the planning preview widget (tab 0 of the tab widget).'''
         pane = QWidget()
         layout = QVBoxLayout(pane)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -573,6 +633,38 @@ class MainWindow(QMainWindow):
         self._block_pos_x.valueChanged.connect(self._on_block_position_changed)
         self._block_pos_y.valueChanged.connect(self._on_block_position_changed)
         self._block_color.clicked.connect(self._on_block_color_clicked)
+
+        # Placement signals.
+        self._placement_view.selection_changed.connect(
+            self._on_placement_selection
+        )
+        self._placement_view.blocks_moved.connect(
+            self._on_placement_pieces_moved
+        )
+        self._placement_panel.beds_changed.connect(
+            self._on_placement_beds_changed
+        )
+        self._placement_panel.auto_place_requested.connect(
+            self._on_placement_auto_place
+        )
+        self._placement_panel.distribute_requested.connect(
+            self._on_placement_distribute
+        )
+        self._placement_panel.piece_bed_changed.connect(
+            self._on_piece_bed_changed
+        )
+        self._placement_panel.piece_position_changed.connect(
+            self._on_piece_position_changed
+        )
+        self._placement_panel.piece_flip_changed.connect(
+            self._on_piece_flip_changed
+        )
+        self._placement_panel.flip_selection_requested.connect(
+            self._on_flip_selection
+        )
+        self._placement_panel.stage_selection_requested.connect(
+            self._on_stage_selection
+        )
 
     def _update_derived_label(self) -> None:
         '''Update the read-only derived-dimensions label from current spin values.
@@ -725,8 +817,15 @@ class MainWindow(QMainWindow):
         self._mark_scene_dirty()
         self._selection = {0}
         self._primary = 0
+        # Reset placement state.
+        self._pselection = set()
+        self._pprimary = None
+        self._block_meshes = []
+        self._mesh_variants = {}
         self._mark_clean()
         self._sync_all()
+        self._placement_view.set_print_beds(self._project.print_layout.beds)
+        self._placement_panel.set_beds(self._project.print_layout.beds)
         self._on_generate()
         self._set_status("New project created.")
 
@@ -750,8 +849,15 @@ class MainWindow(QMainWindow):
         self._mark_scene_dirty()
         self._selection = {0} if project.blocks else set()
         self._primary = 0 if project.blocks else None
+        # Reset placement state.
+        self._pselection = set()
+        self._pprimary = None
+        self._block_meshes = []
+        self._mesh_variants = {}
         self._mark_clean()
         self._sync_all()
+        self._placement_view.set_print_beds(self._project.print_layout.beds)
+        self._placement_panel.set_beds(self._project.print_layout.beds)
         self._on_generate()
         self._set_status(f"Project opened: {Path(path).name}")
 
@@ -1422,22 +1528,27 @@ class MainWindow(QMainWindow):
         return f"{round(scale * 100)}%"
 
     def _on_grid_show(self, checked: bool) -> None:
-        '''Toggle the floor grid and persist it.'''
-        self._app_settings.grid_enabled = checked
+        '''Toggle the floor grid on the active preview and persist it.'''
+        if self._tabs.currentIndex() == 0:
+            self._app_settings.grid_enabled = checked
+        else:
+            self._app_settings.placement_grid_enabled = checked
         self._save_app_settings()
-        self._preview.set_grid_enabled(checked)
+        self._active_preview().set_grid_enabled(checked)
 
     def _on_grid_scale(self, scale: float) -> None:
-        '''Set the grid cell scale factor and persist it.'''
+        '''Set the grid cell scale factor and persist it (both previews).'''
         self._app_settings.grid_scale = scale
         self._save_app_settings()
         self._preview.set_grid_scale(scale)
+        self._placement_view.set_grid_scale(scale)
 
     def _on_grid_snap(self, checked: bool) -> None:
-        '''Toggle snap-to-grid movement and persist it.'''
+        '''Toggle snap-to-grid movement and persist it (both previews).'''
         self._app_settings.grid_snap = checked
         self._save_app_settings()
         self._preview.set_snap_enabled(checked)
+        self._placement_view.set_snap_enabled(checked)
 
     def _on_view_qty_labels(self, checked: bool) -> None:
         '''Toggle the per-block BOM quantity labels and persist it.'''
@@ -1526,6 +1637,7 @@ class MainWindow(QMainWindow):
         self._project.settings = shared
         # The grid cells and the snap step follow the unit size.
         self._preview.set_grid_unit(shared.unit_size)
+        self._placement_view.set_grid_unit(shared.unit_size)
 
         self._gen_seq += 1
         seq = self._gen_seq
@@ -1598,8 +1710,8 @@ class MainWindow(QMainWindow):
                 logger.error("Export job %d returned unexpected payload", job_id)
                 self._set_status("Export failed.", error=True)
                 return
-            written = Path(str(result['written']))
-            self._set_status(f"Exported: {written.name}")
+            written = [Path(str(p)) for p in result['written']]
+            self._set_status(f"Exported: {', '.join(p.name for p in written)}")
             return
 
         # --- generation routing ---
@@ -1652,51 +1764,66 @@ class MainWindow(QMainWindow):
             )
             colors.append(block.color)
         self._preview.update_scene(meshes, colors, meta_list, context['changed'])
+
+        # Store resolved meshes for placement tab; reset orientation cache.
+        self._block_meshes = list(meshes)
+        self._mesh_variants = {}
+        self._sync_placement()
+
         self._set_status(self._scene_summary())
 
     # ------------------------------------------------------------- export
-    def _on_export(self) -> None:
-        '''Ask for a destination file and queue the scene export.
+    def _on_export_print(self) -> None:
+        '''Ask for a destination folder and format, then queue the layout
+        export: one compound file per print bed.
 
-        The exported model is the one built from the applied generation's
-        payload snapshot: a later re-render never affects this export. All
-        blocks are combined into one file, each block sitting at its scene
-        position as a separate solid.
+        Only pieces fully inside their bed are exported (a piece hanging
+        over the edge would not print); skipped pieces are reported in the
+        status afterwards.
         '''
-        context = self._applied_context
-        if context is None or not context['payload']['blocks']:
+        beds, _skipped = collect_all_beds(self._project)
+        if not beds:
             QMessageBox.information(
-                self, "Nothing to export", "Add a block to the scene first."
+                self, "Nothing to export", "Place pieces on a bed first."
             )
             return
-        formats = list(SUPPORTED_FORMATS)
-        default_format = self._app_settings.default_format
-        default_filter = f"{default_format} (*.{default_format.lower()})"
-        stem = self._project_path.stem if self._project_path else "brickgen-scene"
-        path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Export scene",
-            f"{stem}.{default_format.lower()}",
-            ";;".join(f"{fmt} (*.{fmt.lower()})" for fmt in formats)
-            + ";;All files (*.*)",
-            default_filter,
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select export folder", self._default_project_dir()
         )
-        if not path:
+        if not folder:
             return
-        path, file_format = resolve_export_target(path, selected_filter)
+        formats = list(SUPPORTED_FORMATS)
+        file_format, ok = QInputDialog.getItem(
+            self,
+            "Export print layout",
+            "Format:",
+            formats,
+            formats.index(self._app_settings.default_format),
+            False,
+        )
+        if not ok:
+            return
+
+        stem = self._project_path.stem if self._project_path else "brickgen-layout"
+        payload_beds = []
+        for bed in beds:
+            name = f"{stem}_bed{bed['index'] + 1:02d}.{file_format.lower()}"
+            path = Path(folder) / name
+            payload_beds.append(
+                {'index': bed['index'], 'path': str(path), 'pieces': bed['pieces']}
+            )
 
         payload = {
-            'blocks': context['payload']['blocks'],
-            'path': path,
+            'beds': payload_beds,
             'format': file_format,
             'tolerance': self._app_settings.export_tolerance,
             'angular': self._app_settings.export_angular_tolerance,
         }
 
-        self._set_status(f"Exporting {Path(path).name}…")
+        self._set_status(f"Exporting {len(payload_beds)} bed file(s)…")
 
-        job_id = self._jobs.submit('export_scene', payload)
-        self._export_meta[job_id] = path
+        job_id = self._jobs.submit('export_print', payload)
+        self._export_meta[job_id] = folder
 
     # ------------------------------------------------------------------ helpers
     def _scene_summary(self) -> str:
@@ -1723,7 +1850,314 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str, error: bool = False) -> None:
         '''Set status text with the matching color.'''
         self._status_style(error)
-        self._status.setText(text)
+        if self._tabs.currentIndex() == 0:
+            self._status.setText(text)
+        else:
+            self._placement_panel.set_status(text, error)
+
+    # ------------------------------------------------------- placement sync
+
+    def _sync_placement(self) -> None:
+        '''Reconcile pieces with blocks and rebuild the placement scene.'''
+        report = sync_pieces(self._project)
+        if report.added or report.removed:
+            self._mark_dirty()
+        self._refresh_placement_scene()
+        self._placement_panel.sync_inspector(
+            self._project.print_layout.pieces,
+            block_footprints(self._project),
+            block_colors(self._project),
+            self._project.blocks,
+            self._pselection,
+            self._pprimary,
+        )
+        if self._tabs.currentIndex() == 1:
+            self._set_status(self._placement_summary())
+
+    def _refresh_placement_scene(self) -> None:
+        '''Rebuild the placement viewport actors from cached block meshes.'''
+        beds = self._project.print_layout.beds
+        footprints = block_footprints(self._project)
+        heights = {
+            b.uid: self._project.block_settings(i).total_height
+            for i, b in enumerate(self._project.blocks)
+        }
+        colors_map = block_colors(self._project)
+
+        # uid -> block index map.
+        uid_to_idx: dict[str, int] = {}
+        for idx, blk in enumerate(self._project.blocks):
+            uid_to_idx[blk.uid] = idx
+
+        meshes_out: list[pv.PolyData | None] = []
+        colors_out: list[str] = []
+        meta_out: list[dict] = []
+
+        pieces = self._project.print_layout.pieces
+        for piece in pieces:
+            blk_idx = uid_to_idx.get(piece.block_uid)
+            if blk_idx is None or blk_idx >= len(self._block_meshes):
+                continue
+            base_mesh = self._block_meshes[blk_idx]
+            if base_mesh is None:
+                continue
+
+            mesh: pv.PolyData = base_mesh
+            if piece.flipped or piece.rotated90:
+                # Lazy variant cache: one transformed mesh per orientation.
+                key = (blk_idx, piece.flipped, piece.rotated90)
+                variant = self._mesh_variants.get(key)
+                if variant is None:
+                    variant = base_mesh.copy()
+                    if piece.rotated90:
+                        # 90 deg about Z: footprint swaps (matches export).
+                        variant.rotate_z(90.0)
+                    if piece.flipped:
+                        # 180 deg about X: pins down; lift onto z >= 0.
+                        variant.rotate_x(180.0)
+                        variant.translate((0.0, 0.0, heights.get(piece.block_uid, 0)))
+                    self._mesh_variants[key] = variant
+                mesh = variant
+
+            wx, wy = world_position(piece, beds)
+            half_x, half_y = piece_dims(piece, footprints)
+            meta_out.append({
+                'pos_x': wx,
+                'pos_y': wy,
+                'half_x': half_x / 2.0,
+                'half_y': half_y / 2.0,
+                'top_z': heights.get(piece.block_uid, 0),
+                'quantity': 1,
+            })
+            colors_out.append(colors_map.get(piece.block_uid, "#3f7fbf"))
+            meshes_out.append(mesh)
+
+        self._placement_view.update_scene(meshes_out, colors_out, meta_out)
+
+        # Prune selection to current piece count.
+        n_pieces = len(pieces)
+        self._pselection = {i for i in self._pselection if i < n_pieces}
+        if self._pprimary is not None and self._pprimary >= n_pieces:
+            self._pprimary = None
+
+    def _placement_summary(self) -> str:
+        '''"Placement: N pieces on K beds, M staged, X outside beds".'''
+        pieces = self._project.print_layout.pieces
+        if not pieces:
+            return "Placement: 0 pieces."
+        beds = self._project.print_layout.beds
+        total = len(pieces)
+        staged = sum(1 for p in pieces if p.bed == PRINT_STAGING_BED)
+        on_beds = total - staged
+
+        # Count pieces whose footprint extends outside their zone bounds.
+        footprints = block_footprints(self._project)
+        outside = 0
+        for piece in pieces:
+            if piece.bed == PRINT_STAGING_BED:
+                continue
+            if piece.block_uid not in footprints:
+                outside += 1
+                continue
+            w, d = piece_dims(piece, footprints)
+            px = piece.position_x
+            py = piece.position_y
+            # Check if footprint extends beyond [gap, width-gap] x [gap, depth-gap].
+            if (
+                px - w / 2 < beds.gap
+                or px + w / 2 > beds.width - beds.gap
+                or py - d / 2 < beds.gap
+                or py + d / 2 > beds.depth - beds.gap
+            ):
+                outside += 1
+
+        return (
+            f"Placement: {total} pieces on {on_beds} bed(s), "
+            f"{staged} staged, {outside} outside"
+        )
+
+    def _after_placement_change(self) -> None:
+        '''Refresh scene, inspector, and status after any placement edit.'''
+        self._refresh_placement_scene()
+        self._placement_panel.sync_inspector(
+            self._project.print_layout.pieces,
+            block_footprints(self._project),
+            block_colors(self._project),
+            self._project.blocks,
+            self._pselection,
+            self._pprimary,
+        )
+        if self._tabs.currentIndex() == 1:
+            self._set_status(self._placement_summary())
+
+    # --------------------------------------------------- placement handlers
+
+    def _on_placement_selection(
+        self, payload: object
+    ) -> None:
+        '''Sync placement selection state.'''
+        selection, primary = cast(tuple[frozenset, int | None], payload)
+        n_pieces = len(self._project.print_layout.pieces)
+        self._pselection = {i for i in selection if 0 <= i < n_pieces}
+        self._pprimary = primary
+        self._placement_panel.sync_inspector(
+            self._project.print_layout.pieces,
+            block_footprints(self._project),
+            block_colors(self._project),
+            self._project.blocks,
+            self._pselection,
+            self._pprimary,
+        )
+
+    def _on_placement_pieces_moved(self, moves: dict) -> None:
+        '''Commit moved piece positions to the project.'''
+        beds = self._project.print_layout.beds
+        for index, (wx, wy) in moves.items():
+            if not 0 <= index < len(self._project.print_layout.pieces):
+                continue
+            zone = zone_for_world_x(wx, beds)
+            lx, ly = local_position(wx, wy, zone, beds)
+            piece = self._project.print_layout.pieces[index]
+            piece.bed = zone
+            piece.position_x = lx
+            piece.position_y = ly
+        self._mark_dirty()
+        self._refresh_placement_scene()
+        self._placement_panel.sync_inspector(
+            self._project.print_layout.pieces,
+            block_footprints(self._project),
+            block_colors(self._project),
+            self._project.blocks,
+            self._pselection,
+            self._pprimary,
+        )
+        if self._tabs.currentIndex() == 1:
+            self._set_status(self._placement_summary())
+
+    def _on_placement_beds_changed(self, beds: PrintBedSettings) -> None:
+        '''Apply new bed settings to the project.'''
+        self._project.print_layout.beds = beds
+        # Pieces with bed >= new count -> staging.
+        for piece in self._project.print_layout.pieces:
+            if piece.bed >= 0 and piece.bed >= beds.count:
+                piece.bed = PRINT_STAGING_BED
+        self._placement_view.set_print_beds(beds)
+        self._placement_panel.set_beds(beds)
+        self._mark_dirty()
+        self._sync_placement()
+
+    def _on_placement_auto_place(self, indices: list[int]) -> None:
+        '''Handle auto-place request.'''
+        report = auto_place(self._project, indices)
+        self._mark_dirty()
+        self._refresh_placement_scene()
+        self._placement_panel.sync_inspector(
+            self._project.print_layout.pieces,
+            block_footprints(self._project),
+            block_colors(self._project),
+            self._project.blocks,
+            self._pselection,
+            self._pprimary,
+        )
+        if self._tabs.currentIndex() == 1:
+            self._set_status(
+                f"Auto-placed {report.placed} pieces ({report.staged} staged)"
+            )
+
+    def _on_placement_distribute(
+        self, mode: str, indices: list[int]
+    ) -> None:
+        '''Handle distribute request.'''
+        report = distribute(self._project, mode, indices)
+        self._mark_dirty()
+        self._refresh_placement_scene()
+        self._placement_panel.sync_inspector(
+            self._project.print_layout.pieces,
+            block_footprints(self._project),
+            block_colors(self._project),
+            self._project.blocks,
+            self._pselection,
+            self._pprimary,
+        )
+        if self._tabs.currentIndex() == 1:
+            self._set_status(
+                f"Distributed {report.placed} pieces ({report.staged} staged)"
+            )
+
+    def _on_piece_bed_changed(self, bed: int) -> None:
+        '''Move selected pieces to a different bed.'''
+        if not self._pselection:
+            return
+        beds = self._project.print_layout.beds
+        for idx in sorted(self._pselection):
+            if idx >= len(self._project.print_layout.pieces):
+                continue
+            piece = self._project.print_layout.pieces[idx]
+            # Preserve world position: compute current zone, then local in target.
+            wx, wy = world_position(piece, beds)
+            lx, ly = local_position(wx, wy, bed, beds)
+            piece.bed = bed
+            piece.position_x = lx
+            piece.position_y = ly
+        self._mark_dirty()
+        self._after_placement_change()
+
+    def _on_piece_position_changed(self, x: float, y: float) -> None:
+        '''Apply delta position to selected pieces.'''
+        if not self._pselection or self._pprimary is None:
+            return
+        primary = self._project.print_layout.pieces[self._pprimary]
+        dx = x - primary.position_x
+        dy = y - primary.position_y
+        for idx in sorted(self._pselection):
+            if idx >= len(self._project.print_layout.pieces):
+                continue
+            piece = self._project.print_layout.pieces[idx]
+            piece.position_x += dx
+            piece.position_y += dy
+        self._mark_dirty()
+        self._after_placement_change()
+
+    def _on_piece_flip_changed(self, flipped: bool) -> None:
+        '''Set flip state on all selected pieces.'''
+        for idx in sorted(self._pselection):
+            if idx >= len(self._project.print_layout.pieces):
+                continue
+            self._project.print_layout.pieces[idx].flipped = flipped
+        self._mark_dirty()
+        self._after_placement_change()
+
+    def _on_flip_selection(self) -> None:
+        '''Toggle flip on all selected pieces.'''
+        for idx in sorted(self._pselection):
+            if idx >= len(self._project.print_layout.pieces):
+                continue
+            p = self._project.print_layout.pieces[idx]
+            p.flipped = not p.flipped
+        self._mark_dirty()
+        self._after_placement_change()
+
+    def _on_stage_selection(self) -> None:
+        '''Move selected pieces to staging.'''
+        beds = self._project.print_layout.beds
+        for idx in sorted(self._pselection):
+            if idx >= len(self._project.print_layout.pieces):
+                continue
+            piece = self._project.print_layout.pieces[idx]
+            piece.bed = PRINT_STAGING_BED
+            # Try to find a free spot; fall back to current coords.
+            fps = block_footprints(self._project)
+            w, d = piece_dims(piece, fps) if piece.block_uid in fps else (0.0, 0.0)
+            existing: list[tuple[float, float, float, float]] = [
+                (p.position_x, p.position_y, *piece_dims(p, fps))
+                for p in self._project.print_layout.pieces
+                if p.bed == PRINT_STAGING_BED and p.uid != piece.uid
+            ]
+            spot = find_free_spot(existing, w, d, beds)
+            if spot is not None:
+                piece.position_x, piece.position_y = spot
+        self._mark_dirty()
+        self._after_placement_change()
 
 
 def main() -> None:
