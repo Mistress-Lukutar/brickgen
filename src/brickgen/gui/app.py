@@ -91,7 +91,9 @@ from brickgen.services.assemble_service import (
     assemble_groups,
     assemble_summary,
     assemble_supports,
+    base_footprint_rects,
     placed_counts,
+    transform_footprint_rects,
 )
 from brickgen.services.placement_service import (
     auto_place,
@@ -3169,6 +3171,12 @@ class MainWindow(QMainWindow):
             )
             for i, block in enumerate(self._project.blocks)
         }
+        # Base-orientation material rectangles per block uid (excluded
+        # cells leave voids pieces may drop into).
+        rects_map = {
+            block.uid: base_footprint_rects(self._project.block_settings(i))
+            for i, block in enumerate(self._project.blocks)
+        }
         colors_map = {block.uid: block.color for block in self._project.blocks}
 
         meshes_out: list[pv.PolyData | None] = []
@@ -3198,6 +3206,7 @@ class MainWindow(QMainWindow):
             half_x, half_y = dims.get(piece.block_uid, (0.0, 0.0))
             if piece.rot_z % 2:
                 half_x, half_y = half_y, half_x
+            base_rects = rects_map.get(piece.block_uid, ())
             meta_out.append(
                 {
                     'pos_x': piece.position_x,
@@ -3205,6 +3214,10 @@ class MainWindow(QMainWindow):
                     'pos_z': piece.position_z,
                     'half_x': half_x,
                     'half_y': half_y,
+                    'base_rects': base_rects,
+                    'rects': transform_footprint_rects(
+                        base_rects, piece.rot_z, piece.flipped
+                    ),
                     'top_z': heights.get(piece.block_uid, 0),
                     'quantity': 1,
                     'uid': piece.uid,
@@ -3470,8 +3483,7 @@ class MainWindow(QMainWindow):
         self._assemble_view.start_placement(
             mesh,
             index,
-            settings.outer_length_x / 2,
-            settings.outer_length_y / 2,
+            base_footprint_rects(settings),
             settings.total_height,
             self._project.blocks[index].color,
         )

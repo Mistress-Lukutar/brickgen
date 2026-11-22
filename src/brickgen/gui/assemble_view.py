@@ -21,9 +21,12 @@ from brickgen.gui.preview import (
     assemble_variant_mesh,
 )
 from brickgen.services.assemble_service import (
+    Rect,
     Support,
     assemble_snap_target,
+    offset_rects,
     support_top_z,
+    transform_footprint_rects,
 )
 
 # Opacity of the cursor-attached ghost piece while placing from the panel.
@@ -74,7 +77,10 @@ class AssembleView(PreviewWidget):
         self._ghost_base: pv.PolyData | None = None
         self._ghost_actor: pv.Actor | None = None
         self._ghost_block = -1
-        self._ghost_hx = self._ghost_hy = 0.0
+        # Ghost material rectangles: base pose (rot 0, unflipped) and the
+        # current pose (rebuilt on R/Space/F) in piece-relative coords.
+        self._ghost_base_rects: tuple[Rect, ...] = ()
+        self._ghost_rects: tuple[Rect, ...] = ()
         self._ghost_height = 0.0
         self._ghost_rot = 0
         self._ghost_flip = False
@@ -105,8 +111,7 @@ class AssembleView(PreviewWidget):
         self,
         mesh: pv.PolyData,
         block_index: int,
-        half_x: float,
-        half_y: float,
+        rects: tuple[Rect, ...],
         height: float,
         color: str,
     ) -> bool:
@@ -119,7 +124,9 @@ class AssembleView(PreviewWidget):
         Args:
             mesh: Untransformed block mesh (centered at origin).
             block_index: Scene index of the source block (reported on drop).
-            half_x, half_y: Unrotated footprint half extents, mm.
+            rects: Piece-relative material rectangles of the block in its
+                base orientation (excluded cells leave voids that pieces
+                may enter).
             height: Block total height (flip lift), mm.
             color: Ghost surface color.
 
@@ -133,12 +140,12 @@ class AssembleView(PreviewWidget):
         self._placing = True
         self._ghost_base = mesh
         self._ghost_block = block_index
-        self._ghost_hx = float(half_x)
-        self._ghost_hy = float(half_y)
+        self._ghost_base_rects = tuple(rects)
         self._ghost_height = float(height)
         self._ghost_rot = 0
         self._ghost_flip = False
         self._ghost_color = color
+        self._refresh_ghost_rects()
         self._drag_supports = self._query_supports(set())
         self._build_ghost_actor()
         if QWidget.mouseGrabber() is not self:
@@ -159,6 +166,8 @@ class AssembleView(PreviewWidget):
                 pass
         self._ghost_actor = None
         self._ghost_base = None
+        self._ghost_base_rects = ()
+        self._ghost_rects = ()
         self._drag_supports = []
         if QWidget.mouseGrabber() is self:
             self.releaseMouse()
@@ -177,11 +186,15 @@ class AssembleView(PreviewWidget):
             return []
         return list(self._supports_provider(exclude_uids))
 
-    def _ghost_halves(self) -> tuple[float, float]:
-        '''Footprint half extents of the ghost at its current rotation.'''
-        if self._ghost_rot % 2:
-            return (self._ghost_hy, self._ghost_hx)
-        return (self._ghost_hx, self._ghost_hy)
+    def _refresh_ghost_rects(self) -> None:
+        '''Material rectangles of the ghost for its current pose.
+
+        Re-applies the base-orientation rectangles for the current R/Space
+        rotation and F flip, mirroring the mesh variant transform order.
+        '''
+        self._ghost_rects = transform_footprint_rects(
+            self._ghost_base_rects, self._ghost_rot, self._ghost_flip
+        )
 
     def _build_ghost_actor(self) -> None:
         '''(Re)build the translucent ghost actor for the current pose.'''
@@ -214,12 +227,10 @@ class AssembleView(PreviewWidget):
         world = self._cursor_on_floor(pos)
         if world is None:
             return
-        hx, hy = self._ghost_halves()
         x, y, z = assemble_snap_target(
             float(world[0]),
             float(world[1]),
-            hx,
-            hy,
+            self._ghost_rects,
             self._drag_supports,
             self.grid_step(),
             self._grid_snap,
@@ -252,16 +263,19 @@ class AssembleView(PreviewWidget):
     def _piece_drop_z(self, index: int, x: float, y: float) -> float:
         '''Drop height of piece *index* at (x, y) under the current snapping.
 
-        With part snapping the piece lands on the topmost support under
-        its footprint (floor when free); without it the piece keeps its
-        current height (free 3D drag, exact heights via the inspector).
+        With part snapping the piece lands on the topmost support whose
+        MATERIAL overlaps its footprint (floor when free — excluded-cell
+        voids let pieces drop into the empty space); without it the piece
+        keeps its current height (free 3D drag, exact heights via the
+        inspector).
         '''
         meta = self._scene_meta[index]
         if not self._snap_parts:
             return float(meta.get('pos_z', 0.0))
-        top = support_top_z(
-            self._drag_supports, x, y, float(meta['half_x']), float(meta['half_y'])
-        )
+        rects = meta.get('rects')
+        if rects is None:  # scene meta without material rects: full box
+            rects = (Rect(0.0, 0.0, float(meta['half_x']), float(meta['half_y'])),)
+        top = support_top_z(self._drag_supports, offset_rects(rects, x, y))
         return 0.0 if top is None else top
 
     def _rotate_moved_pieces(self) -> None:
@@ -278,6 +292,13 @@ class AssembleView(PreviewWidget):
             meta = self._scene_meta[index]
             meta['rot_z'] = (int(meta.get('rot_z', 0)) + 1) % 4
             meta['half_x'], meta['half_y'] = meta['half_y'], meta['half_x']
+            base_rects = meta.get('base_rects')
+            if base_rects is not None:
+                meta['rects'] = transform_footprint_rects(
+                    base_rects,
+                    int(meta['rot_z']),
+                    bool(meta.get('flipped', False)),
+                )
             x, y = float(meta['pos_x']), float(meta['pos_y'])
             meta['pos_z'] = self._piece_drop_z(index, x, y)
             if index < len(self._block_actors):
@@ -450,12 +471,14 @@ class AssembleView(PreviewWidget):
         if self._placing:
             if key in (Qt.Key.Key_R, Qt.Key.Key_Space):
                 self._ghost_rot = (self._ghost_rot + 1) % 4
+                self._refresh_ghost_rects()
                 self._build_ghost_actor()
                 self.render()
                 event.accept()
                 return
             if key == Qt.Key.Key_F:
                 self._ghost_flip = not self._ghost_flip
+                self._refresh_ghost_rects()
                 self._build_ghost_actor()
                 self.render()
                 event.accept()

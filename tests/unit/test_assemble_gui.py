@@ -350,6 +350,51 @@ def test_place_requested_starts_ghost(window: MainWindow) -> None:
     _reset(window)
 
 
+def test_scene_meta_and_ghost_carry_material_rects(window: MainWindow) -> None:
+    '''Excluded-cell pieces expose their voids to the drop logic.
+
+    Regression for the T-notch bug: scene meta and the placement ghost
+    must carry the material rectangles, otherwise the drop logic silently
+    falls back to the bounding box and pieces can never enter the empty
+    space of a notch. The scene meta and ghost rects are derived from the
+    block settings, so no regeneration is needed (the stale 2x2 mesh is
+    irrelevant to them).
+    '''
+    _reset(window)
+    block = window._project.blocks[0]
+    block.cells_x = 3
+    block.cells_y = 2
+    block.excluded_cells = [[2, 0]]
+    window._tabs.setCurrentIndex(1)
+    unit = window._project.settings.unit_size
+    _place(window, x=0.0, y=0.0)
+
+    view = window._assemble_view
+    meta = view._scene_meta[0]
+    assert len(meta['rects']) == 2
+    # rot 0 / unflipped: the current rects are the base rects.
+    assert meta['rects'] == meta['base_rects']
+    # The support provider reports the same world rectangles.
+    supports = view._query_supports(set())
+    assert len(supports) == 1
+    assert len(supports[0].rects) == 2
+    assert supports[0].rects[0].cx == pytest.approx(-unit / 2)
+
+    # The placement ghost starts with the same material rectangles.
+    window._on_parts_place_requested(block.uid)
+    assert view.placing() is True
+    assert view._ghost_rects == view._ghost_base_rects
+    assert view._ghost_base_rects == tuple(meta['base_rects'])
+    window._tabs.setCurrentIndex(0)
+
+    # Restore the default full-square block geometry.
+    block.cells_x = 2
+    block.cells_y = 2
+    block.excluded_cells = []
+    window._sync_assemble()
+    _reset(window)
+
+
 def test_assemble_panel_status_routing(window: MainWindow) -> None:
     '''Status messages on the assemble tab land in its own panel label.'''
     _reset(window)
