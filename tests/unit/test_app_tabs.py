@@ -3,7 +3,7 @@ File:   test_app_tabs.py
 Brief:  Integration tests for the MainWindow tab integration (S4).
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations
@@ -895,3 +895,35 @@ def test_mark_dirty_boot_guard(window: MainWindow) -> None:
     window._mark_clean()
     assert window._dirty is False
     assert window.isWindowModified() is False
+
+
+# -------------------------------------------------------- gizmo toggle per tab
+
+def test_view_gizmo_toggle_shared_flag(window: MainWindow) -> None:
+    '''The View>Show move gizmo toggle sets the shared project flag.'''
+    _reset_state(window)
+    window._dirty = False
+
+    # --- Tab 0 (planning): toggle off ---
+    window._tabs.setCurrentIndex(0)
+    window._act_show_gizmo.toggled.emit(False)
+    assert window._project.view.show_gizmo is False
+    assert window._dirty is True
+
+    # Reset dirty for next check.
+    window._dirty = False
+
+    # --- Tab 1 (assemble): toggle off ---
+    window._tabs.setCurrentIndex(1)
+    window._act_show_gizmo.toggled.emit(False)
+    assert window._project.view.show_gizmo is False
+    assert window._dirty is True
+
+    # Verify the shared flag persisted across tab switch.
+    window._tabs.setCurrentIndex(0)
+    assert window._project.view.show_gizmo is False
+
+    # Restore defaults for other tests.
+    window._tabs.setCurrentIndex(0)
+    window._act_show_gizmo.toggled.emit(True)
+    window._dirty = False

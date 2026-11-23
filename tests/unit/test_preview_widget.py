@@ -3,7 +3,7 @@ File:   test_preview_widget.py
 Brief:  Offscreen PreviewWidget tests: selection scheme, camera navigation, modes.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations
@@ -807,3 +807,299 @@ def test_empty_scene_update_removes_block_actors(
     renderer_actors = set(map(id, preview_two.actors.values()))
     for actor in block_actors:
         assert id(actor) not in renderer_actors
+
+
+# ---------------------------------------------------------------- axis-lock
+
+def _stub_ray(
+    view: PreviewWidget, target_x: float, target_y: float, target_z: float = 2.5
+):
+    '''Monkeypatch ``view._cursor_ray``: deterministic ray aimed at *target*.'''
+    origin = np.array([0.0, 0.0, 400.0], dtype=np.float64)
+    target = np.array([target_x, target_y, target_z], dtype=np.float64)
+    direction = target - origin
+    view._cursor_ray = lambda pos=None: (origin, direction)  # type: ignore[method-assign]
+
+
+# ------------------------------------------------------------------ engage
+
+def test_axis_lock_engages_without_jump(preview: PreviewWidget) -> None:
+    '''Locking an axis on a fresh grab must not jump the selection.
+
+    After ``start_grab()`` + one ``_update_grab`` establishes the free anchor,
+    setting an axis lock and calling ``_update_grab`` again with the same ray
+    must keep x/y unchanged (zero constrained delta at engagement).
+    '''
+    preview.set_selection({0}, 0)
+    assert preview.start_grab(_CENTER)
+    # First _update_grab sets the free anchor.
+    _hover_move(preview, _CENTER)
+    orig_x = preview._scene_meta[0]['pos_x']
+    orig_y = preview._scene_meta[0]['pos_y']
+
+    # Stub a ray aimed exactly at the block center (30, 20, 2.5).
+    _stub_ray(preview, 30.0, 20.0)
+
+    # Lock X axis (single-axis mode).
+    assert preview._set_axis_lock("x", False) is True
+    # One constrained update with the engagement ray: no jump expected.
+    _hover_move(preview, _CENTER)
+    assert preview._scene_meta[0]['pos_x'] == pytest.approx(orig_x)
+    assert preview._scene_meta[0]['pos_y'] == pytest.approx(orig_y)
+
+    # The lock is active and the constraint anchor was set.
+    assert preview._axis_lock == "x"
+    assert preview._constraint_anchor is not None
+
+
+# ------------------------------------------------------------------ X move
+
+def test_axis_lock_x_moves_only_x(preview: PreviewWidget) -> None:
+    '''Locking X constrains movement to world-X only; Y stays frozen.'''
+    preview.set_selection({0}, 0)
+    assert preview.start_grab(_CENTER)
+    _hover_move(preview, _CENTER)
+
+    # Grid step is unit_size * scale = 4.0 * 0.5 = 2.0 mm.
+    grid_step = preview.grid_step()
+    assert grid_step == pytest.approx(2.0)
+
+    # Engage the lock with a near-anchor ray: it is absorbed into the
+    # constraint origin (the engagement frame never moves the block).
+    _stub_ray(preview, 30.0, 20.0)
+    preview._set_axis_lock("x", False)
+    _hover_move(preview, _CENTER)
+
+    # Retarget the ray at x=30+4*step=38, y=20 (same Y).
+    _stub_ray(preview, 30.0 + 4 * grid_step, 20.0)
+    _hover_move(preview, _CENTER)
+    meta = preview._scene_meta[0]
+    assert meta['pos_x'] == pytest.approx(30.0 + 4 * grid_step, abs=1e-6)
+    assert meta['pos_y'] == pytest.approx(20.0, abs=1e-9)
+    assert preview._grab_moved is True
+
+
+# --------------------------------------------------------------- toggle off
+
+def test_axis_lock_toggle_off(preview: PreviewWidget) -> None:
+    '''Repeating the same axis-lock toggles it off; diagonal move moves freely.'''
+    preview.set_selection({0}, 0)
+    assert preview.start_grab(_CENTER)
+    _hover_move(preview, _CENTER)
+
+    # Lock X.
+    preview._set_axis_lock("x", False)
+    assert preview._axis_lock == "x"
+
+    # Same key again -> toggle off.
+    preview._set_axis_lock("x", False)
+    assert preview._axis_lock is None
+
+    # Now a diagonal ray should move both axes freely.
+    _stub_ray(preview, 30.0 + 4, 20.0 + 3)
+    _hover_move(preview, _CENTER)
+    meta = preview._scene_meta[0]
+    assert meta['pos_x'] != pytest.approx(30.0, abs=1e-9)
+    assert meta['pos_y'] != pytest.approx(20.0, abs=1e-9)
+
+
+# -------------------------------------------------------- plane lock shift_x
+
+def test_plane_lock_shift_x_moves_only_y(preview: PreviewWidget) -> None:
+    '''Shift+X (plane mode) excludes X from movement; only Y changes.'''
+    preview.set_selection({0}, 0)
+    assert preview.start_grab(_CENTER)
+    _hover_move(preview, _CENTER)
+
+    # Lock X in plane mode (shift_x = exclude X); the near-anchor ray is
+    # absorbed into the constraint origin at engagement. Targets stay far
+    # from vertical so the ray never trips the ~0.1 plane-parallel guard.
+    _stub_ray(preview, 30.0, 20.0, 300.0)
+    preview._set_axis_lock("x", True)
+    assert preview._axis_lock == "x"
+    assert preview._axis_plane is True
+    _hover_move(preview, _CENTER)
+
+    # Retarget the ray at offset X and Y: only Y may move.
+    _stub_ray(preview, 30.0 + 10.0, 20.0 + 5.0, 300.0)
+    _hover_move(preview, _CENTER)
+    meta = preview._scene_meta[0]
+    # X is frozen at the anchor; Y moved.
+    assert meta['pos_x'] == pytest.approx(30.0, abs=1e-6)
+    assert meta['pos_y'] != pytest.approx(20.0, abs=1e-9)
+
+
+# ----------------------------------------------------- Z rejected on planning
+
+def test_z_lock_rejected_on_planning(preview: PreviewWidget) -> None:
+    '''Planning tab active_axes = {x,y}: locking Z returns False.'''
+    preview.set_selection({0}, 0)
+    assert preview.start_grab(_CENTER)
+    _hover_move(preview, _CENTER)
+
+    result = preview._set_axis_lock("z", False)
+    assert result is False
+    assert preview._axis_lock is None
+
+
+# -------------------------------------------------------- guides during lock
+
+def test_guides_drawn_during_locked_move(preview: PreviewWidget) -> None:
+    '''Locked moves draw guide lines; toggling off draws both axes.'''
+    preview.set_selection({0}, 0)
+    assert preview.start_grab(_CENTER)
+    _hover_move(preview, _CENTER)
+
+    # No lock yet -> no guides.
+    preview._clear_guides()
+    assert len(preview._guide_actors) == 0
+
+    # Lock X: one guide line.
+    _stub_ray(preview, 38.0, 20.0)
+    preview._set_axis_lock("x", False)
+    _hover_move(preview, _CENTER)
+    assert len(preview._guide_actors) == 1
+
+    # Toggle lock off: two guides (both planning axes).
+    preview._set_axis_lock("x", False)
+    assert preview._axis_lock is None
+    _stub_ray(preview, 38.0, 25.0)
+    _hover_move(preview, _CENTER)
+    assert len(preview._guide_actors) == 2
+
+    # Confirm grab clears guides.
+    preview.confirm_grab()
+    assert len(preview._guide_actors) == 0
+
+
+# ------------------------------------------------------- gizmo visibility
+
+def test_gizmo_visibility_follows_state(preview: PreviewWidget) -> None:
+    '''Gizmo is visible only when enabled+selection+not grabbing.'''
+    # No selection + enabled -> no gizmo.
+    preview.set_show_gizmo(True)
+    preview._update_gizmo()
+    assert preview._gizmo is None or not preview._gizmo.visible()
+
+    # Select a block -> gizmo becomes visible after update.
+    preview.set_selection({0}, 0)
+    preview._update_gizmo()
+    assert preview._gizmo is not None
+    assert preview._gizmo.visible() is True
+
+    # Start grab -> gizmo hidden (via _end_grab path).
+    assert preview.start_grab(_CENTER)
+    assert preview._grabbing is True
+    # _update_gizmo should now hide it.
+    preview._update_gizmo()
+    assert preview._gizmo.visible() is False
+
+    # Confirm grab -> visible again.
+    preview.confirm_grab()
+    preview._update_gizmo()
+    assert preview._gizmo.visible() is True
+
+    # Disable gizmo -> hidden and _gizmo_enabled False.
+    preview.set_show_gizmo(False)
+    assert preview._gizmo_enabled is False
+
+
+# ---------------------------------------------------- gizmo arrow drag
+
+def test_gizmo_arrow_drag_commits_axis_move(preview: PreviewWidget) -> None:
+    '''Clicking a gizmo axis starts a constrained grab; release commits.'''
+    received: list[dict] = []
+    preview.blocks_moved.connect(lambda payload: received.append(payload))
+
+    # Enable gizmo, select block.
+    preview.set_show_gizmo(True)
+    preview.set_selection({0}, 0)
+    preview._update_gizmo()
+    assert preview._gizmo is not None
+
+    # Monkeypatch _gizmo_axis_at to return "x".
+    original = preview._gizmo_axis_at
+    preview._gizmo_axis_at = lambda pos: "x"  # type: ignore[method-assign]
+
+    try:
+        # Engage with a near-anchor ray (the press frame never moves).
+        grid_step = preview.grid_step()
+        _stub_ray(preview, 30.0, 20.0)
+
+        # Simulate LMB press on the gizmo axis (the path in mousePressEvent).
+        preview.mousePressEvent(
+            QMouseEvent(
+                QEvent.Type.MouseButtonPress,
+                QPointF(_CENTER),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        # After press: grab started, axis locked to x.
+        assert preview._grabbing is True
+        assert preview._axis_lock == "x"
+
+        # Retarget the ray at +2*step along X and move: constrained delta.
+        _stub_ray(preview, 30.0 + 2 * grid_step, 20.0)
+        _hover_move(preview, QPoint(_CENTER.x() + 60, _CENTER.y()))
+        meta = preview._scene_meta[0]
+        assert meta['pos_x'] != pytest.approx(30.0, abs=1e-9)
+        # Y unchanged in locked mode.
+        assert meta['pos_y'] == pytest.approx(20.0, abs=1e-9)
+
+        # Simulate release far enough to commit (beyond RUBBER_BAND_THRESHOLD_PX).
+        far_end = QPoint(_CENTER.x() + 100, _CENTER.y())
+        preview.mouseReleaseEvent(
+            QMouseEvent(
+                QEvent.Type.MouseButtonRelease,
+                QPointF(far_end),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        assert not preview._grabbing
+        # Signal emitted with x-only delta.
+        assert received and set(received[-1]) == {0}
+    finally:
+        preview._gizmo_axis_at = original  # type: ignore[method-assign]
+
+
+def test_gizmo_actors_not_scene_pickable(preview: PreviewWidget) -> None:
+    '''Gizmo arrows must be invisible to the block scene picker but still
+    axis-pickable.
+
+    Each gizmo actor is added with ``pickable=False`` so clicks on an arrow
+    pass through to the solid block underneath.  The dedicated cell picker
+    temporarily enables picking, finds the hit, then restores ``False``.
+    '''
+    # Enable gizmo and select a block (same setup as the arrow-drag test).
+    preview.set_show_gizmo(True)
+    preview.set_selection({0}, 0)
+    preview._update_gizmo()
+    assert preview._gizmo is not None
+
+    # Every gizmo actor must be invisible to the scene picker.
+    for axis, actor in preview._gizmo._actors.items():
+        assert not actor.GetPickable(), f"axis {axis}"
+
+    # Mock the VTK picker so pick_axis returns a valid hit regardless of pos.
+    original_pick = preview._gizmo._picker.Pick
+    mock_actor = list(preview._gizmo._actors.values())[0]
+    def _mock_pick(*args, **kwargs):  # noqa: ANN001, ANN003 - VTK args
+        preview._gizmo._picker.GetActor = lambda: mock_actor
+        return True
+    preview._gizmo._picker.Pick = _mock_pick  # type: ignore[assignment]
+
+    try:
+        # pick_axis temporarily enables picking, finds the axis, restores.
+        result = preview._gizmo.pick_axis(preview, _CENTER)
+        assert result is not None
+        assert result in ("x", "y", "z")
+
+        # After pick_axis: all actors must still be unpickable (restored).
+        for axis, actor in preview._gizmo._actors.items():
+            assert not actor.GetPickable(), f"axis {axis} after pick"
+    finally:
+        preview._gizmo._picker.Pick = original_pick  # type: ignore[assignment]

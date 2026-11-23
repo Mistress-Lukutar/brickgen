@@ -3,7 +3,7 @@ File:   test_scene_jobs.py
 Brief:  Worker-handler tests for multi-block scene build and export.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 import os

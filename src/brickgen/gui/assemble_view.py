@@ -3,19 +3,22 @@ File:   assemble_view.py
 Brief:  Assemble-tab 3D viewport: free piece placement, collision feedback, magnets.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
 import pyvista as pv
 from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent, QWheelEvent
+from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QWidget
 
 from brickgen.gui.preview import (
+    _FLOOR_RAY_MIN_SIN,
+    AXIS_VECTORS,
     RUBBER_BAND_THRESHOLD_PX,
     SELECTION_COLOR,
     PreviewWidget,
@@ -46,8 +49,9 @@ class AssembleView(PreviewWidget):
     selection machinery this subclass adds:
 
     - panel-driven free 3D placement: a translucent ghost piece attaches to
-      the cursor (like the G grab), follows the working plane controlled by
-      the mouse wheel, and every left click drops a copy (R or Space
+      the cursor (like the G grab), follows the cursor with axis-lock keys
+      (X/Y/Z constrain to that axis, Shift+X/Y/Z constrains to the plane
+      excluding that axis); every left click drops a copy (R or Space
       rotates 90 degrees, F flips, Esc/right-click exits the mode);
     - collision prohibition: ``assemble_pose_collides`` blocks drops that
       intersect existing pieces; outlines tint to :data:`COLLISION_COLOR`;
@@ -105,6 +109,21 @@ class AssembleView(PreviewWidget):
         self._rot_total = 0  # quarter turns applied during the active drag
         self._rot_undo = 0   # quarter turns applied after the last valid snapshot
 
+    def active_axes(self) -> frozenset[str]:
+        '''Assemble tab allows Z movement (3D placement).'''
+        return frozenset({"x", "y", "z"})
+
+    def _clamp_move_dz(self, dz: float) -> float:
+        '''Clamp Z delta so the lowest grabbed piece never goes below z=0.'''
+        if self._grab_orig_z:
+            min_z = -min(self._grab_orig_z.values())
+            return max(dz, min_z)
+        return dz
+
+    def _retained_move_dz(self) -> float:
+        '''Plane locks keep the drag's accumulated Z offset (current height).'''
+        return float(self._drag_dz)
+
     # ------------------------------------------------------------------ API
 
     def set_snap_parts(self, enabled: bool) -> None:
@@ -140,9 +159,10 @@ class AssembleView(PreviewWidget):
     ) -> bool:
         '''Attach a ghost copy of *mesh* to the cursor (panel-driven).
 
-        The ghost follows the working plane controlled by the mouse wheel
-        with the current snapping until Esc or a right click cancels; every
-        left click drops a copy (the ghost stays for the next drop).
+        The ghost follows the cursor with axis-lock keys (X/Y/Z constrain
+        to that axis, Shift+X/Y/Z constrains to the plane excluding that
+        axis) until Esc or a right click cancels; every left click drops a
+        copy (the ghost stays for the next drop).
 
         Args:
             mesh: Untransformed block mesh (centered at origin).
@@ -165,6 +185,13 @@ class AssembleView(PreviewWidget):
             self.cancel_placement()
         if self._grabbing:
             self.cancel_grab()
+        # Reset axis-lock state for a fresh placement.
+        self._axis_lock = None
+        self._axis_plane = False
+        self._constraint_anchor = None
+        self._constraint_origin = None
+        self._constraint_zero = None
+        self._last_grab_pos = None
         self._placing = True
         self._ghost_base = mesh
         self._ghost_block = block_index
@@ -178,6 +205,7 @@ class AssembleView(PreviewWidget):
         self._refresh_ghost_rects()
         self._drag_supports = self._query_supports(set())
         self._build_ghost_actor()
+        self._update_gizmo()
         self.setCursor(Qt.CursorShape.CrossCursor)
         # Placement starts from a press on a panel card, so the viewport
         # must take the keyboard focus itself: without it R/Space/F stay
@@ -192,7 +220,10 @@ class AssembleView(PreviewWidget):
         return True
 
     def cancel_placement(self) -> None:
-        '''Leave the ghost placement mode and remove the ghost actor.'''
+        '''Leave the ghost placement mode and remove the ghost actor.
+
+        Also clears guide lines and resets axis-lock state.
+        '''
         if not self._placing:
             return
         self._placing = False
@@ -208,6 +239,14 @@ class AssembleView(PreviewWidget):
         self._drag_supports = []
         self._ghost_pos = None
         self.unsetCursor()
+        self._clear_guides()
+        self._axis_lock = None
+        self._axis_plane = False
+        self._constraint_anchor = None
+        self._constraint_origin = None
+        self._constraint_zero = None
+        self._last_grab_pos = None
+        self._update_gizmo()
         self.render()
 
     def placing(self) -> bool:
@@ -260,8 +299,17 @@ class AssembleView(PreviewWidget):
             self._ghost_actor.SetPosition(*self._ghost_pos)
 
     def _update_ghost(self, pos: QPoint) -> None:
-        '''Move the ghost to the snapped drop position under the cursor.'''
+        '''Move the ghost to the snapped drop position under the cursor.
+
+        When an axis lock is active (X/Y/Z key), delegates to the constrained
+        path; otherwise uses the original free-plane floor intersection with
+        magnet snapping.
+        '''
         if not self._placing or self._ghost_actor is None:
+            return
+        self._last_grab_pos = QPoint(pos)
+        if self._axis_lock is not None:
+            self._update_ghost_constrained(pos)
             return
         world = self._cursor_on_plane(pos, self._ghost_z)
         if world is None:
@@ -276,6 +324,119 @@ class AssembleView(PreviewWidget):
         self._ghost_actor.SetPosition(x, y, z)
         self._tint_ghost(not self._ghost_valid_at(x, y, z))
         self.render()
+
+    def _update_ghost_constrained(self, pos: QPoint) -> None:
+        '''Constrained-path ghost placement via axis-lock intersection.
+
+        Uses ``_constrained_delta`` to compute the total world displacement
+        from the ghost anchor, then applies plain grid snapping (no magnet
+        snapping).
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+        '''
+        # Lazily engage: when constraint_anchor is None, set it from ghost pos.
+        if self._constraint_anchor is None:
+            gx, gy, gz = (
+                self._ghost_pos if self._ghost_pos is not None
+                else (0.0, 0.0, self._ghost_z)
+            )
+            self._constraint_anchor = np.array([gx, gy, gz], dtype=np.float64)
+            self._constraint_zero = np.zeros(3, dtype=np.float64)
+            # Compute _constraint_origin based on lock mode.
+            if not self._axis_plane:
+                # Single-axis: absorb the engagement cursor's projection onto
+                # the axis line into the origin, so the first constrained
+                # frame is a no-move (the lock never jumps the ghost).
+                self._constraint_origin = self._constraint_anchor.copy()
+                raw0 = self._constrained_raw_delta(pos)
+                if raw0 is not None:
+                    idx = {'x': 0, 'y': 1, 'z': 2}[str(self._axis_lock)]
+                    self._constraint_origin[idx] += float(raw0[idx])
+            else:
+                # Plane mode: origin = cursor ray intersection with the plane
+                # through the anchor (fallback: the anchor itself when the
+                # ray is too parallel to the plane).
+                lock = self._axis_lock
+                assert lock is not None  # constrained path only when locked
+                self._constraint_origin = self._constraint_anchor.copy()
+                ray = self._cursor_ray(pos)
+                if ray is not None:
+                    o, d = ray
+                    n = AXIS_VECTORS[lock]  # unit normal
+                    d_hat = d / max(float(np.linalg.norm(d)), 1e-12)
+                    denom = float(np.dot(d_hat, n))
+                    if abs(denom) >= _FLOOR_RAY_MIN_SIN:
+                        anchor_tmp = self._constraint_anchor
+                        assert anchor_tmp is not None
+                        t = float(
+                            np.dot(anchor_tmp - o, n) / denom
+                        )
+                        if t > 0.0:
+                            self._constraint_origin = o + d * t
+
+        # Compute total delta from constrained math.
+        raw = self._constrained_raw_delta(pos)
+        if raw is None:
+            return
+
+        anchor = self._constraint_anchor
+        assert anchor is not None  # ensured by lazy engagement above
+        tx = anchor[0] + float(raw[0])
+        ty = anchor[1] + float(raw[1])
+        tz = anchor[2] + float(raw[2])
+
+        allowed = self._allowed_axes()
+        assert allowed is not None  # constrained path only when lock is set
+        if "x" not in allowed:
+            tx = float(anchor[0])
+        if "y" not in allowed:
+            ty = float(anchor[1])
+        if "z" not in allowed:
+            tz = float(anchor[2])
+
+        # Plain snapping (no magnet snapping under constraint): the footprint
+        # minimum corner rounds to the grid step like the free path does.
+        if self._grid_snap:
+            step = max(self.grid_step(), 1e-9)
+            hx = hy = 0.0
+            if self._ghost_rects:
+                cx_vals = [r.cx + r.hx for r in self._ghost_rects]
+                cx_vals += [r.cx - r.hx for r in self._ghost_rects]
+                cy_vals = [r.cy + r.hy for r in self._ghost_rects]
+                cy_vals += [r.cy - r.hy for r in self._ghost_rects]
+                hx = (max(cx_vals) - min(cx_vals)) / 2.0
+                hy = (max(cy_vals) - min(cy_vals)) / 2.0
+            if "x" in allowed:
+                tx = round((tx - hx) / step) * step + hx
+            if "y" in allowed:
+                ty = round((ty - hy) / step) * step + hy
+            if "z" in allowed:
+                tz = round(tz / step) * step
+
+        # Clamp z >= 0.
+        tz = max(tz, 0.0)
+
+        self._ghost_pos = (tx, ty, tz)
+        ghost_actor = self._ghost_actor
+        assert ghost_actor is not None
+        ghost_actor.SetPosition(tx, ty, tz)
+        self._tint_ghost(not self._ghost_valid_at(tx, ty, tz))
+        self._update_guides(
+            np.array([tx, ty, tz + self._ghost_height / 2.0], dtype=np.float64)
+        )
+        self.render()
+
+    def _reengage_constraint(self) -> None:
+        '''Override to handle ghost re-engagement during placement.'''
+        if self._placing:
+            self._constraint_anchor = None
+            self._constraint_origin = None
+            self._constraint_zero = None
+            if self._last_grab_pos is not None:
+                self._update_ghost(QPoint(self._last_grab_pos))
+        else:
+            super()._reengage_constraint()
 
     def _drop_ghost(self) -> None:
         '''Drop one copy at the current ghost pose (ghost stays active).'''
@@ -329,48 +490,19 @@ class AssembleView(PreviewWidget):
 
     # --------------------------------------------------------- input routing
 
-    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt naming
-        '''Wheel steps the working plane during placement and the drag height
-        during a move; otherwise native zoom.'''
-        if self._placing:
-            delta = event.angleDelta().y()
-            if delta > 0:
-                self._ghost_z += self.grid_step()
-            elif delta < 0:
-                self._ghost_z = max(0.0, self._ghost_z - self.grid_step())
-            self._update_ghost(event.position().toPoint())
-            event.accept()
-            return
-        if self._grabbing and self._grab_orig:
-            self._adjust_drag_height(event.angleDelta().y(), event.position().toPoint())
-            event.accept()
-            return
-        super().wheelEvent(event)
-        self._refresh_grid_labels()
-
-    def _adjust_drag_height(self, delta: int, pos: QPoint) -> None:
-        '''Wheel mid-drag: step the whole selection's height (z >= 0).'''
-        if not self._grab_orig_z:
-            return
-        step = self.grid_step()
-        if delta > 0:
-            self._drag_dz += step
-        elif delta < 0:
-            self._drag_dz = max(self._drag_dz - step, -min(self._grab_orig_z.values()))
-        else:
-            return
-        # Re-anchor on the new plane so the next XY move does not jump.
-        self._grab_anchor = None
-        self._update_grab(pos)
-
     def _update_grab(self, pos: QPoint) -> None:
         '''Move the selection with the cursor on the plane at its height.
 
-        The cursor ray is intersected with the horizontal plane through the
-        primary piece's current bottom height (the wheel raises/lowers it),
-        so XY deltas stay true to the piece's own level.
+        When an axis lock is active (X/Y/Z key), delegates to the constrained
+        path; otherwise uses the original free-plane intersection at the
+        primary piece's current bottom height.
         '''
         if not self._grabbing or not self._grab_orig:
+            return
+        self._last_grab_pos = QPoint(pos)
+        if self._axis_lock is not None:
+            self._update_grab_constrained(pos)
+            self._sync_drag_dz_from_primary()
             return
         primary = (
             self._primary if self._primary in self._grab_orig else min(self._grab_orig)
@@ -397,6 +529,20 @@ class AssembleView(PreviewWidget):
         dx, dy = target_x - original_x, target_y - original_y
         self._apply_move(self._grab_orig, dx, dy, dz=self._drag_dz)
         self._applied_dz = self._drag_dz
+
+    def _sync_drag_dz_from_primary(self) -> None:
+        '''Sync _drag_dz / _applied_dz from the primary piece's current Z.'''
+        if not self._grab_orig:
+            return
+        primary = (
+            self._primary if self._primary in self._grab_orig
+            else min(self._grab_orig)
+        )
+        dz = float(self._scene_meta[primary].get('pos_z', 0.0)) - float(
+            self._grab_orig_z.get(primary, 0.0)
+        )
+        self._drag_dz = dz
+        self._applied_dz = dz
 
     def _begin_piece_drag(self) -> None:
         '''Freeze the support set for the starting move drag/grab.'''
@@ -630,15 +776,17 @@ class AssembleView(PreviewWidget):
 
     def start_move_drag(self, pos: QPoint) -> bool:
         '''Start dragging the selection (supports frozen first).'''
-        if not self._placing:
+        started = super().start_move_drag(pos)
+        if started and not self._placing:
             self._begin_piece_drag()
-        return super().start_move_drag(pos)
+        return started
 
     def start_grab(self, pos: QPoint | None = None) -> bool:
         '''Start the G-grab move (supports frozen first).'''
-        if not self._placing:
+        started = super().start_grab(pos)
+        if started and not self._placing:
             self._begin_piece_drag()
-        return super().start_grab(pos)
+        return started
 
     def confirm_grab(self) -> None:
         '''Finish the grab move and commit the new (x, y, z, rot_z) states.
@@ -670,6 +818,7 @@ class AssembleView(PreviewWidget):
         drag_delta = event.position().toPoint() - self._grab_press_pos
         dragged = drag_delta.manhattanLength() > RUBBER_BAND_THRESHOLD_PX
         moved = self._grab_moved
+        from_axis = self._drag_from_axis
         if moved and dragged:
             if self._drag_pose_invalid():
                 self._restore_valid_pose()
@@ -690,9 +839,12 @@ class AssembleView(PreviewWidget):
             return
         if moved:
             self._rollback_drag()
+        self._tint_drag(False)
+        self._end_grab()
         self._grab_orig.clear()
         self._grab_anchor = None
-        self._finish_click(event)
+        if not from_axis:
+            self._finish_click(event)
 
     def cancel_grab(self) -> None:
         '''Finish the grab move restoring positions, heights and rotations.'''
@@ -756,10 +908,22 @@ class AssembleView(PreviewWidget):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt naming
-        '''Placement keys (R/Space rotate, F flips, Esc cancels), Space
-        rotates the pieces of an active move drag, Del deletes.'''
+        '''Placement keys (R/Space rotate, F flips, Esc cancels), X/Y/Z lock
+        movement to axis/plane during placement, Space rotates the pieces of
+        an active move drag, Del deletes.'''
         key = event.key()
         if self._placing:
+            lock_map: dict[int, str] = {
+                Qt.Key.Key_X: "x",
+                Qt.Key.Key_Y: "y",
+                Qt.Key.Key_Z: "z",
+            }
+            if key in lock_map and self._set_axis_lock(
+                lock_map[key],
+                bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+            ):
+                event.accept()
+                return
             if key in (Qt.Key.Key_R, Qt.Key.Key_Space):
                 self._ghost_rot = (self._ghost_rot + 1) % 4
                 self._refresh_ghost_rects()

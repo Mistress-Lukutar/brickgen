@@ -3,7 +3,7 @@ File:   start_dialog.py
 Brief:  Startup welcome dialog: new project, open project, recent list.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations

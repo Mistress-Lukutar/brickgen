@@ -3,7 +3,7 @@ File:   preview.py
 Brief:  PyVista/VTK-based 3D scene preview: multi-block meshes, selection, navigation.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import QRubberBand, QWidget
 from pyvistaqt import QtInteractor
 
 from brickgen.core.models import BlockSettings
+from brickgen.gui.move_gizmo import GIZMO_LENGTH_STEPS, MoveGizmo
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,22 @@ GRID_AXIS_X_COLOR = "#d86a6a"
 GRID_AXIS_Y_COLOR = "#6abf83"
 GRID_LABEL_X_COLOR = "#cf8d8d"
 GRID_LABEL_Y_COLOR = "#8dcfa4"
+# Axis-lock guide-line colors (Z axis, blue-ish to match the muted palette).
+GRID_AXIS_Z_COLOR = "#6a86d8"
+# Guide line half-length in grid steps (lines run BOTH directions from center).
+MOVE_GUIDE_LENGTH_STEPS = 8
+# Mapping of axis names to their color strings.
+AXIS_COLORS: dict[str, str] = {
+    "x": GRID_AXIS_X_COLOR,
+    "y": GRID_AXIS_Y_COLOR,
+    "z": GRID_AXIS_Z_COLOR,
+}
+# Unit vectors for each axis (float64).
+AXIS_VECTORS: dict[str, np.ndarray] = {
+    "x": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+    "y": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+    "z": np.array([0.0, 0.0, 1.0], dtype=np.float64),
+}
 
 # Turntable navigation: the model follows the cursor - horizontal drags
 # turn it around the world Z axis, vertical drags tip it up/down. Degrees
@@ -623,9 +640,24 @@ class PreviewWidget(QtInteractor):
         self._grabbing = False
         self._grab_keyboard = False
         self._grab_moved = False
+        self._drag_from_axis = False
         self._grab_press_pos = QPoint()
         self._grab_orig: dict[int, tuple[float, float]] = {}
         self._grab_anchor: np.ndarray | None = None
+        # Axis-lock state (X/Y/Z lock movement to a single axis or plane).
+        # Move gizmo (View menu): draggable arrow cross at the selection center.
+        self._gizmo_enabled = False
+        self._gizmo: MoveGizmo | None = None
+        self._gizmo_step: float | None = None
+        # Axis-lock state (X/Y/Z lock movement to a single axis or plane).
+        self._axis_lock: str | None = None
+        self._axis_plane = False
+        self._constraint_anchor: np.ndarray | None = None
+        self._constraint_origin: np.ndarray | None = None
+        self._constraint_zero: np.ndarray | None = None
+        self._last_grab_pos: QPoint | None = None
+        self._guide_actors: list[pv.Actor] = []
+        self._guides_key: frozenset[str] | None = None
         # Keyboard grabs (G) need the viewport to take and keep focus.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.enable_anti_aliasing("msaa")  # type: ignore[call-arg]  # pyvista stub bug
@@ -707,6 +739,7 @@ class PreviewWidget(QtInteractor):
             # is False, which would yank the view on the first selection.
             self.camera_set = True
         self._refresh_grid_labels()
+        self._update_gizmo()
         # Single render for the whole batch: the actor add/remove calls run
         # with render=False (one pyvista render per actor would stall the UI
         # on large scenes), so the batch needs this explicit draw.
@@ -790,6 +823,7 @@ class PreviewWidget(QtInteractor):
         if scale > 0 and scale != self._grid_scale:
             self._grid_scale = float(scale)
             self._update_grid()
+            self._update_gizmo()
 
     def set_snap_enabled(self, enabled: bool) -> None:
         '''Enable or disable snap-to-grid for block moves (Grid menu).
@@ -802,6 +836,436 @@ class PreviewWidget(QtInteractor):
     def grid_step(self) -> float:
         '''Current grid step in mm (unit size * cell scale).'''
         return self._grid_unit * self._grid_scale
+
+    # ------------------------------------------------------- axis-lock helpers
+    def active_axes(self) -> frozenset[str]:
+        '''Axes available for movement on this widget.
+
+        The base planning/placement widgets are floor-locked (XY only); the
+        assemble tab overrides to allow Z movement too.
+
+        Returns:
+            Set of allowed axis names ('x', 'y', optionally 'z').
+        '''
+        return frozenset({"x", "y"})
+
+    def _allowed_axes(self) -> frozenset[str] | None:
+        '''Axes that are actually constrained by the current lock state.
+
+        Returns ``None`` when unconstrained (lock is off); otherwise returns
+        the intersection of ``{lock}`` (or ``active_axes() - {lock}`` in
+        plane mode) with ``active_axes()``. An empty result falls back to
+        ``None``.
+
+        Returns:
+            The allowed axes, or ``None`` when no lock is active.
+        '''
+        if self._axis_lock is None:
+            return None
+        if self._axis_plane:
+            candidate = self.active_axes() - {self._axis_lock}
+        else:
+            candidate = frozenset({self._axis_lock})
+        allowed = candidate & self.active_axes()
+        return allowed if allowed else None
+
+    def set_show_gizmo(self, enabled: bool) -> None:
+        '''Toggle the move gizmo visibility.
+
+        Args:
+            enabled: True to show the draggable arrow cross.
+        '''
+        self._gizmo_enabled = bool(enabled)
+        self._update_gizmo()
+        self.render()
+
+    def _gizmo_axis_at(self, pos: "QPoint") -> str | None:
+        '''Which gizmo axis lies under *pos*, or ``None``.
+
+        Only returns an axis when the gizmo is enabled and visible.
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+
+        Returns:
+            Axis name ('x', 'y', or 'z'), or None.
+        '''
+        if not self._gizmo_enabled or self._gizmo is None or not self._gizmo.visible():
+            return None
+        return self._gizmo.pick_axis(self, pos)
+
+    def _update_gizmo(self) -> None:
+        '''(Re)build or hide the move gizmo based on current state.
+
+        No render inside — callers render once. The gizmo is visible when
+        enabled, there is a selection, and no grab/placement is active.
+        Grid-scale changes trigger a rebuild of the arm geometry.
+        '''
+        visible = (
+            self._gizmo_enabled
+            and bool(self._selection)
+            and not self._grabbing
+            and not getattr(self, "_placing", False)
+        )
+        if not visible:
+            if self._gizmo is not None:
+                self._gizmo.set_visible(False)
+            return
+
+        step = max(self.grid_step(), 1e-9)
+        length = GIZMO_LENGTH_STEPS * step
+        if self._gizmo is None:
+            self._gizmo = MoveGizmo(
+                self.active_axes(), AXIS_COLORS, AXIS_VECTORS
+            )
+            self._gizmo.build(length)
+            self._gizmo_step = self.grid_step()
+            self._gizmo.add_actors(self)
+        elif (
+            self._gizmo_step is None
+            or abs(self.grid_step() - self._gizmo_step) > 1e-9
+        ):
+            # Grid scale changed: rebuild the arm geometry through the view.
+            self._gizmo.remove_actors(self)
+            self._gizmo.build(length)
+            self._gizmo_step = self.grid_step()
+            self._gizmo.add_actors(self)
+        self._gizmo.place(self._selection_center())
+        self._gizmo.set_visible(True)
+
+    def _set_axis_lock(self, axis: str, plane: bool) -> bool:
+        '''Toggle the move axis constraint; re-anchors the active move.
+
+        Pressing X/Y/Z (or Shift+X/Y/Z for plane mode) constrains movement
+        to that axis or to the plane perpendicular to it. Repeated presses of
+        the same key combo toggle the lock off.
+
+        Args:
+            axis: Axis name ('x', 'y', or 'z').
+            plane: True = exclude the locked axis (Shift modifier).
+
+        Returns:
+            ``True`` when the key was consumed, ``False`` otherwise.
+        '''
+        if axis not in self.active_axes():
+            return False
+        if self._axis_lock == axis and self._axis_plane == plane:
+            self._axis_lock = None
+            self._axis_plane = False
+        else:
+            self._axis_lock = axis
+            self._axis_plane = plane
+        self._reengage_constraint()
+        return True
+
+    def _reengage_constraint(self) -> None:
+        '''Reset constraint fields for lazy re-engagement on the next move.
+
+        Clears the anchor/origin/zero state so the constrained path will
+        re-engage from the current cursor position with delta=0 at engagement.
+        When currently grabbing, replays the last grab position to keep the
+        visual in sync.
+        '''
+        self._constraint_anchor = None
+        self._constraint_origin = None
+        self._constraint_zero = None
+        if self._grabbing and self._last_grab_pos is not None:
+            self._update_grab(QPoint(self._last_grab_pos))
+
+    def _selection_center(self) -> np.ndarray:
+        '''World center of the selection bounding box.
+
+        Computes the midpoint of the axis-aligned bounding box spanning all
+        selected pieces. For each selected block, the bounds are derived from
+        ``pos_x ± half_x``, ``pos_y ± half_y``, and ``pos_z`` to
+        ``pos_z + top_z`` (using ``meta.get(...)`` defaults of 0.0).
+
+        Returns:
+            ``(x, y, z)`` world-coordinate center as float64 array.
+            Empty selection returns zeros(3).
+        '''
+        if not self._selection:
+            return np.zeros(3, dtype=np.float64)
+        valid = {i for i in self._selection if 0 <= i < len(self._scene_meta)}
+        if not valid:
+            return np.zeros(3, dtype=np.float64)
+        mins = np.full(3, np.inf, dtype=np.float64)
+        maxs = np.full(3, -np.inf, dtype=np.float64)
+        for idx in valid:
+            meta = self._scene_meta[idx]
+            hx = float(meta.get('half_x', 0.0))
+            hy = float(meta.get('half_y', 0.0))
+            pz = float(meta.get('pos_z', 0.0))
+            tz = float(meta.get('top_z', 0.0))
+            mins[0] = min(mins[0], meta['pos_x'] - hx)
+            maxs[0] = max(maxs[0], meta['pos_x'] + hx)
+            mins[1] = min(mins[1], meta['pos_y'] - hy)
+            maxs[1] = max(maxs[1], meta['pos_y'] + hy)
+            mins[2] = min(mins[2], pz)
+            maxs[2] = max(maxs[2], pz + tz)
+        return (mins + maxs) / 2.0
+
+    def _update_guides(self, center: np.ndarray) -> None:
+        '''Draw thin colored guide lines along the allowed axes from *center*.
+
+        Guide lines are 2-point polylines extending ``MOVE_GUIDE_LENGTH_STEPS``
+        grid steps in both directions along each allowed axis. They are rebuilt
+        when the allowed-set changes; otherwise only repositioned.
+
+        Args:
+            center: World-coordinate anchor point for the guide lines.
+        '''
+        allowed = self._allowed_axes()
+        if not allowed:
+            # Unconstrained move: every active axis is movable, so guide all
+            # of them (call sites only run during an active move).
+            allowed = self.active_axes()
+
+        step = max(self.grid_step(), 1e-9)
+        L = MOVE_GUIDE_LENGTH_STEPS * step
+
+        if self._guides_key != allowed:
+            # Rebuild actors — clear old ones (batched, no render).
+            for actor in self._guide_actors:
+                try:
+                    self.remove_actor(actor, reset_camera=False, render=False)
+                except Exception:  # noqa: BLE001 - may be detached
+                    pass
+            self._guide_actors.clear()
+
+            for axis in sorted(allowed):
+                u = AXIS_VECTORS[axis]
+                start = -u * L
+                end = u * L
+                segments = np.array([[start, end]], dtype=np.float64)
+                points = segments.reshape(-1, 3)
+                index = np.arange(len(segments) * 2, dtype=np.int64).reshape(-1, 2)
+                lines = np.hstack([np.full((len(index), 1), 2), index]).ravel()
+                mesh = pv.PolyData(points, lines=lines)
+                actor = self.add_mesh(
+                    mesh,
+                    color=AXIS_COLORS[axis],
+                    line_width=2.0,
+                    lighting=False,
+                    pickable=False,
+                    reset_camera=False,
+                    render=False,
+                )
+                # Position at origin for now; SetPosition applied in every call.
+                self._guide_actors.append(actor)
+
+            self._guides_key = allowed
+
+        # Reposition all guide actors to the current center.
+        for actor in self._guide_actors:
+            actor.SetPosition(*center)
+
+    def _clear_guides(self) -> None:
+        '''Remove all guide-line actors and reset guide state.'''
+        for actor in self._guide_actors:
+            try:
+                self.remove_actor(actor, reset_camera=False, render=False)
+            except Exception:  # noqa: BLE001 - may be detached
+                pass
+        self._guide_actors.clear()
+        self._guides_key = None
+
+    def _cursor_ray(self, pos: QPoint) -> tuple[np.ndarray, np.ndarray] | None:
+        '''Reconstruct the cursor ray from camera through the unprojected cursor.
+
+        The ray origin is the camera position; direction is the vector from
+        origin to the focal-depth-unprojected cursor point (NOT normalized).
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+
+        Returns:
+            ``(origin, direction)`` where both are ``np.ndarray`` of shape (3,)
+            and direction is not normalized; ``None`` when no renderer/camera.
+        '''
+        renderer = self.renderer
+        camera = renderer.GetActiveCamera()
+        focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
+        renderer.SetWorldPoint(focal[0], focal[1], focal[2], 1.0)
+        renderer.WorldToDisplay()
+        depth = float(renderer.GetDisplayPoint()[2])
+        display_x, display_y = self._to_display(pos)
+        renderer.SetDisplayPoint(display_x, display_y, depth)
+        renderer.DisplayToWorld()
+        world = renderer.GetWorldPoint()
+        weight = float(world[3])
+        point = np.asarray(world[:3], dtype=np.float64)
+        if abs(weight) > 1e-12:
+            point = point / weight
+        origin = np.asarray(camera.GetPosition(), dtype=np.float64)
+        direction = point - origin
+        return (origin, direction)
+
+    def _constrained_delta(self, pos: QPoint) -> np.ndarray | None:
+        '''Return the total world delta (3-vector) for the current constraint.
+
+        Lazily engages when ``_constraint_anchor is None`` by computing the
+        anchor from the selection center and the current applied offset of
+        the primary grabbed piece. Then computes the raw cursor-to-anchor
+        delta using either single-axis or plane-mode intersection math.
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+
+        Returns:
+            The total world delta (``_constraint_zero + raw_for_cursor``) as a
+            3-vector, or ``None`` when the cursor cannot be mapped to the
+            constrained space.
+        '''
+        if self._constraint_anchor is None:
+            center = self._selection_center()
+            self._constraint_anchor = center.copy()
+            # Compute _constraint_zero from primary piece's current offset.
+            primary = (
+                self._primary if self._primary in self._grab_orig
+                else min(self._grab_orig)
+            )
+            orig = self._grab_orig[primary]
+            orig_z = float(getattr(self, '_grab_orig_z', {}).get(primary, 0.0))
+            meta = self._scene_meta[primary]
+            current_offset = np.array([
+                meta['pos_x'] - orig[0],
+                meta['pos_y'] - orig[1],
+                float(meta.get('pos_z', 0.0)) - orig_z,
+            ], dtype=np.float64)
+            self._constraint_zero = current_offset
+
+            # Compute _constraint_origin based on lock mode.
+            if self._axis_lock is not None and not self._axis_plane:
+                # Single-axis: absorb the engagement cursor's projection onto
+                # the axis line into the origin, so the first constrained
+                # frame is a no-move (the lock never jumps the selection).
+                self._constraint_origin = center.copy()
+                raw0 = self._constrained_raw_delta(pos)
+                if raw0 is not None:
+                    idx = {'x': 0, 'y': 1, 'z': 2}[str(self._axis_lock)]
+                    self._constraint_origin[idx] += float(raw0[idx])
+            else:
+                # Plane mode: origin = cursor ray intersection with the plane
+                # through the center (fallback: the center itself when the
+                # ray is too parallel to the plane).
+                lock = self._axis_lock
+                assert lock is not None  # constrained path only when locked
+                self._constraint_origin = center.copy()
+                ray = self._cursor_ray(pos)
+                if ray is not None:
+                    o, d = ray
+                    n = AXIS_VECTORS[lock]  # unit normal
+                    d_hat = d / max(float(np.linalg.norm(d)), 1e-12)
+                    denom = float(np.dot(d_hat, n))
+                    if abs(denom) >= _FLOOR_RAY_MIN_SIN:
+                        t = float(np.dot(self._constraint_anchor - o, n) / denom)
+                        if t > 0.0:
+                            self._constraint_origin = o + d * t
+
+        raw = self._constrained_raw_delta(pos)
+        if raw is None:
+            return None
+        return self._constraint_zero + raw
+
+    def _constrained_raw_delta(self, pos: QPoint) -> np.ndarray | None:
+        '''Pure cursor math for constrained delta (no state mutation).
+
+        Computes the raw displacement from ``_constraint_origin`` to the
+        closest point on the cursor ray relative to the anchor.
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+
+        Returns:
+            Raw 3-vector delta, or ``None`` when the ray is too parallel.
+        '''
+        lock = self._axis_lock
+        assert lock is not None  # _constrained_raw_delta called only when locked
+        u = AXIS_VECTORS[lock]
+        ray = self._cursor_ray(pos)
+        if ray is None:
+            return None
+        o, d = ray
+
+        anchor = self._constraint_anchor
+        assert anchor is not None  # lazily engaged before this call
+        origin = self._constraint_origin
+        assert origin is not None  # set during lazy engagement
+
+        if not self._axis_plane:
+            # Single-axis mode: closest point of cursor ray to the line (anchor, u).
+            w = anchor - o
+            uu = float(np.dot(u, u))  # =1.0 for unit vectors but keep generic
+            du = float(np.dot(d, u))
+            ddot = float(np.dot(d, d))
+            denom = ddot * uu - du * du
+            if denom < 1e-12:
+                return None
+            # Guard against ray nearly parallel to the line.
+            norm_d = float(np.linalg.norm(d))
+            if abs(du) / (norm_d * max(float(np.linalg.norm(u)), 1e-12)) > (1 - 1e-3):
+                return None
+            t_ray = ((float(np.dot(w, d)) * uu) - (float(np.dot(w, u)) * du)) / denom
+            if t_ray <= 0.0:
+                return None
+            # Line parameter s (mm from the anchor along u): b*e - c*d0 over
+            # the denominator with a = u*u, b = u*d, c = d*d, d0 = u*w,
+            # e = d*w — same numerator order as t_ray, NOT mirrored.
+            s = ((float(np.dot(w, d)) * du) - (float(np.dot(w, u)) * ddot)) / denom
+
+            # The line runs anchor + s*u, so *s* is a parameter in mm from
+            # the anchor; the zero reference is the origin's own offset from
+            # the anchor along the axis (captured at engagement). raw = 0
+            # when the cursor sits exactly where the lock engaged.
+            lock_idx = {'x': 0, 'y': 1, 'z': 2}[lock]
+            origin_offset = float(origin[lock_idx]) - float(anchor[lock_idx])
+            coord = s - origin_offset
+
+            raw = np.zeros(3, dtype=np.float64)
+            raw[lock_idx] = coord
+            return raw
+        else:
+            # Plane mode: intersect cursor ray with plane through anchor.
+            n = AXIS_VECTORS[lock]  # unit normal
+            d_hat = d / max(float(np.linalg.norm(d)), 1e-12)
+            denom = float(np.dot(d_hat, n))
+            if abs(denom) < _FLOOR_RAY_MIN_SIN:
+                return None
+            t = float(np.dot(anchor - o, n) / denom)
+            if t <= 0.0:
+                return None
+            point = o + d * t
+            raw = point - origin
+            return raw
+
+    def _clamp_move_dz(self, dz: float) -> float:
+        '''Clamp the Z component of a constrained drag delta.
+
+        Base implementation returns ``dz`` unchanged; subclasses may override
+        to enforce additional bounds (e.g. AssembleView clamps to the lowest
+        grabbed piece's original height).
+
+        Args:
+            dz: The Z delta from constrained math.
+
+        Returns:
+            Clamped Z delta.
+        '''
+        return dz
+
+    def _retained_move_dz(self) -> float:
+        '''Z offset kept when the active constraint excludes the Z axis.
+
+        The base widgets are floor-locked, so nothing to retain.
+        AssembleView overrides this to hold the drag's accumulated Z offset
+        (e.g. Shift+Z plane moves keep the current height instead of
+        dropping the piece back to its drag-start height).
+
+        Returns:
+            The Z offset (mm) to keep applying while Z is constrained out.
+        '''
+        return 0.0
 
     def _snap_move_target(
         self, x: float, y: float, hx: float = 0.0, hy: float = 0.0
@@ -1337,6 +1801,7 @@ class PreviewWidget(QtInteractor):
                 float(position.get('pos_z', 0.0)),
             )
             self._outline_actors[index] = actor
+        self._update_gizmo()
         self.render()
 
     def _drop_outline(self, index: int) -> None:
@@ -1368,6 +1833,7 @@ class PreviewWidget(QtInteractor):
         self._grabbing = True
         self._grab_keyboard = False
         self._grab_moved = False
+        self._drag_from_axis = False
         self._grab_press_pos = QPoint(pos)
         self._grab_orig = {
             index: (
@@ -1378,6 +1844,13 @@ class PreviewWidget(QtInteractor):
             if 0 <= index < len(self._scene_meta)
         }
         self._grab_anchor = None
+        # Reset axis-lock state for a fresh move.
+        self._axis_lock = None
+        self._axis_plane = False
+        self._constraint_anchor = None
+        self._constraint_origin = None
+        self._constraint_zero = None
+        self._last_grab_pos = None
         self._update_grab(pos)
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
         return True
@@ -1400,6 +1873,7 @@ class PreviewWidget(QtInteractor):
         self._grabbing = True
         self._grab_keyboard = True
         self._grab_moved = False
+        self._drag_from_axis = False
         self._grab_press_pos = QPoint()
         self._grab_orig = {
             index: (
@@ -1410,6 +1884,13 @@ class PreviewWidget(QtInteractor):
             if 0 <= index < len(self._scene_meta)
         }
         self._grab_anchor = None
+        # Reset axis-lock state for a fresh move.
+        self._axis_lock = None
+        self._axis_plane = False
+        self._constraint_anchor = None
+        self._constraint_origin = None
+        self._constraint_zero = None
+        self._last_grab_pos = None
         self._update_grab(self.mapFromGlobal(QCursor.pos()) if pos is None else pos)
         if QWidget.mouseGrabber() is not self:
             self.grabMouse()  # keep receiving moves outside the viewport
@@ -1417,8 +1898,16 @@ class PreviewWidget(QtInteractor):
         return True
 
     def _update_grab(self, pos: QPoint) -> None:
-        '''Move the selection with the cursor; snap to the grid when enabled.'''
+        '''Move the selection with the cursor; snap to the grid when enabled.
+
+        When an axis lock is active (X/Y/Z key), delegates to the constrained
+        path; otherwise uses the original free-plane floor intersection.
+        '''
         if not self._grabbing or not self._grab_orig:
+            return
+        self._last_grab_pos = QPoint(pos)
+        if self._axis_lock is not None:
+            self._update_grab_constrained(pos)
             return
         world = self._cursor_on_floor(pos)
         if world is None:
@@ -1444,6 +1933,53 @@ class PreviewWidget(QtInteractor):
         if dx != 0.0 or dy != 0.0:
             self._grab_moved = True
         self._apply_move(self._grab_orig, dx, dy)
+        self._update_guides(self._selection_center())
+
+    def _update_grab_constrained(self, pos: QPoint) -> None:
+        '''Constrained-path move: delta computed via axis-lock intersection.
+
+        Uses ``_constrained_delta`` to compute the total world displacement,
+        then applies grid snapping and calls ``_apply_move`` with the result.
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+        '''
+        delta = self._constrained_delta(pos)
+        if delta is None:
+            return
+        primary = (
+            self._primary if self._primary in self._grab_orig else min(self._grab_orig)
+        )
+        original_x, original_y = self._grab_orig[primary]
+        allowed = self._allowed_axes()
+        assert allowed is not None  # constrained path only when lock is set
+        target_x = original_x + float(delta[0]) if "x" in allowed else original_x
+        target_y = original_y + float(delta[1]) if "y" in allowed else original_y
+        dz = float(delta[2]) if "z" in allowed else self._retained_move_dz()
+
+        dz = self._clamp_move_dz(dz)
+
+        if self._grid_snap:
+            step = max(self.grid_step(), 1e-9)
+            meta = self._scene_meta[primary]
+            hx = float(meta.get('half_x', 0.0))
+            hy = float(meta.get('half_y', 0.0))
+            if "x" in allowed:
+                target_x = round((target_x - hx) / step) * step + hx
+            if "y" in allowed:
+                target_y = round((target_y - hy) / step) * step + hy
+            if "z" in allowed:
+                dz = round(dz / step) * step
+
+        # Check if we actually moved compared to current meta position.
+        dx = target_x - original_x
+        dy = target_y - original_y
+        moved_z = abs(dz - float(self._scene_meta[primary].get('pos_z', 0.0))) > 1e-9
+        if dx != 0.0 or dy != 0.0 or moved_z:
+            self._grab_moved = True
+
+        self._update_guides(self._selection_center())
+        self._apply_move(self._grab_orig, dx, dy, dz=dz)
 
     def confirm_grab(self) -> None:
         '''Finish the grab move and commit the new positions.'''
@@ -1481,6 +2017,7 @@ class PreviewWidget(QtInteractor):
             event.position().toPoint() - self._grab_press_pos
         ).manhattanLength() > RUBBER_BAND_THRESHOLD_PX
         moved = self._grab_moved
+        from_axis = self._drag_from_axis
         self._end_grab()
         if moved and dragged:
             positions = {
@@ -1498,13 +2035,26 @@ class PreviewWidget(QtInteractor):
             self._apply_move(self._grab_orig, 0.0, 0.0, restore=True)
         self._grab_orig.clear()
         self._grab_anchor = None
-        self._finish_click(event)
+        if not from_axis:
+            self._finish_click(event)
 
     def _end_grab(self) -> None:
-        '''Leave the move drag: drop the mouse grab and the drag cursor.'''
+        '''Leave the move drag: drop the mouse grab and the drag cursor.
+
+        Also clears guide lines and resets all axis-lock state.
+        '''
         self._grabbing = False
         self._grab_keyboard = False
         self._grab_moved = False
+        self._drag_from_axis = False
+        self._clear_guides()
+        self._axis_lock = None
+        self._axis_plane = False
+        self._constraint_anchor = None
+        self._constraint_origin = None
+        self._constraint_zero = None
+        self._last_grab_pos = None
+        self._update_gizmo()
         if QWidget.mouseGrabber() is self:
             self.releaseMouse()
         self.unsetCursor()
@@ -1516,6 +2066,7 @@ class PreviewWidget(QtInteractor):
         dx: float,
         dy: float,
         restore: bool = False,
+        dz: float = 0.0,
     ) -> None:
         '''Shift (or restore) the moved blocks and their decorations.
 
@@ -1525,6 +2076,9 @@ class PreviewWidget(QtInteractor):
             dy: Delta applied to every Y coordinate.
             restore: True writes the original coordinates back verbatim
                 (the deltas are ignored).
+            dz: Z delta applied on the non-restore path. Planning blocks
+                start at z=0 and never lift — this is a no-op on the planning
+                tab; does NOT read-modify meta z.
         '''
         for index, (original_x, original_y) in originals.items():
             if not 0 <= index < len(self._scene_meta):
@@ -1534,6 +2088,7 @@ class PreviewWidget(QtInteractor):
                 x, y = original_x, original_y
             else:
                 x, y = original_x + dx, original_y + dy
+                self._scene_meta[index]['pos_z'] = dz
             self._scene_meta[index]['pos_x'] = x
             self._scene_meta[index]['pos_y'] = y
             self._position_actor(index, x, y)
@@ -1563,22 +2118,10 @@ class PreviewWidget(QtInteractor):
             the plane (side views would translate pixel deltas into huge
             distances) or points away from it.
         '''
-        renderer = self.renderer
-        camera = renderer.GetActiveCamera()
-        focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
-        renderer.SetWorldPoint(focal[0], focal[1], focal[2], 1.0)
-        renderer.WorldToDisplay()
-        depth = float(renderer.GetDisplayPoint()[2])
-        display_x, display_y = self._to_display(pos)
-        renderer.SetDisplayPoint(display_x, display_y, depth)
-        renderer.DisplayToWorld()
-        world = renderer.GetWorldPoint()
-        weight = float(world[3])
-        point = np.asarray(world[:3], dtype=np.float64)
-        if abs(weight) > 1e-12:
-            point = point / weight
-        origin = np.asarray(camera.GetPosition(), dtype=np.float64)
-        direction = point - origin
+        ray = self._cursor_ray(pos)
+        if ray is None:
+            return None
+        origin, direction = ray
         length = float(np.linalg.norm(direction))
         if length < 1e-9 or abs(direction[2]) < _FLOOR_RAY_MIN_SIN * length:
             return None
@@ -1697,6 +2240,22 @@ class PreviewWidget(QtInteractor):
             event.accept()  # a move drag is already running on the LMB
             return
         if button == Qt.MouseButton.LeftButton:
+            # Grab an axis arrow to start an axis-constrained move of the
+            # current selection through the same machinery as X/Y/Z keys.
+            axis = self._gizmo_axis_at(pos)
+            if axis is not None:
+                self.setFocus()
+                self.start_move_drag(pos)
+                if self._grabbing:
+                    self._drag_from_axis = True
+                    self._axis_lock = axis
+                    self._axis_plane = False
+                    self._constraint_anchor = None
+                    self._constraint_origin = None
+                    self._constraint_zero = None
+                    self._update_grab(pos)
+                event.accept()
+                return
             self.setFocus()
             hit = self._pick_scene(pos)
             if (
@@ -1795,9 +2354,22 @@ class PreviewWidget(QtInteractor):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt naming
         '''G starts the grab move; Enter confirms and Esc cancels an active
-        move. Every other key falls through to the VTK interactor.'''
+        move. X/Y/Z lock movement to a single axis (or Shift+X/Y/Z for plane
+        constraint) during a move drag. Every other key falls through to the
+        VTK interactor.'''
         key = event.key()
         if self._grabbing:
+            lock_map: dict[int, str] = {
+                Qt.Key.Key_X: "x",
+                Qt.Key.Key_Y: "y",
+                Qt.Key.Key_Z: "z",
+            }
+            if key in lock_map and self._set_axis_lock(
+                lock_map[key],
+                bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+            ):
+                event.accept()
+                return
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self.confirm_grab()
                 event.accept()

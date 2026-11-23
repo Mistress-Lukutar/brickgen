@@ -3,7 +3,7 @@ File:   test_bottom_chamfer.py
 Brief:  Unit tests for bottom-chamfered cells (sloped underside wedges).
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations

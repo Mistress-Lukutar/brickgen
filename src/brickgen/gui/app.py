@@ -3,7 +3,7 @@ File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations
@@ -320,6 +320,10 @@ class MainWindow(QMainWindow):
         # Refresh "Show grid" checked state from the active preview.
         self._refresh_grid_action_state()
 
+        # When entering the planning tab: push shared view settings.
+        if index == 0:
+            self._preview.set_show_gizmo(self._project.view.show_gizmo)
+
         # When entering the assemble tab: push the view settings and sync.
         if index == 1:
             self._assemble_view.set_grid_unit(self._project.settings.unit_size)
@@ -337,6 +341,7 @@ class MainWindow(QMainWindow):
                 self._project.assemble.view.snap_to_grid,
                 self._project.assemble.view.snap_to_parts,
             )
+            self._assemble_view.set_show_gizmo(self._project.view.show_gizmo)
             self._sync_assemble()
 
         # When entering the placement tab: push shared settings into the
@@ -353,6 +358,7 @@ class MainWindow(QMainWindow):
                 self._project.view.placement_grid_enabled
             )
             self._placement_view.set_print_beds(self._project.print_layout.beds)
+            self._placement_view.set_show_gizmo(self._project.view.show_gizmo)
             self._sync_placement()
 
     def _refresh_grid_action_state(self) -> None:
@@ -507,6 +513,16 @@ class MainWindow(QMainWindow):
             position_group.addAction(act_pos)
             position_menu.addAction(act_pos)
             self._act_qty_positions[position] = act_pos
+
+        self._act_show_gizmo = QAction("Show move &gizmo", self)
+        self._act_show_gizmo.setCheckable(True)
+        self._act_show_gizmo.setChecked(self._project.view.show_gizmo)
+        self._act_show_gizmo.setToolTip(
+            "Arrow cross to drag the selection along the world axes "
+            "(X/Y/Z keys constrain a move)."
+        )
+        self._act_show_gizmo.toggled.connect(self._on_view_gizmo)
+        view_menu.addAction(self._act_show_gizmo)
 
         grid_menu = self.menuBar().addMenu("&Grid")
         self._act_show_grid = QAction("Show &grid", self)
@@ -2357,6 +2373,9 @@ class MainWindow(QMainWindow):
         self._placement_view.set_grid_scale(view.grid_scale)
         self._placement_view.set_snap_enabled(view.grid_snap)
         self._placement_view.set_grid_enabled(view.placement_grid_enabled)
+        self._preview.set_show_gizmo(view.show_gizmo)
+        self._placement_view.set_show_gizmo(view.show_gizmo)
+        self._assemble_view.set_show_gizmo(view.show_gizmo)
         self._refresh_view_actions()
 
     def _refresh_view_actions(self) -> None:
@@ -2370,6 +2389,7 @@ class MainWindow(QMainWindow):
             self._act_show_grid,
             self._act_snap,
             self._act_qty_labels,
+            self._act_show_gizmo,
             *self._act_grid_scale.values(),
             *self._act_qty_positions.values(),
         ]
@@ -2379,6 +2399,7 @@ class MainWindow(QMainWindow):
             self._act_show_grid.setChecked(view.grid_enabled)
             self._act_snap.setChecked(view.grid_snap)
             self._act_qty_labels.setChecked(view.quantity_labels_enabled)
+            self._act_show_gizmo.setChecked(view.show_gizmo)
             for scale, action in self._act_grid_scale.items():
                 action.setChecked(scale == view.grid_scale)
             for position, action in self._act_qty_positions.items():
@@ -2398,6 +2419,12 @@ class MainWindow(QMainWindow):
             self._project.view.placement_grid_enabled = checked
         self._mark_dirty()
         self._active_preview().set_grid_enabled(checked)
+
+    def _on_view_gizmo(self, checked: bool) -> None:
+        '''Toggle the move gizmo shared flag (stored in project view).'''
+        self._project.view.show_gizmo = checked
+        self._mark_dirty()
+        self._active_preview().set_show_gizmo(checked)
 
     def _on_grid_scale(self, scale: float) -> None:
         '''Set the grid cell scale factor (stored per project, all previews).'''

@@ -3,7 +3,7 @@ File:   assemble_service.py
 Brief:  Pure Assemble-tab domain logic: part grouping, counts, snap and stacking.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations

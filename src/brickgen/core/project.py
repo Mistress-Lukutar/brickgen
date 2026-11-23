@@ -3,7 +3,7 @@ File:   project.py
 Brief:  Project and placed-block models for the multi-block GUI scene.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations
@@ -597,6 +597,12 @@ class AssembleViewSettings(BaseModel):
             "sides of nearby pieces."
         ),
     )
+    show_gizmo: bool = Field(
+        default=True,
+        description=(
+            "Show the move gizmo (draggable axis arrows) in the assemble viewport."
+        ),
+    )
 
 
 class AssembleState(BaseModel):
@@ -649,6 +655,13 @@ class ViewSettings(BaseModel):
     placement_grid_enabled: bool = Field(
         default=False,
         description="Show the floor grid on the print-placement viewport.",
+    )
+    show_gizmo: bool = Field(
+        default=True,
+        description=(
+            "Show the move gizmo (draggable axis arrows) in the planning and "
+            "print-placement viewports."
+        ),
     )
     quantity_labels_enabled: bool = Field(
         default=False,

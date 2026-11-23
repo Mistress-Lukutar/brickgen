@@ -3,7 +3,7 @@ File:   test_assemble_gui.py
 Brief:  Integration tests for the Assemble tab (MainWindow level).
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations
@@ -14,9 +14,10 @@ from collections.abc import Iterator
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
+import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QKeyEvent, QWheelEvent  # noqa: E402
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
@@ -646,32 +647,21 @@ def test_ghost_blocked_drop_refused(window: MainWindow) -> None:
     _reset(window)
 
 
-def test_ghost_wheel_steps_working_plane(window: MainWindow) -> None:
-    '''Wheel steps the working plane during placement; clamped at 0.'''
+def test_ghost_wheel_zooms_without_stepping_height(window: MainWindow) -> None:
+    '''Wheel no longer steps the ghost height: it zooms natively; z stays.'''
     _reset(window)
     window._tabs.setCurrentIndex(1)
     _wait_meshes(window)
-
     view = window._assemble_view
     uid = window._project.blocks[0].uid
     window._on_parts_place_requested(uid)
     assert view.placing() is True
-
-    step = view.grid_step()
-    # Scroll up (positive delta) → height increases.
+    _ = view.grid_step()  # verify grid_step accessible during placement
     ev = _wheel(view, 120)
-    assert view._ghost_z == pytest.approx(step)
-    assert ev.isAccepted()
-
-    # Scroll down (negative delta) → height decreases back.
-    ev = _wheel(view, -120)
-    assert view._ghost_z == pytest.approx(0.0)
-
-    # Extra scroll down stays at 0 (clamped).
-    ev = _wheel(view, -120)
     assert view._ghost_z == pytest.approx(0.0)
     assert ev.isAccepted()
-
+    ev = _wheel(view, -120)
+    assert view._ghost_z == pytest.approx(0.0)
     view.cancel_placement()
     _reset(window)
 
@@ -934,3 +924,490 @@ def test_del_action_gated_to_planning(window: MainWindow) -> None:
     window._tabs.setCurrentIndex(0)
     assert window._act_remove_blocks.isEnabled()
     _reset(window)
+
+
+# ---------------------------------------------------------------- axis-lock
+
+def _hover_move(widget: QWidget, pos: QPoint) -> None:
+    '''A plain mouse-move event (no buttons held) at *pos*.'''
+    move = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(pos),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, move)
+
+
+def _assemble_stub_ray(view, target_x: float, target_y: float, target_z: float = 2.5):
+    '''Monkeypatch ``view._cursor_ray`` for deterministic ray targeting *target*.
+
+    The camera origin is offset sideways so rays never run parallel to the
+    Z axis line (the single-axis closest-point guard would reject them).
+    '''
+    origin = np.array([150.0, 120.0, 400.0], dtype=np.float64)
+    target = np.array([target_x, target_y, target_z], dtype=np.float64)
+    direction = target - origin
+    view._cursor_ray = lambda pos=None: (origin, direction)
+
+
+# ------------------------------------------------------------------ Z lock lift
+
+def test_drag_z_lock_lifts_piece(window: MainWindow) -> None:
+    '''Z-axis lock during a grab lifts the piece along world-Z.'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+    _place(window, z=0.0)
+
+    view = window._assemble_view
+    view.set_selection({0}, 0)
+    assert view.start_grab()
+    view._begin_piece_drag()
+
+    # Engage the lock with a near-anchor ray (absorbs into the origin).
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("z", False)
+    assert view._axis_lock == "z"
+    _hover_move(view, QPoint(200, 150))
+
+    # Retarget the ray high above: constrained delta lifts z only.
+    _assemble_stub_ray(view, 10.0, 5.0, 100.0)
+    _hover_move(view, QPoint(200, 150))
+    meta = view._scene_meta[0]
+    assert meta['pos_z'] > 0.5
+    # X/Y unchanged in Z-lock mode.
+    assert meta['pos_x'] == pytest.approx(0.0, abs=1e-6)
+    assert meta['pos_y'] == pytest.approx(0.0, abs=1e-6)
+
+    view.cancel_grab()
+    _reset(window)
+
+
+# ------------------------------------------------------------- Z clamp floor
+
+def test_drag_z_lock_clamps_at_floor(window: MainWindow) -> None:
+    '''Z-lock drag below z=0 clamps the piece at the floor.'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+    _place(window, z=0.0)
+
+    view = window._assemble_view
+    view.set_selection({0}, 0)
+    assert view.start_grab()
+    view._begin_piece_drag()
+
+    # Engage the lock with a near-anchor ray first.
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("z", False)
+    assert view._axis_lock == "z"
+    _hover_move(view, QPoint(200, 150))
+
+    # Retarget the ray well below floor (z negative): clamped at z=0.
+    _assemble_stub_ray(view, 10.0, 5.0, -50.0)
+    _hover_move(view, QPoint(200, 150))
+    meta = view._scene_meta[0]
+    # pos_z clamped >= 0.
+    assert meta['pos_z'] >= 0.0
+    # X/Y unchanged.
+    assert meta['pos_x'] == pytest.approx(0.0, abs=1e-6)
+
+    view.cancel_grab()
+    _reset(window)
+
+
+# -------------------------------------------------------- plane lock XY
+
+def test_shift_z_lock_moves_xy_not_z(window: MainWindow) -> None:
+    '''Shift+Z (plane mode) excludes Z; only X/Y change.'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+    _place(window, z=5.0)  # start at non-zero height
+
+    view = window._assemble_view
+    view.set_selection({0}, 0)
+    assert view.start_grab()
+    view._begin_piece_drag()
+
+    # Engage the plane lock with a near-anchor ray first.
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("z", True)
+    assert view._axis_lock == "z"
+    assert view._axis_plane is True
+    _hover_move(view, QPoint(200, 150))
+
+    # Retarget the ray offset in all axes: X/Y move, Z stays frozen.
+    _assemble_stub_ray(view, 10.0, 15.0, 80.0)
+    _hover_move(view, QPoint(200, 150))
+    meta = view._scene_meta[0]
+    # Z unchanged (locked axis excluded).
+    assert meta['pos_z'] == pytest.approx(5.0, abs=1e-6)
+    # X/Y moved.
+    assert meta['pos_x'] != pytest.approx(0.0, abs=1e-9)
+    assert meta['pos_y'] != pytest.approx(0.0, abs=1e-9)
+
+    view.cancel_grab()
+    _reset(window)
+
+
+# ------------------------------------------------------- ghost Z lock snap
+
+def test_ghost_z_lock_constrains_and_snaps_corner(window: MainWindow) -> None:
+    '''During placement, Z-lock constrains ghost to Z with plain corner snapping.'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    view = window._assemble_view
+    uid = window._project.blocks[0].uid
+    window._on_parts_place_requested(uid)
+    assert view.placing() is True
+
+    # Engage the lock with a near-anchor ray first (absorbed at engagement).
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("z", False)
+    assert view._axis_lock == "z"
+    _hover_move(view, QPoint(200, 150))
+
+    # Retarget the ray at z=20: ghost z follows, X/Y stay at the anchor.
+    _assemble_stub_ray(view, 10.0, 5.0, 20.0)
+    _hover_move(view, QPoint(200, 150))
+    assert view._ghost_pos is not None
+    gx, gy, gz = view._ghost_pos
+    # Ghost z moved up (from 0 toward the ray target).
+    assert gz > 0.5
+    # X/Y unchanged (locked axis excluded).
+    assert gx == pytest.approx(0.0, abs=1e-6)
+    assert gy == pytest.approx(0.0, abs=1e-6)
+
+    # Unlock Z: placement should still be active.
+    view._set_axis_lock("z", False)
+    assert view._axis_lock is None
+    assert view.placing() is True
+    assert view._ghost_actor is not None
+
+    view.cancel_placement()
+    _reset(window)
+
+
+# ----------------------------------------------------- plane lock YZ
+
+def test_ghost_plane_lock_x_moves_yz(window: MainWindow) -> None:
+    '''During placement, Shift+X (plane mode) locks X; ghost moves in Y/Z.'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    view = window._assemble_view
+    uid = window._project.blocks[0].uid
+    window._on_parts_place_requested(uid)
+    assert view.placing() is True
+
+    # Engage the plane lock with a near-anchor ray first.
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("x", True)
+    assert view._axis_lock == "x"
+    assert view._axis_plane is True
+    _hover_move(view, QPoint(200, 150))
+
+    # Retarget the ray offset in all axes: X frozen, Y/Z move.
+    _assemble_stub_ray(view, 10.0, 15.0, 30.0)
+    _hover_move(view, QPoint(200, 150))
+    assert view._ghost_pos is not None
+    gx, gy, gz = view._ghost_pos
+    # X frozen at anchor.
+    assert gx == pytest.approx(0.0, abs=1e-6)
+    # Y/Z moved.
+    assert gy != pytest.approx(0.0, abs=1e-9) or gz != pytest.approx(0.0, abs=1e-9)
+
+    view.cancel_placement()
+    _reset(window)
+
+
+# ------------------------------------------------------- gizmo has Z axis
+
+def test_assemble_gizmo_has_z_axis(window: MainWindow) -> None:
+    '''Assemble gizmo exposes X, Y and Z axes (planning is XY only).'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    view = window._assemble_view
+    # Enable the gizmo.
+    view.set_show_gizmo(True)
+    # Select a piece so the gizmo becomes visible.
+    _place(window)
+    view.set_selection({0}, 0)
+    view._update_gizmo()
+
+    assert view._gizmo is not None
+    # The gizmo's internal axis list should contain z.
+    assert "z" in view._gizmo._axes
+    assert "x" in view._gizmo._axes
+    assert "y" in view._gizmo._axes
+
+    _reset(window)
+
+
+# ----------------------------------------------------- planning gizmo XY only
+
+def test_planning_preview_gizmo_xy_only(window: MainWindow) -> None:
+    '''Planning tab PreviewWidget gizmo has only X and Y axes (no Z).'''
+    window._tabs.setCurrentIndex(0)
+    _reset(window)
+
+    view = window._preview
+    view.set_show_gizmo(True)
+    # Select the block so gizmo becomes visible.
+    view.set_selection({0}, 0)
+    view._update_gizmo()
+
+    assert view._gizmo is not None
+    axes_list = view._gizmo._axes
+    assert "x" in axes_list
+    assert "y" in axes_list
+    assert "z" not in axes_list
+
+
+# ---------------------------------------------------------------- click/release drag
+
+
+def test_click_piece_release_ends_drag(window: MainWindow) -> None:
+    '''A plain click on a piece must not leave the move-drag state lingering.
+
+    Regression: pressing LMB on a piece starts a grab; releasing without
+    movement must call ``_finish_click`` which clears ``_grabbing`` and
+    keeps the selection alive (the old code left ``_grabbing`` True).
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    # Place one piece at z=0.
+    _place(window, z=0.0)
+
+    view = window._assemble_view
+    # Stub the pickers so a click lands on block 0 and no gizmo axis.
+    view._pick_scene = lambda pos: ("block", 0)  # type: ignore[method-assign]
+    view._gizmo_axis_at = lambda pos: None  # type: ignore[method-assign]
+
+    # Press + release at the same QPoint (plain click).
+    pt = QPoint(100, 100)
+    press = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPointF(pt),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        QPointF(pt),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(view, press)
+    QApplication.processEvents()
+    QApplication.sendEvent(view, release)
+    QApplication.processEvents()
+
+    # After release: grab ended, selection kept.
+    assert view._grabbing is False
+    assert view._selection == {0}
+    # Cursor was released (WA_SetCursor cleared by unsetCursor).
+    assert not view.testAttribute(Qt.WidgetAttribute.WA_SetCursor)
+
+    _reset(window)
+
+
+def test_axis_click_release_keeps_selection(window: MainWindow) -> None:
+    '''Clicking a gizmo arrow and releasing without movement keeps selection.
+
+    When the gizmo axis is hit, ``mousePressEvent`` calls ``start_move_drag``
+    which sets ``_grabbing = True``. On release, if no real move happened,
+    the selection must NOT be cleared (the old code called ``_select_clear``).
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    _place(window, z=0.0)
+
+    view = window._assemble_view
+    # Select the piece first so it has a selection before the gizmo click.
+    view.set_selection({0}, 0)
+
+    # Stub: arrow pixel beyond any block → axis hit, not block pick.
+    view._gizmo_axis_at = lambda pos: "x"  # type: ignore[method-assign]
+    view._pick_scene = lambda pos: None  # type: ignore[method-assign]
+
+    pt = QPoint(100, 100)
+    press = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPointF(pt),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        QPointF(pt),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(view, press)
+    QApplication.processEvents()
+    QApplication.sendEvent(view, release)
+    QApplication.processEvents()
+
+    assert view._grabbing is False
+    assert view._selection == {0}
+
+    _reset(window)
+
+
+# ---------------------------------------------------------------- Z lock lift
+
+
+def test_z_lock_engagement_keeps_lifted_height(window: MainWindow) -> None:
+    '''A lifted piece must NOT jump when the Z lock engages.
+
+    Regression: ``_set_axis_lock("z", False)`` during a grab used to
+    re-resolve the piece height from a fresh ray, dropping a piece that
+    was sitting at z=10 back to z=0. The fix sets the constraint origin
+    so the first constrained update is a no-move (zero delta).
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    # Place a piece at z=10 (non-zero height).
+    _place(window, z=10.0)
+
+    view = window._assemble_view
+    view.set_selection({0}, 0)
+    assert view.start_grab()
+    # Do NOT call _begin_piece_drag manually (that was masking the bug).
+    assert view._grab_orig_z == {0: 10.0}
+
+    # Engage Z lock with a near-anchor ray (absorbed into origin).
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("z", False)
+    _hover_move(view, QPoint(200, 150))
+
+    # Engagement is a no-move: height stays at ~10.0.
+    assert view._scene_meta[0]["pos_z"] == pytest.approx(10.0, abs=1e-6)
+
+    # Lift via a high ray target: piece follows the Z delta.
+    _assemble_stub_ray(view, 10.0, 5.0, 60.0)
+    _hover_move(view, QPoint(200, 150))
+    lifted = view._scene_meta[0]["pos_z"]
+    assert lifted > 10.5  # should have risen above the starting z=10
+
+    # Retarget the ray even higher: continue lifting smoothly along Z.
+    _assemble_stub_ray(view, 10.0, 5.0, 200.0)
+    _hover_move(view, QPoint(200, 150))
+    meta = view._scene_meta[0]
+    # The piece should lift significantly above its starting height of 10.0.
+    assert meta["pos_z"] > 50
+
+    view.cancel_grab()
+    _reset(window)
+
+
+def test_plane_z_lock_keeps_height(window: MainWindow) -> None:
+    '''Shift+Z (plane mode) keeps the height gained earlier in the same drag.
+
+    In plane-lock mode, the constraint origin is set at the ray-plane
+    intersection through the anchor, so the first constrained update
+    retains the current Z offset (the "lifted" height).
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    # Place a piece at z=10.
+    _place(window, z=10.0)
+
+    view = window._assemble_view
+    view.set_selection({0}, 0)
+    assert view.start_grab()
+
+    # Engage Z lock (single-axis) with near-anchor ray.
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("z", False)
+    _hover_move(view, QPoint(200, 150))
+
+    # Lift via a high ray target: piece follows the Z delta.
+    _assemble_stub_ray(view, 10.0, 5.0, 60.0)
+    _hover_move(view, QPoint(200, 150))
+    lifted = view._scene_meta[0]["pos_z"]
+    assert lifted > 10.5  # should have risen above the starting z=10
+
+    # Switch to plane mode (Shift+Z).
+    view._set_axis_lock("z", True)
+    assert view._axis_plane is True
+
+    # Retarget a ray offset in XY: height retained, XY moves.
+    _assemble_stub_ray(view, 40.0, 30.0)
+    _hover_move(view, QPoint(200, 150))
+    meta = view._scene_meta[0]
+    assert meta["pos_z"] == pytest.approx(lifted, abs=1e-6)
+    # X/Y should have changed from the original (0, 0).
+    assert meta["pos_x"] != pytest.approx(0.0, abs=1e-6)
+    assert meta["pos_y"] != pytest.approx(0.0, abs=1e-6)
+
+    view.cancel_grab()
+    _reset(window)
+
+
+# --------------------------------------------------------- shared gizmo flag
+
+
+def test_gizmo_toggle_shared_across_tabs(window: MainWindow) -> None:
+    '''The View-menu gizmo action controls one shared flag for all tabs.
+
+    Toggling ``_act_show_gizmo`` must update ``project.view.show_gizmo``
+    AND every preview widget's ``_gizmo_enabled``, regardless of which tab
+    is currently active.
+    '''
+    _reset(window)
+    # Start with gizmo enabled at the project level.
+    window._project.view.show_gizmo = True
+    window._apply_view_settings()
+
+    # --- On assemble tab: toggle off ---
+    window._tabs.setCurrentIndex(1)
+    window._act_show_gizmo.setChecked(False)
+    QApplication.processEvents()
+
+    assert window._assemble_view._gizmo_enabled is False
+    assert window._project.view.show_gizmo is False
+    # Legacy per-project field untouched (the shared flag lives in view).
+    assert window._project.assemble.view.show_gizmo is True
+
+    # --- Switch to planning tab: gizmo stays off ---
+    window._tabs.setCurrentIndex(0)
+    QApplication.processEvents()
+    assert window._act_show_gizmo.isChecked() is False
+    assert window._preview._gizmo_enabled is False
+
+    # --- Switch back to assemble: still disabled ---
+    window._tabs.setCurrentIndex(1)
+    QApplication.processEvents()
+    assert window._assemble_view._gizmo_enabled is False
+
+    # --- Re-enable via action: all previews follow ---
+    window._act_show_gizmo.setChecked(True)
+    QApplication.processEvents()
+    assert window._assemble_view._gizmo_enabled is True
+
+    window._dirty = False
+
+
+# ------------------------------------------------------------------ gizmo visibility

@@ -3,7 +3,7 @@ File:   placement_view.py
 Brief:  Print-placement viewport: piece actors plus per-bed grids and zone overlays.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations

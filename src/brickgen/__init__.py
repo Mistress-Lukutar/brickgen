@@ -3,7 +3,7 @@ File:   __init__.py
 Brief:  BrickGen package root - parametric stud block generator.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations
@@ -13,4 +13,4 @@ from brickgen.core.models import BlockSettings
 
 __all__ = ["BlockSettings", "build_block", "__version__"]
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"

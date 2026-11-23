@@ -3,7 +3,7 @@ File:   test_project_io.py
 Brief:  Unit tests for JSON save/load of multi-block projects.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations
@@ -748,3 +748,51 @@ def test_v9_payload_without_export_key_loads_defaults(tmp_path: Path) -> None:
     resaved_payload = json.loads(resaved.read_text(encoding="utf-8"))
     assert resaved_payload["schema"]["version"] == PROJECT_SCHEMA_VERSION
     assert resaved_payload["export"] == ExportSettings().model_dump()
+
+
+# -------------------------------------------------------- show_gizmo roundtrip
+
+def test_view_settings_gizmo_roundtrip(tmp_path: Path) -> None:
+    '''show_gizmo flags on both view settings survive save/load.'''
+    proj = Project(blocks=[BlockInstance()])
+    proj.view.show_gizmo = False
+    proj.assemble.view.show_gizmo = False
+
+    path = save_project(proj, tmp_path / "gizmo.json")
+    loaded = load_project(path)
+    assert loaded.view.show_gizmo is False
+    assert loaded.assemble.view.show_gizmo is False
+
+    # Default project has both True.
+    default_proj = Project(blocks=[BlockInstance()])
+    assert default_proj.view.show_gizmo is True
+    assert default_proj.assemble.view.show_gizmo is True
+
+
+def test_load_v11_payload_defaults_gizmo(tmp_path: Path) -> None:
+    '''A v11 payload without show_gizmo loads with default True values.'''
+    proj = Project(blocks=[BlockInstance()])
+    payload = {
+        "schema": {"name": PROJECT_SCHEMA_NAME, "version": 11},
+        "settings": {
+            field: getattr(BlockSettings(), field)
+            for field in (
+                "unit_size",
+                "wall_thickness",
+                "block_height",
+                "clearance_xy",
+                "clearance_z",
+            )
+        },
+        "blocks": [b.model_dump() for b in proj.blocks],
+        "print_layout": {"beds": {}, "pieces": []},
+        "assemble": {"pieces": [], "view": {}},
+        "view": {},
+    }
+    path = tmp_path / "v11.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    loaded = load_project(path)
+
+    # Both show_gizmo should default to True.
+    assert loaded.view.show_gizmo is True
+    assert loaded.assemble.view.show_gizmo is True

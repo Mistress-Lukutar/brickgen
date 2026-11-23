@@ -3,7 +3,7 @@ File:   models.py
 Brief:  Pydantic settings model describing the parametric block geometry.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations

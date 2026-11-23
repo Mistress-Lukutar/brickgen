@@ -3,7 +3,7 @@ File:   test_assemble_project.py
 Brief:  Project-model and IO tests for the Assemble state (schema v11).
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 from __future__ import annotations

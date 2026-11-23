@@ -3,7 +3,7 @@ File:   test_grid_editor.py
 Brief:  Unit tests for the layout CellGridEditor selection behavior.
 Author: Mistress-Lukutar
 Date:   2026-11-23
-Version: v0.21.0
+Version: v0.22.0
 '''
 
 import os
