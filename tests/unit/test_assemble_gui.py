@@ -17,7 +17,8 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import pytest  # noqa: E402
 from PySide6.QtCore import QEvent, Qt  # noqa: E402
 from PySide6.QtGui import QKeyEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from brickgen.core.project import BlockInstance  # noqa: E402
 from brickgen.gui.app import MainWindow  # noqa: E402
@@ -533,6 +534,66 @@ def test_space_rotates_ghost_during_placement(window: MainWindow) -> None:
     )
     view.keyPressEvent(event)
     assert view._ghost_rot == 1
+
+    view.cancel_placement()
+    _reset(window)
+
+
+def test_placement_focuses_view_for_hotkeys(window: MainWindow) -> None:
+    '''Regression: R/Space/F were dead on the first placed ghost.
+
+    Placement starts from a press on a panel card, so the viewport must
+    take the keyboard focus itself; previously the hotkeys only worked
+    after the first drop click (which focused the view) — i.e. of two
+    same-type parts placed in a row the first never rotated.
+    '''
+    _reset(window)
+    _wait_meshes(window)
+    window._tabs.setCurrentIndex(1)
+    view = window._assemble_view
+    window._on_parts_place_requested(window._project.blocks[0].uid)
+    assert view.placing() is True
+    # The viewport holds the keyboard focus right away.
+    assert QApplication.focusWidget() is view
+
+    # A key press through the application focus (what a user's R becomes)
+    # rotates the ghost.
+    event = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_R, Qt.KeyboardModifier.NoModifier
+    )
+    QApplication.sendEvent(QApplication.focusWidget(), event)
+    assert view._ghost_rot == 1
+
+    view.cancel_placement()
+    _reset(window)
+
+
+def test_panel_click_while_placing_never_drops(window: MainWindow) -> None:
+    '''Regression: while placing, a press on the parts panel dropped a copy.
+
+    The viewport used to grab the mouse for the whole placement mode, so
+    panel presses were redirected into its LMB drop handler and landed a
+    piece at the ghost's stale position. The viewport must not hold the
+    grab: panel presses stay with the panel (switching parts, toggles).
+    '''
+    _reset(window)
+    _wait_meshes(window)
+    window._tabs.setCurrentIndex(1)
+    view = window._assemble_view
+    window._on_parts_place_requested(window._project.blocks[0].uid)
+    assert view.placing() is True
+    assert QWidget.mouseGrabber() is not view
+
+    # Clicking the card again while placing re-selects the part without
+    # appending a piece.
+    n0 = len(window._project.assemble.pieces)
+    card = window._parts_panel._cards[0]
+    QTest.mousePress(card, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    QTest.mouseRelease(card, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert len(window._project.assemble.pieces) == n0
+    assert view.placing() is True
 
     view.cancel_placement()
     _reset(window)

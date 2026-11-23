@@ -2,8 +2,8 @@
 File:   assemble_view.py
 Brief:  Assemble-tab 3D viewport: placed pieces, cursor ghost placement, stacking.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations
@@ -148,10 +148,17 @@ class AssembleView(PreviewWidget):
         self._refresh_ghost_rects()
         self._drag_supports = self._query_supports(set())
         self._build_ghost_actor()
-        if QWidget.mouseGrabber() is not self:
-            self.grabMouse()  # keep receiving moves outside the viewport
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self._update_ghost(self.mapFromGlobal(QCursor.pos()))
+        # Placement starts from a press on a panel card, so the viewport
+        # must take the keyboard focus itself: without it R/Space/F stay
+        # dead until the first drop click focuses the view.
+        self.setFocus()
+        # Seed the ghost from the cursor only when it is inside the
+        # viewport: the mode normally starts over the panel, where the
+        # extrapolated floor point would park the ghost off-scene.
+        cursor = self.mapFromGlobal(QCursor.pos())
+        if self.rect().contains(cursor):
+            self._update_ghost(cursor)
         return True
 
     def cancel_placement(self) -> None:
@@ -169,8 +176,6 @@ class AssembleView(PreviewWidget):
         self._ghost_base_rects = ()
         self._ghost_rects = ()
         self._drag_supports = []
-        if QWidget.mouseGrabber() is self:
-            self.releaseMouse()
         self.unsetCursor()
         self.render()
 
@@ -420,14 +425,19 @@ class AssembleView(PreviewWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
         '''Ghost mode: LMB drops, RMB cancels, MMB keeps the camera moves.'''
+        pos = event.position().toPoint()
         button = event.button()
         if self._placing:
+            self.setFocus()
             if button == Qt.MouseButton.LeftButton:
+                # Drop exactly under the press cursor, never at the ghost's
+                # last followed position.
+                self._update_ghost(pos)
                 self._drop_ghost()
             elif button == Qt.MouseButton.RightButton:
                 self.cancel_placement()
             elif button == Qt.MouseButton.MiddleButton:
-                self._last_mouse = event.position().toPoint()
+                self._last_mouse = pos
                 self._panning = bool(
                     event.modifiers() & Qt.KeyboardModifier.ShiftModifier
                 )
