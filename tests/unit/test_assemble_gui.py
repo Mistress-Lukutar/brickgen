@@ -15,8 +15,8 @@ from collections.abc import Iterator
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import pytest  # noqa: E402
-from PySide6.QtCore import QEvent, Qt  # noqa: E402
-from PySide6.QtGui import QKeyEvent  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import QKeyEvent, QWheelEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
@@ -81,6 +81,12 @@ def _wait_meshes(win: MainWindow, timeout_s: float = 120.0) -> None:
 
 def _reset(win: MainWindow) -> None:
     '''Back to one unlinked default block, empty assembly and placement.'''
+    # Cancel any active placement / grab mode so stale state doesn't leak.
+    view = win._assemble_view
+    if view.placing():
+        view.cancel_placement()
+    if view._grabbing:
+        view.cancel_grab()
     win._project.blocks[:] = [win._project.blocks[0]]
     win._project.blocks[0].quantity = 1
     win._project.blocks[0].quantity_linked = False
@@ -102,6 +108,43 @@ def _place(win: MainWindow, block_index: int = 0, **overrides) -> int:
     info.update(overrides)
     win._on_assemble_piece_placed(info)
     return len(win._project.assemble.pieces)
+
+
+def _actor_color_hex(actor) -> str:
+    '''Extract the hex color string from a VTK actor's prop.color.
+
+    Args:
+        actor: A pyvista/vtk actor with ``prop.color`` attribute.
+
+    Returns:
+        Hex color string like ``"#d02020"``.
+    '''
+    c = actor.prop.color
+    if hasattr(c, '__iter__') and not isinstance(c, str):
+        # VTK Color / tuple of RGB floats (0-1).
+        r, g, b = float(c[0]), float(c[1]), float(c[2])
+        return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+    # Already a string.
+    return str(c)
+
+
+def _wheel(view, dy: int) -> QWheelEvent:
+    '''Send a wheel delta to *view* and return the event.
+
+    Args:
+        view: AssembleView to receive the wheel event.
+        dy: Vertical scroll delta (positive = up / increase height).
+
+    Returns:
+        The constructed ``QWheelEvent``.
+    '''
+    event = QWheelEvent(
+        QPointF(10.0, 10.0), QPointF(10.0, 10.0), QPoint(0, 0), QPoint(0, dy),
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase, False,
+    )
+    view.wheelEvent(event)
+    return event
 
 
 # ===========================================================================
@@ -408,36 +451,69 @@ def test_assemble_panel_status_routing(window: MainWindow) -> None:
     _reset(window)
 
 
-def test_copy_paste_assembled_pieces(window: MainWindow) -> None:
-    '''Assemble copy/paste clones placed copies (+10 mm, same pose).'''
+def test_copy_paste_starts_persistent_ghost(window: MainWindow) -> None:
+    '''Paste starts a persistent ghost; one drop appends and dirties.
+
+    The Assemble tab now uses free 3D placement: paste attaches the first
+    copied piece's pose to the ghost, drops land via _drop_ghost →
+    piece_placed → _on_assemble_piece_placed, and the ghost STAYS until
+    Esc / RMB (cancel_placement).
+    '''
     _reset(window)
     window._tabs.setCurrentIndex(1)
     _place(window, x=5.0, z=7.0, rot_z=2, flipped=True)
-    _place(window, x=20.0)
-    window._aselection = {0, 1}
+    # Select piece 0 and copy it.
+    window._aselection = {0}
     window._aprimary = 0
     window._on_copy()
     window._reset_edit_history()
     window._dirty = False
     n0 = len(window._project.assemble.pieces)
 
+    # Paste → ghost active, nothing appended yet.
     window._on_paste()
+    view = window._assemble_view
+    assert view.placing() is True
+    assert view._ghost_actor is not None
+    # Ghost carries the copied pose.
+    assert view._ghost_rot == 2
+    assert view._ghost_flip is True
+    assert view._ghost_z == pytest.approx(7.0)
+    assert view._ghost_block == 0
+    # Nothing appended yet (paste only starts the ghost).
+    assert len(window._project.assemble.pieces) == n0
+    assert window._dirty is False
+
+    # Drop: set ghost position directly and call _drop_ghost.
+    # Piece 0 is at (5,0,7) with half_x=8mm → occupies x ∈ [-3,13].
+    # Use x=20 to land in non-overlapping space.
     pieces = window._project.assemble.pieces
-    assert len(pieces) == n0 + 2
-    # New uids, +10 mm X, everything else preserved.
-    assert pieces[2].uid != pieces[0].uid
-    assert pieces[2].position_x == pytest.approx(15.0)
-    assert pieces[2].position_z == pytest.approx(7.0)
-    assert pieces[2].rot_z == 2
-    assert pieces[2].flipped is True
-    assert pieces[3].position_x == pytest.approx(30.0)
-    # The pasted copies are selected, primary = last.
-    assert window._aselection == {n0, n0 + 1}
-    assert window._aprimary == n0 + 1
+    view._ghost_pos = (20.0, 0.0, 7.0)
+    view._drop_ghost()
+    assert len(pieces) == n0 + 1
+    new_piece = pieces[-1]
+    # New uid != source uid.
+    assert new_piece.uid != pieces[0].uid
+    # Position / orientation match the ghost pose.
+    assert new_piece.position_x == pytest.approx(20.0)
+    assert new_piece.position_y == 0.0
+    assert new_piece.position_z == pytest.approx(7.0)
+    assert new_piece.rot_z == 2
+    assert new_piece.flipped is True
+    # Ghost PERSISTS after one drop (explicit requirement).
+    assert view.placing() is True
+    # The drop was an undoable edit.
     assert window._dirty is True
 
+    # Cancel → ghost gone.
+    view.cancel_placement()
+    assert view.placing() is False
+
+    # Undo the placement drop.
     window._on_undo()
-    assert len(window._project.assemble.pieces) == n0
+    pieces = window._project.assemble.pieces
+    assert len(pieces) == n0
+    _wait_meshes(window)
     window._reset_edit_history()
     _reset(window)
 
@@ -448,12 +524,15 @@ def test_paste_assembled_empty_and_stale(window: MainWindow) -> None:
     window._tabs.setCurrentIndex(1)
     window._on_paste()
     assert "Clipboard is empty" in window._assemble_panel._status_label.text()
+    # Nothing was placed; ghost mode is not active.
+    assert window._assemble_view.placing() is False
 
     window._clip_assembled = [{"block_uid": "gone", "position_x": 0.0}]
     window._on_paste()
     assert (
         "copied blocks no longer exist" in window._assemble_panel._status_label.text()
     )
+    assert window._assemble_view.placing() is False
     assert window._project.assemble.pieces == []
     _reset(window)
 
@@ -468,13 +547,255 @@ def test_paste_assembled_updates_linked_quantity(window: MainWindow) -> None:
     window._on_qty_link_toggled(True)
     assert window._project.blocks[0].quantity == 1
 
+    # Select piece 0, copy, paste → ghost active.
     window._aselection = {0}
     window._aprimary = 0
     window._on_copy()
     window._on_paste()
+    view = window._assemble_view
+    assert view.placing() is True
+
+    # Drop at non-overlapping position (piece 0 is at origin, default block
+    # half-extent is 4mm → occupies x ∈ [-4,4], y ∈ [-4,4]).
+    view._ghost_pos = (16.0, 0.0, 0.0)
+    view._drop_ghost()
+
+    # Now: piece count +1, linked quantity updated, placement scene follows.
     assert len(window._project.assemble.pieces) == 2
     assert window._project.blocks[0].quantity == 2
     assert len(window._project.print_layout.pieces) == 2
+
+    view.cancel_placement()
+    _reset(window)
+
+
+def test_paste_multi_copies_ghosts_first(window: MainWindow) -> None:
+    '''Multi-piece copy: ghost attaches to the FIRST copied piece's block.'''
+    _reset(window)
+    # Add a second block (mirror test_prune_stale_pieces_on_block_removal).
+    window._project.blocks.append(
+        BlockInstance(uid="blk2", cells_x=2, cells_y=2, quantity=1)
+    )
+    # Place pieces of both blocks.
+    _place(window, block_index=0)
+    _place(window, block_index=1)
+    assert len(window._project.assemble.pieces) == 2
+
+    # Select {0, 1} (piece indices), primary = 0.
+    window._aselection = {0, 1}
+    window._aprimary = 0
+    window._on_copy()
+    window._on_paste()
+
+    view = window._assemble_view
+    # Ghost attaches to the FIRST copied piece's block (index 0).
+    assert view._ghost_block == 0
+    assert view.placing() is True
+    # Status message mentions remaining copies on clipboard.
+    status = window._assemble_panel._status_label.text()
+    assert "stay on the clipboard" in status
+
+    # Cancel and prune the second block (mirror the prune test).
+    view.cancel_placement()
+    window._selection = {1}
+    window._primary = 1
+    window._on_remove_blocks()
+    window._sync_assemble()
+    _reset(window)
+
+
+def test_ghost_blocked_drop_refused(window: MainWindow) -> None:
+    '''Collision prohibition: intersecting ghost is refused, tinted red.'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    # Place piece 0 at origin.
+    _place(window)
+    bh = window._project.block_settings(0).block_height
+
+    # Start placement from the parts panel → ghost active.
+    uid = window._project.blocks[0].uid
+    window._on_parts_place_requested(uid)
+    view = window._assemble_view
+    assert view.placing() is True
+    n_before = len(window._project.assemble.pieces)
+
+    # Drop exactly on the existing piece → intersecting → refused.
+    view._ghost_pos = (0.0, 0.0, 0.0)
+    assert view._ghost_valid_at(0.0, 0.0, 0.0) is False
+    view._drop_ghost()
+    assert len(window._project.assemble.pieces) == n_before
+
+    # Ghost tinted red (COLLISION_COLOR = "#d02020").
+    # _update_ghost wasn't called after setting _ghost_pos, so trigger tint.
+    assert view._ghost_actor is not None
+    view._tint_ghost(not view._ghost_valid_at(0.0, 0.0, 0.0))
+    color_hex = _actor_color_hex(view._ghost_actor)
+    assert color_hex[:7] == "#d02020"
+
+    # Move to the legal stack plane (z = block_height).
+    view._ghost_pos = (0.0, 0.0, bh)
+    assert view._ghost_valid_at(0.0, 0.0, bh) is True
+    view._drop_ghost()
+    assert len(window._project.assemble.pieces) == n_before + 1
+    new_piece = window._project.assemble.pieces[-1]
+    assert new_piece.position_z == pytest.approx(bh)
+
+    view.cancel_placement()
+    _reset(window)
+
+
+def test_ghost_wheel_steps_working_plane(window: MainWindow) -> None:
+    '''Wheel steps the working plane during placement; clamped at 0.'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    view = window._assemble_view
+    uid = window._project.blocks[0].uid
+    window._on_parts_place_requested(uid)
+    assert view.placing() is True
+
+    step = view.grid_step()
+    # Scroll up (positive delta) → height increases.
+    ev = _wheel(view, 120)
+    assert view._ghost_z == pytest.approx(step)
+    assert ev.isAccepted()
+
+    # Scroll down (negative delta) → height decreases back.
+    ev = _wheel(view, -120)
+    assert view._ghost_z == pytest.approx(0.0)
+
+    # Extra scroll down stays at 0 (clamped).
+    ev = _wheel(view, -120)
+    assert view._ghost_z == pytest.approx(0.0)
+    assert ev.isAccepted()
+
+    view.cancel_placement()
+    _reset(window)
+
+
+def test_drag_collision_commits_last_valid(window: MainWindow) -> None:
+    '''Dragging onto a piece tints red; confirm falls back to last valid.'''
+    _reset(window)
+    _wait_meshes(window)
+
+    # Place piece 0 at origin.
+    _place(window)
+    unit = window._project.settings.unit_size
+    # Place piece 1 aside — 3*unit clears the half-extent of a 2x2 block.
+    _place(window, x=3 * unit)
+    assert len(window._project.assemble.pieces) == 2
+
+    view = window._assemble_view
+    # Select piece 1 and begin drag.
+    view.set_selection({1}, 1)
+    view._grabbing = True
+    view._grab_keyboard = False
+    view._grab_orig = {1: (3 * unit, 0.0)}
+    view._begin_piece_drag()
+
+    # Drive piece 1 onto piece 0.
+    view._apply_move(view._grab_orig, -3 * unit, 0.0)
+    assert view._drag_pose_invalid() is True
+    # Outline tinted red (COLLISION_COLOR = "#d02020").
+    color_hex = _actor_color_hex(view._outline_actors[1])
+    assert color_hex[:7] == "#d02020"
+
+    # Confirm → falls back to last valid pose (original position).
+    view.confirm_grab()
+    piece = window._project.assemble.pieces[1]
+    assert piece.position_x == pytest.approx(3 * unit)
+    assert piece.position_y == 0.0
+    assert piece.rot_z == 0
+    # Outline back to selection color (#ff9d2e).
+    color_hex = _actor_color_hex(view._outline_actors[1])
+    assert color_hex[:7] == "#ff9d2e"
+    assert window._dirty is True
+
+    _reset(window)
+
+
+def test_move_keeps_height_and_rotation_keeps_height(window: MainWindow) -> None:
+    '''No auto-stacking: XY moves and rotations preserve the current height.'''
+    _reset(window)
+    _wait_meshes(window)
+
+    # Place piece at z=7.0 (non-zero height).
+    _place(window, z=7.0)
+    view = window._assemble_view
+
+    # Fake drag state for piece 0.
+    view.set_selection({0}, 0)
+    view._grabbing = True
+    view._grab_keyboard = False
+    view._grab_orig = {0: (0.0, 0.0)}
+    view._begin_piece_drag()
+
+    # Move XY → height must stay at 7.0.
+    view._apply_move(view._grab_orig, 5.0, 3.0)
+    assert view._scene_meta[0]['pos_z'] == pytest.approx(7.0)
+    assert view._scene_meta[0]['pos_x'] == pytest.approx(5.0)
+    assert view._scene_meta[0]['pos_y'] == pytest.approx(3.0)
+
+    # Space rotate → height must still be 7.0 (old code re-resolved it).
+    from PySide6.QtGui import QKeyEvent
+    event = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier
+    )
+    view.keyPressEvent(event)
+    assert view._scene_meta[0]['rot_z'] == 1
+    assert view._scene_meta[0]['pos_z'] == pytest.approx(7.0)
+
+    # Cancel → fully restored: z=7.0 and the orientation rolls back too
+    # (rot_z, halves and rects return to the drag start).
+    view.cancel_grab()
+    assert view._scene_meta[0]['pos_z'] == pytest.approx(7.0)
+    assert view._scene_meta[0]['rot_z'] == 0
+
+    _reset(window)
+
+
+def test_placement_and_grab_cancel_with_rmb_and_esc(window: MainWindow) -> None:
+    '''Placement cancel is RMB or Esc; G-grab cancel also accepts both.'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+    view = window._assemble_view
+
+    # --- Placement cancel via RMB ---
+    uid = window._project.blocks[0].uid
+    window._on_parts_place_requested(uid)
+    assert view.placing() is True
+    QTest.mousePress(view, Qt.MouseButton.RightButton)
+    QApplication.processEvents()
+    QTest.mouseRelease(view, Qt.MouseButton.RightButton)
+    QApplication.processEvents()
+    assert view.placing() is False
+
+    # --- Placement cancel via Esc ---
+    window._on_parts_place_requested(uid)
+    assert view.placing() is True
+    esc_event = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier
+    )
+    QApplication.sendEvent(QApplication.focusWidget(), esc_event)
+    assert view.placing() is False
+
+    # --- G-grab cancel via RMB ---
+    _place(window)
+    window._aselection = {0}
+    window._aprimary = 0
+    view.set_selection({0}, 0)
+    view.start_grab()
+    assert view._grabbing is True
+    QTest.mousePress(view, Qt.MouseButton.RightButton)
+    QApplication.processEvents()
+    QTest.mouseRelease(view, Qt.MouseButton.RightButton)
+    QApplication.processEvents()
+    assert view._grabbing is False
+
     _reset(window)
 
 

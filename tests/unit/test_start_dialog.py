@@ -2,7 +2,7 @@
 File:   test_start_dialog.py
 Brief:  Unit tests for the startup welcome dialog (new/open/recent).
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 

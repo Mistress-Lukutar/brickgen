@@ -2,8 +2,8 @@
 File:   project_io.py
 Brief:  JSON save/load of multi-block GUI projects with legacy settings migration.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations

@@ -3,8 +3,8 @@ File:   assemble_panel.py
 Brief:  Left-sidebar panel for the Assemble tab: snapping settings and the
         selected-piece inspector.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations

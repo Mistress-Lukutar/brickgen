@@ -2,7 +2,7 @@
 File:   test_project_io.py
 Brief:  Unit tests for JSON save/load of multi-block projects.
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 

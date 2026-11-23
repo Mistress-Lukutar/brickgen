@@ -2,8 +2,8 @@
 File:   project.py
 Brief:  Project and placed-block models for the multi-block GUI scene.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations

@@ -2,8 +2,8 @@
 File:   main.py
 Brief:  Typer CLI entry point for headless project export of print layouts.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations

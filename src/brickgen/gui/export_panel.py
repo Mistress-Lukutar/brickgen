@@ -3,8 +3,8 @@ File:   export_panel.py
 Brief:  Right-sidebar export panel for the print-placement tab: precision,
         format, per-bed vs single-file output and the export button.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations

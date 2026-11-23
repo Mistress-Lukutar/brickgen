@@ -20,12 +20,12 @@ from brickgen.services.assemble_service import (
     Rect,
     Support,
     assemble_groups,
+    assemble_pose_collides,
     assemble_snap_target,
     assemble_summary,
     assemble_supports,
     base_footprint_rects,
     placed_counts,
-    support_top_z,
     transform_footprint_rects,
 )
 
@@ -70,40 +70,6 @@ def test_placed_counts() -> None:
     ]
     assert placed_counts(pieces) == {"a": 2, "b": 1}
     assert placed_counts([]) == {}
-
-
-def test_support_top_z_none_and_stack() -> None:
-    '''Empty space returns None; overlap returns the highest stacking
-    plane; a pure edge touch is not an overlap.'''
-    supports = [
-        Support(
-            x=0.0,
-            y=0.0,
-            z=0.0,
-            hx=10.0,
-            hy=10.0,
-            height=8.0,
-            stack_top=8.0,
-            rects=(Rect(0.0, 0.0, 10.0, 10.0),),
-        ),
-        Support(
-            x=30.0,
-            y=0.0,
-            z=8.0,
-            hx=10.0,
-            hy=10.0,
-            height=8.0,
-            stack_top=16.0,
-            rects=(Rect(30.0, 0.0, 10.0, 10.0),),
-        ),
-    ]
-    assert support_top_z(supports, (Rect(100.0, 100.0, 5.0, 5.0),)) is None
-    # Inside the first piece: stacking plane 8; the second starts at x=20
-    # (30-10), so a footprint touching x=20 exactly does not count.
-    assert support_top_z(supports, (Rect(5.0, 0.0, 5.0, 5.0),)) == pytest.approx(8.0)
-    assert support_top_z(supports, (Rect(20.0, 0.0, 0.0, 5.0),)) is None
-    # Overlapping both pieces: the higher stacking plane wins.
-    assert support_top_z(supports, (Rect(15.0, 0.0, 6.0, 5.0),)) == pytest.approx(16.0)
 
 
 def test_assemble_supports_stack_top_by_flip_state() -> None:
@@ -214,54 +180,121 @@ def test_assemble_supports_rects_world_offset_and_rotation() -> None:
     assert support.hy == pytest.approx(3 * unit / 2)
 
 
-def test_support_top_z_drops_into_excluded_void() -> None:
-    '''A footprint fully inside an excluded-cell void overlaps nothing.
+# ---------------------------------------------------------------------------
+# assemble_pose_collides — collision tests
+# ---------------------------------------------------------------------------
 
-    Regression: the T-piece notch is not material, so pieces drop into
-    the empty space instead of snapping onto the bounding box top.
-    '''
+def test_pose_collides_body_intersection() -> None:
+    '''Pose overlapping a support's XY material AND z-interval (no contact
+    plane match) returns True.'''
+    support = Support(
+        x=0.0, y=0.0, z=0.0, hx=10.0, hy=10.0, height=8.8, stack_top=3.0,
+        rects=(Rect(0.0, 0.0, 10.0, 10.0),),
+    )
+    pose_rects = (Rect(2.0, 2.0, 4.0, 4.0),)
+    # Pose bottom z=3 inside support body (0..8.8), not on any contact plane.
+    assert assemble_pose_collides(
+        [support], pose_rects, z=2.5, height=4.0, stack_offset=3.0
+    )
+
+
+def test_pose_allows_exact_stack_contact() -> None:
+    '''Pose z == support.stack_top is a legal contact (False); 1e-3 offset
+    inside the body returns True.'''
+    support = Support(
+        x=0.0, y=0.0, z=0.0, hx=10.0, hy=10.0, height=8.8, stack_top=3.0,
+        rects=(Rect(0.0, 0.0, 10.0, 10.0),),
+    )
+    pose_rects = (Rect(2.0, 2.0, 4.0, 4.0),)
+    assert not assemble_pose_collides(
+        [support], pose_rects, z=3.0, height=4.0, stack_offset=3.0
+    )
+    # 1e-3 mm below stack_top — still inside the body, not on a contact plane.
+    assert assemble_pose_collides(
+        [support], pose_rects, z=2.999, height=4.0, stack_offset=3.0
+    )
+
+
+def test_pose_allows_under_overhang_contact() -> None:
+    '''Support bottom == pose z + stack_offset is a legal contact (False).'''
+    support = Support(
+        x=0.0, y=0.0, z=3.0, hx=10.0, hy=10.0, height=8.8, stack_top=11.8,
+        rects=(Rect(0.0, 0.0, 10.0, 10.0),),
+    )
+    pose_rects = (Rect(2.0, 2.0, 4.0, 4.0),)
+    # Pose stud plane at z=3 exactly meets the support's bottom.
+    assert not assemble_pose_collides(
+        [support], pose_rects, z=0.0, height=3.0, stack_offset=3.0
+    )
+
+
+def test_pose_clear_above_and_below() -> None:
+    '''Z-ranges disjoint (above and below) return False.'''
+    support = Support(
+        x=0.0, y=0.0, z=0.0, hx=10.0, hy=10.0, height=8.8, stack_top=3.0,
+        rects=(Rect(0.0, 0.0, 10.0, 10.0),),
+    )
+    pose_rects = (Rect(2.0, 2.0, 4.0, 4.0),)
+    # Fully above the support body.
+    assert not assemble_pose_collides(
+        [support], pose_rects, z=10.0, height=3.0, stack_offset=3.0
+    )
+    # Fully below the support body.
+    assert not assemble_pose_collides(
+        [support], pose_rects, z=-5.0, height=3.0, stack_offset=3.0
+    )
+
+
+def test_pose_uses_material_rects_not_bbox() -> None:
+    '''Pose entirely inside an excluded-cell void of a T-piece support returns False.'''
     project, settings = _t_block_project()
-    unit = settings.unit_size
+    unit = settings.unit_size  # type: ignore[attr-defined]
     project.assemble.pieces = [AssembledPiece(uid="p", block_uid="a")]
     supports = assemble_supports(project)
     # Void cell (2, 0) spans x in [0.5u, 1.5u], y in [-u, 0].
-    void = (Rect(unit, -unit / 2, unit / 2, unit / 2),)
-    assert support_top_z(supports, void) is None
-    # Material overlap still stacks (cell (0, 0) center).
-    material = (Rect(-unit, -unit / 2, unit / 2, unit / 2),)
-    assert support_top_z(supports, material) == pytest.approx(settings.block_height)
-
-
-def test_support_top_z_stacks_into_notch_on_base_plate() -> None:
-    '''Inside a T-void the piece stacks on the plate under the T-piece.'''
-    project = Project(
-        blocks=[
-            BlockInstance(uid="plate", cells_x=5, cells_y=5),
-            BlockInstance(uid="t", cells_x=3, cells_y=2, excluded_cells=[[2, 0]]),
-        ]
+    void_rects = (Rect(unit, -unit / 2, unit / 2, unit / 2),)
+    assert not assemble_pose_collides(
+        supports, void_rects, z=0.0, height=3.0, stack_offset=3.0
     )
-    unit = project.settings.unit_size
-    project.assemble.pieces = [
-        AssembledPiece(uid="p1", block_uid="plate"),
-        AssembledPiece(uid="p2", block_uid="t", position_z=3.0),
-    ]
-    supports = assemble_supports(project)
-    # The void cell of the T-piece sits above plate material: the plate's
-    # stacking plane wins over the T-piece's bounding-box top.
-    void = (Rect(unit, -unit / 2, unit / 2, unit / 2),)
-    assert support_top_z(supports, void) == pytest.approx(3.0)
+
+
+def test_pose_flipped_uses_total_height_contact() -> None:
+    '''Flipped pose stack_offset = total_height; support bottom at pose
+    z + total_height is a legal contact (False).'''
+    project = Project(blocks=[BlockInstance(uid="a", cells_x=2, cells_y=2)])
+    settings = project.blocks[0].to_settings(project.settings)
+    total_h = settings.total_height
+    support = Support(
+        x=0.0, y=0.0, z=total_h, hx=10.0, hy=10.0, height=8.8, stack_top=total_h + 3.0,
+        rects=(Rect(0.0, 0.0, 10.0, 10.0),),
+    )
+    pose_rects = (Rect(2.0, 2.0, 4.0, 4.0),)
+    # Flipped piece: stack_offset = total_height; support bottom at z=total_h.
+    assert not assemble_pose_collides(
+        [support], pose_rects, z=0.0, height=total_h, stack_offset=total_h
+    )
+
+
+# ---------------------------------------------------------------------------
+# assemble_snap_target — rewritten and new tests
+# ---------------------------------------------------------------------------
+
+def _box_support(
+    x: float = 0.0, y: float = 0.0, hx: float = 8.0, hy: float = 8.0
+) -> Support:
+    '''One rectangular support at floor level with stack_top 3.'''
+    return Support(
+        x=x, y=y, z=0.0, hx=hx, hy=hy, height=8.8, stack_top=3.0,
+        rects=(Rect(x, y, hx, hy),),
+    )
 
 
 def test_snap_target_grid_only() -> None:
-    '''Without part snapping the corner-rounded cursor target, z=0.'''
+    '''Without part snapping the corner-rounded cursor target at z=0.'''
     x, y, z = assemble_snap_target(
-        3.0,
-        7.0,
-        (Rect(0.0, 0.0, 4.0, 4.0),),
-        [],
-        4.0,
-        snap_to_grid=True,
-        snap_to_parts=False,
+        3.0, 7.0, 0.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, [],
+        4.0, True, False,
     )
     # Corners at 0/4: the footprint fills one grid cell per axis.
     assert (x, y, z) == (4.0, 8.0, 0.0)
@@ -270,61 +303,35 @@ def test_snap_target_grid_only() -> None:
 def test_snap_target_no_snapping() -> None:
     '''All snapping off: the raw cursor point on the floor.'''
     x, y, z = assemble_snap_target(
-        3.3,
-        7.7,
-        (Rect(0.0, 0.0, 4.0, 4.0),),
-        [],
-        4.0,
-        snap_to_grid=False,
-        snap_to_parts=False,
+        3.3, 7.7, 0.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, [],
+        4.0, False, False,
     )
     assert (x, y, z) == (3.3, 7.7, 0.0)
-
-
-def _box_support(
-    x: float = 0.0, y: float = 0.0, hx: float = 8.0, hy: float = 8.0
-) -> Support:
-    '''One rectangular support at floor level with stack_top 3.'''
-    return Support(
-        x=x,
-        y=y,
-        z=0.0,
-        hx=hx,
-        hy=hy,
-        height=8.8,
-        stack_top=3.0,
-        rects=(Rect(x, y, hx, hy),),
-    )
 
 
 def test_snap_target_stacks_on_overlap() -> None:
     '''A footprint overlapping a piece drops onto its stacking plane.'''
     supports = [_box_support()]
+    # cursor_z=4 inside support body (0..8.8), base at z=4 collides.
     x, y, z = assemble_snap_target(
-        3.0,
-        3.0,
-        (Rect(0.0, 0.0, 4.0, 4.0),),
-        supports,
-        4.0,
-        snap_to_grid=True,
-        snap_to_parts=True,
+        3.0, 3.0, 4.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, supports,
+        4.0, True, True,
     )
     assert (x, y) == (4.0, 4.0)  # corner-rounded cursor
-    assert z == pytest.approx(3.0)  # block_height above the support bottom
+    assert z == pytest.approx(3.0)  # stack_top above the support bottom
 
 
 def test_snap_target_side_flush_wins_when_closer() -> None:
     '''A cursor near a piece side snaps flush to that side at its height.'''
     supports = [_box_support()]
-    # Cursor just outside the +X side (side contact needs 8 + 4 = 12).
+    # Cursor just outside the +X side (side contact needs 8+4=12).
+    # cursor_z=1 rounds to base_z=0 with step=4, so side flush at floor wins.
     x, y, z = assemble_snap_target(
-        13.0,
-        0.5,
-        (Rect(0.0, 0.0, 4.0, 4.0),),
-        supports,
-        4.0,
-        snap_to_grid=True,
-        snap_to_parts=True,
+        13.0, 0.5, 1.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, supports,
+        4.0, True, True,
     )
     assert x == pytest.approx(12.0)
     assert y == pytest.approx(0.0)
@@ -333,18 +340,13 @@ def test_snap_target_side_flush_wins_when_closer() -> None:
 
 def test_snap_target_stacking_preferred_on_tie() -> None:
     '''When stacking and side distances tie, stacking wins.'''
-    # Support spans x in [-10, 6]: the corner-rounded cursor (9, 0) drops
-    # at (8, 0) — overlapping the support (stacking candidate) and exactly
-    # as far from the +X flush side (10, 0).
+    # Support spans x in [-10, 6]: corner-rounded cursor (9, 0) drops at
+    # (8, 0) overlapping the support (stacking candidate).
     supports = [_box_support(x=-2.0)]
     x, y, z = assemble_snap_target(
-        9.0,
-        0.0,
-        (Rect(0.0, 0.0, 4.0, 4.0),),
-        supports,
-        4.0,
-        snap_to_grid=True,
-        snap_to_parts=True,
+        9.0, 0.0, 4.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, supports,
+        4.0, True, True,
     )
     assert z == pytest.approx(3.0)
     assert (x, y) == (8.0, 0.0)
@@ -354,37 +356,24 @@ def test_snap_target_far_from_parts_falls_back_to_grid() -> None:
     '''No nearby pieces: the plain corner-rounded floor position.'''
     supports = [_box_support()]
     x, y, z = assemble_snap_target(
-        200.0,
-        100.0,
-        (Rect(0.0, 0.0, 4.0, 4.0),),
-        supports,
-        4.0,
-        snap_to_grid=True,
-        snap_to_parts=True,
+        200.0, 100.0, 4.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, supports,
+        4.0, True, True,
     )
-    assert (x, y, z) == (200.0, 100.0, 0.0)
+    assert (x, y, z) == (200.0, 100.0, 4.0)  # cursor_z=4 rounds to base_z=4 with step=4
 
 
 def test_snap_target_drops_into_excluded_void() -> None:
-    '''Dropping into an excluded-cell void lands on the floor.
-
-    Regression: the stacking candidate must come from material overlap
-    only — the T-piece bounding box top (in the air above the notch)
-    never wins.
-    '''
+    '''Dropping into an excluded-cell void lands on the floor.'''
     project, settings = _t_block_project()
-    unit = settings.unit_size
+    unit = settings.unit_size  # type: ignore[attr-defined]
     project.assemble.pieces = [AssembledPiece(uid="p", block_uid="a")]
     supports = assemble_supports(project)
     # Cursor inside the void cell (2, 0): spans x [0.5u, 1.5u].
     x, y, z = assemble_snap_target(
-        1.5 * unit,
-        -unit / 2,
-        (Rect(0.0, 0.0, unit / 2, unit / 2),),
-        supports,
-        unit,
-        snap_to_grid=True,
-        snap_to_parts=True,
+        1.5 * unit, -unit / 2, 0.0,
+        (Rect(0.0, 0.0, unit / 2, unit / 2),), unit, unit / 2, False, supports,
+        unit, True, True,
     )
     assert (x, y) == pytest.approx((1.5 * unit, -unit / 2))
     assert z == pytest.approx(0.0)
@@ -393,25 +382,123 @@ def test_snap_target_drops_into_excluded_void() -> None:
 def test_snap_target_side_flush_against_notch_wall() -> None:
     '''A piece flushes against the inner wall of an excluded-cell notch.'''
     project, settings = _t_block_project()
-    unit = settings.unit_size
+    unit = settings.unit_size  # type: ignore[attr-defined]
     project.assemble.pieces = [AssembledPiece(uid="p", block_uid="a")]
     supports = assemble_supports(project)
     # Cursor inside the void, near the flush position against the notch's
     # -X wall (the row-0 material edge at x = 0.5u): the one-cell piece
     # center lands at 0.5u + u/2 = u.
     x, y, z = assemble_snap_target(
-        unit + unit / 8,
-        -unit / 2,
-        (Rect(0.0, 0.0, unit / 2, unit / 2),),
-        supports,
-        unit,
-        snap_to_grid=True,
-        snap_to_parts=True,
+        unit + unit / 8, -unit / 2, 0.0,
+        (Rect(0.0, 0.0, unit / 2, unit / 2),), unit, unit / 2, False, supports,
+        unit, True, True,
     )
     assert x == pytest.approx(unit)
     assert y == pytest.approx(-unit / 2)
     assert z == pytest.approx(0.0)
 
+
+# ---------------------------------------------------------------------------
+# Required NEW test cases for assemble_snap_target
+# ---------------------------------------------------------------------------
+
+def test_snap_target_free_float_above_pieces() -> None:
+    '''snap_to_parts=True, base footprint NOT overlapping any support,
+    cursor_z=12 returns the rounded base at z=12 (no lift, no drop).'''
+    supports = [_box_support()]
+    # Cursor far from all supports in XY, high in Z.
+    x, y, z = assemble_snap_target(
+        50.0, 50.0, 12.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, supports,
+        4.0, True, True,
+    )
+    assert (x, y) == pytest.approx((52.0, 52.0))  # corner-rounded
+    assert z == pytest.approx(12.0)  # rounded to step=4
+
+
+def test_snap_target_blocked_base_falls_to_stack() -> None:
+    '''Cursor over a support at floor level with cursor_z inside the support
+    body returns the stack_top stacking candidate (base was discarded).'''
+    supports = [_box_support()]
+    # Cursor at (3, 3) rounds to base at (4, 4), z=0 collides in body.
+    x, y, z = assemble_snap_target(
+        3.0, 3.0, 2.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, supports,
+        4.0, True, True,
+    )
+    assert (x, y) == pytest.approx((4.0, 4.0))
+    assert z == pytest.approx(3.0)  # stacked on stack_top
+
+
+def test_snap_target_side_flush_at_top_plane() -> None:
+    '''A side candidate at support.stack_top wins when cursor_z is near the
+    top plane (build a support near cursor, place one step to the side).'''
+    support = _box_support(x=4.0)  # spans x [-4, 12]
+    # Cursor just outside +X side at z=3 (≈ stack_top).
+    x, y, z = assemble_snap_target(
+        13.0, 0.5, 3.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, [support],
+        4.0, True, True,
+    )
+    # Side flush at stack_top plane wins over side flush at floor level.
+    assert x == pytest.approx(12.0)
+    assert y == pytest.approx(0.0)
+    assert z == pytest.approx(3.0)
+
+
+def test_snap_target_stack_on_floating_support() -> None:
+    '''A support with z=16 (floating piece), cursor over it at z within its
+    body returns stacking candidate at its stack_top (~16+block_height).'''
+    floating = Support(
+        x=0.0, y=0.0, z=16.0, hx=8.0, hy=8.0, height=8.8, stack_top=19.0,
+        rects=(Rect(0.0, 0.0, 8.0, 8.0),),
+    )
+    # Cursor at (3, 3) inside floating support; z=17 inside body.
+    x, y, z = assemble_snap_target(
+        3.0, 3.0, 17.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, [floating],
+        4.0, True, True,
+    )
+    assert (x, y) == pytest.approx((4.0, 4.0))
+    assert z == pytest.approx(19.0)  # stacked on floating support's stack_top
+
+
+def test_snap_target_z_grid_rounding() -> None:
+    '''snap_to_grid=True, cursor_z=13, step=4 returns base z rounded to 12.'''
+    supports = [_box_support()]
+    # Cursor far from supports so base position wins.
+    x, y, z = assemble_snap_target(
+        50.0, 50.0, 13.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, supports,
+        4.0, True, True,
+    )
+    assert z == pytest.approx(12.0)  # round(13/4)*4 = 12
+
+
+def test_snap_target_flipped_stack_offset() -> None:
+    '''Flipped=True query piece stacking onto a support uses flipped
+    stack_top semantics (stack candidate accepted as valid).'''
+    project = Project(blocks=[BlockInstance(uid="a", cells_x=2, cells_y=2)])
+    settings = project.blocks[0].to_settings(project.settings)
+    total_h = settings.total_height
+    # Normal support at floor level.
+    support = Support(
+        x=0.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8, stack_top=3.0,
+        rects=(Rect(0.0, 0.0, 8.0, 8.0),),
+    )
+    # Flipped piece: cursor just above support, z inside body.
+    x, y, z = assemble_snap_target(
+        3.0, 3.0, 2.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), total_h, 3.0, True, [support],
+        4.0, True, True,
+    )
+    assert (x, y) == pytest.approx((4.0, 4.0))
+    assert z == pytest.approx(3.0)  # stacked at support.stack_top regardless of flip
+
+
+# ---------------------------------------------------------------------------
+# assemble_summary — unchanged
+# ---------------------------------------------------------------------------
 
 def test_assemble_summary() -> None:
     '''Summary reports placed/planned counts and part types.'''

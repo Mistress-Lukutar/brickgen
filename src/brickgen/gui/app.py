@@ -2,8 +2,8 @@
 File:   app.py
 Brief:  BrickGen PySide6 main window: project scene, parameters, template library.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations
@@ -1494,49 +1494,60 @@ class MainWindow(QMainWindow):
         self._set_status(message)
 
     def _paste_assembled(self) -> None:
-        '''Paste the copied assembled copies as new placed copies.
+        '''Paste the copied assembled copies as a cursor ghost.
 
-        Every pasted copy keeps the source's orientation and height and
-        starts 10 mm to the right of it (mirroring the placement paste);
-        the pasted copies are selected, and a linked block's quantity
-        follows the new count.
+        The first copied piece attaches to the viewport ghost with its
+        orientation and height (exactly like a parts-panel placement): every
+        left click drops one copy, Esc/right click cancels — the ghost stays
+        until explicitly cancelled. Pieces land through the normal placement
+        handler, so linked block quantities follow on every drop.
         '''
         if not self._clip_assembled:
             self._set_status("Clipboard is empty: copy pieces first (Ctrl+C).")
             return
         blocks_by_uid = {block.uid: block for block in self._project.blocks}
-        if not any(
-            str(values.get("block_uid", "")) in blocks_by_uid
-            for values in self._clip_assembled
-        ):
+        values = next(
+            (
+                entry
+                for entry in self._clip_assembled
+                if str(entry.get("block_uid", "")) in blocks_by_uid
+            ),
+            None,
+        )
+        if values is None:
             self._set_status("Nothing to paste: copied blocks no longer exist.")
             return
-        self._begin_edit("paste-assembled")
-        pasted: list[int] = []
-        pasted_uids: set[str] = set()
-        for values in self._clip_assembled:
-            block_uid = str(values.get("block_uid", ""))
-            if block_uid not in blocks_by_uid:
-                continue  # The source block was removed since the copy.
-            piece = AssembledPiece.model_validate(
-                {
-                    **values,
-                    "uid": uuid.uuid4().hex,
-                    "position_x": float(values.get("position_x", 0.0)) + 10.0,
-                }
+        block_uid = str(values.get("block_uid", ""))
+        index = next(
+            i for i, block in enumerate(self._project.blocks) if block.uid == block_uid
+        )
+        mesh = self._block_meshes[index] if index < len(self._block_meshes) else None
+        if mesh is None or mesh.n_points == 0:
+            self._set_status(
+                "Part mesh is not ready yet - wait for the generation.",
+                error=True,
             )
-            self._project.assemble.pieces.append(piece)
-            pasted.append(len(self._project.assemble.pieces) - 1)
-            pasted_uids.add(block_uid)
-        if not pasted:
             return
-        self._aselection = set(pasted)
-        self._aprimary = pasted[-1]
-        self._assemble_view.set_selection(self._aselection, self._aprimary)
-        self._mark_dirty()
-        self._sync_assemble()
-        self._apply_linked_quantities(self._linked_block_indices(pasted_uids))
-        self._set_status(f"Pasted {len(pasted)} copy(ies).")
+        settings = self._project.block_settings(index)
+        self._assemble_view.start_placement(
+            mesh,
+            index,
+            base_footprint_rects(settings),
+            settings.total_height,
+            self._project.blocks[index].color,
+            settings.block_height,
+            rot_z=int(values.get("rot_z", 0)) % 4,
+            flipped=bool(values.get("flipped", False)),
+            z=float(values.get("position_z", 0.0)),
+        )
+        extra = len(self._clip_assembled) - 1
+        message = (
+            "Placing pasted copy: click drops it, R/Space rotates, F flips, "
+            "wheel changes height, Esc/RMB finishes."
+        )
+        if extra:
+            message += f" {extra} more copied piece(s) stay on the clipboard."
+        self._set_status(message)
 
     # ------------------------------------------------------------ select all
     def _on_select_all(self) -> None:
@@ -3164,6 +3175,10 @@ class MainWindow(QMainWindow):
             block.uid: self._project.block_settings(i).total_height
             for i, block in enumerate(self._project.blocks)
         }
+        block_heights = {
+            block.uid: self._project.block_settings(i).block_height
+            for i, block in enumerate(self._project.blocks)
+        }
         dims = {
             block.uid: (
                 self._project.block_settings(i).outer_length_x / 2,
@@ -3219,6 +3234,7 @@ class MainWindow(QMainWindow):
                         base_rects, piece.rot_z, piece.flipped
                     ),
                     'top_z': heights.get(piece.block_uid, 0),
+                    'block_h': block_heights.get(piece.block_uid, 0),
                     'quantity': 1,
                     'uid': piece.uid,
                     'rot_z': piece.rot_z,
@@ -3486,9 +3502,11 @@ class MainWindow(QMainWindow):
             base_footprint_rects(settings),
             settings.total_height,
             self._project.blocks[index].color,
+            settings.block_height,
         )
         self._set_status(
-            "Placing: click drops a copy, R/Space rotates, F flips, Esc finishes."
+            "Placing: click drops a copy, R/Space rotates, F flips, "
+            "wheel changes height, Esc/RMB finishes."
         )
 
 

@@ -2,7 +2,7 @@
 File:   test_print_export.py
 Brief:  Unit tests for print-bed entry collection and compound assembly.
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 

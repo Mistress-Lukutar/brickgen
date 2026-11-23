@@ -2,7 +2,7 @@
 File:   test_app_tabs.py
 Brief:  Integration tests for the MainWindow tab integration (S4).
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 

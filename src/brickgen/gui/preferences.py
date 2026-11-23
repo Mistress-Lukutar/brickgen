@@ -2,8 +2,8 @@
 File:   preferences.py
 Brief:  Modal preferences dialog: precisions and default export format.
 Author: Mistress-Lukutar
-Date:   2026-11-22
-Version: v0.20.0
+Date:   2026-11-23
+Version: v0.21.0
 '''
 
 from __future__ import annotations

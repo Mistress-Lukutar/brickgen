@@ -2,7 +2,7 @@
 File:   test_models.py
 Brief:  Unit tests for BlockSettings validation and derived properties.
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 

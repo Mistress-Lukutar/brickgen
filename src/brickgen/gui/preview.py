@@ -1544,19 +1544,24 @@ class PreviewWidget(QtInteractor):
         self.render()
 
     def _cursor_on_floor(self, pos: QPoint) -> np.ndarray | None:
-        '''World point of the cursor ray on the z=0 floor plane.
+        '''World point of the cursor ray on the z=0 floor plane.'''
+        return self._cursor_on_plane(pos, 0.0)
+
+    def _cursor_on_plane(self, pos: QPoint, plane_z: float) -> np.ndarray | None:
+        '''World point of the cursor ray on the horizontal plane *plane_z*.
 
         The ray is reconstructed from the camera through the unprojected
         cursor (at the focal-plane depth, reusing the pan projection path)
-        and intersected with the floor.
+        and intersected with the plane.
 
         Args:
             pos: Cursor position in Qt widget coordinates.
+            plane_z: Height of the horizontal intersection plane, mm.
 
         Returns:
             World (x, y, z) point, or None when the ray is too parallel to
-            the floor (side views would translate pixel deltas into huge
-            floor distances) or points away from the plane.
+            the plane (side views would translate pixel deltas into huge
+            distances) or points away from it.
         '''
         renderer = self.renderer
         camera = renderer.GetActiveCamera()
@@ -1577,7 +1582,7 @@ class PreviewWidget(QtInteractor):
         length = float(np.linalg.norm(direction))
         if length < 1e-9 or abs(direction[2]) < _FLOOR_RAY_MIN_SIN * length:
             return None
-        t = -origin[2] / direction[2]
+        t = (plane_z - origin[2]) / direction[2]
         if t <= 0.0:
             return None
         return origin + direction * t

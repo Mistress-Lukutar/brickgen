@@ -340,32 +340,61 @@ def assemble_supports(
     return supports
 
 
-def support_top_z(supports: list[Support], rects: Sequence[Rect]) -> float | None:
-    '''Stacking height of the highest piece whose MATERIAL overlaps.
+def _rects_overlap(a: Sequence[Rect], b: Sequence[Rect]) -> bool:
+    '''True when any rectangle of *a* materially overlaps one of *b*.
 
-    Only actual occupied rectangles count: a footprint sitting in the
-    void of an excluded-cell piece (e.g. a T-shaped notch) overlaps
-    nothing and returns None, so pieces drop into the empty space.
+    Exact edge touching (flush faces) is not an overlap.
+    '''
+    return any(
+        abs(ra.cx - rb.cx) < ra.hx + rb.hx - _OVERLAP_EPS
+        and abs(ra.cy - rb.cy) < ra.hy + rb.hy - _OVERLAP_EPS
+        for ra in a
+        for rb in b
+    )
+
+
+def assemble_pose_collides(
+    supports: list[Support],
+    rects: Sequence[Rect],
+    z: float,
+    height: float,
+    stack_offset: float,
+) -> bool:
+    '''True when the piece pose intersects any support volume.
+
+    The XY test uses the material rectangles only — excluded-cell voids
+    stay enterable. The Z test is a plain interval overlap with two
+    legal contacts: resting ON a support (pose bottom exactly at its
+    :attr:`Support.stack_top`, studs entering its top cavities) and
+    sitting UNDER one (support bottom exactly at the pose stud plane
+    ``z + stack_offset``). Exact edge touching anywhere is never an
+    intersection.
 
     Args:
-        supports: Candidate pieces (the dragged ones must be excluded).
-        rects: World-space material rectangles of the queried piece.
+        supports: Other pieces (the moving one must be excluded).
+        rects: World-space material rectangles of the pose.
+        z: Bottom height of the pose, mm.
+        height: Total height of the pose, mm.
+        stack_offset: Stud plane offset of the pose — ``block_height``
+            for a normal piece, ``total_height`` for a flipped one.
 
     Returns:
-        The :attr:`Support.stack_top` of the highest materially
-        overlapping piece, or None when nothing overlaps.
+        True when the pose volume intersects a support volume.
     '''
-    best: float | None = None
+    top = z + height
     for support in supports:
-        hit = any(
-            abs(query.cx - rect.cx) < query.hx + rect.hx - _OVERLAP_EPS
-            and abs(query.cy - rect.cy) < query.hy + rect.hy - _OVERLAP_EPS
-            for rect in support.rects
-            for query in rects
-        )
-        if hit and (best is None or support.stack_top > best):
-            best = support.stack_top
-    return best
+        if not _rects_overlap(support.rects, rects):
+            continue
+        if z >= support.z + support.height - _OVERLAP_EPS:
+            continue  # fully above the support
+        if support.z >= top - _OVERLAP_EPS:
+            continue  # fully below the support
+        if abs(z - support.stack_top) <= _OVERLAP_EPS:
+            continue  # studs enter the support's top cavities
+        if abs(support.z - (z + stack_offset)) <= _OVERLAP_EPS:
+            continue  # the support's cavities sit on this pose's studs
+        return True
+    return False
 
 
 def _grid_round(value: float, step: float) -> float:
@@ -376,29 +405,46 @@ def _grid_round(value: float, step: float) -> float:
 def assemble_snap_target(
     cursor_x: float,
     cursor_y: float,
+    cursor_z: float,
     rects: Sequence[Rect],
+    height: float,
+    block_height: float,
+    flipped: bool,
     supports: list[Support],
     step: float,
     snap_to_grid: bool,
     snap_to_parts: bool,
 ) -> tuple[float, float, float]:
-    '''Resolve the drop position of a piece from the cursor point.
+    '''Resolve the free-3D drop position of a piece from the cursor point.
 
-    The base target is the cursor point (rounded so the footprint minimum
-    corner — not the center — lands on a grid-step multiple when
-    ``snap_to_grid``). With ``snap_to_parts`` two extra candidate kinds
-    compete by their XY distance to the raw cursor: dropping ON TOP of
-    the highest piece under the footprint (material overlap only), and
-    aligning FLUSH to the sides of a nearby material rectangle (at that
-    piece's bottom height). Ties prefer the stacking candidate.
+    The base target is the cursor point on the caller's working plane
+    (``cursor_z`` is the piece bottom height): X/Y are rounded so the
+    footprint minimum corner — not the center — lands on a grid-step
+    multiple when ``snap_to_grid``, Z is rounded to the step. With
+    ``snap_to_parts`` magnet candidates compete by their 3D distance to
+    the raw cursor: the free base position itself, stacking ON TOP of
+    any piece whose material overlaps the footprint (at its
+    ``stack_top`` — any height, so towers and floating pieces stack
+    alike), and aligning FLUSH to the sides of a nearby material
+    rectangle at that piece's bottom or top plane. Candidates that would
+    intersect another piece are discarded; ties prefer stacking.
+
+    The returned position may still intersect a piece when every
+    candidate collides (the free base position is then returned for the
+    red "blocked" feedback) — callers must gate the actual drop with
+    :func:`assemble_pose_collides`.
 
     Args:
-        cursor_x, cursor_y: Unsnapped cursor point on the floor, mm.
+        cursor_x, cursor_y: Unsnapped cursor point on the working
+            plane, mm.
+        cursor_z: Working plane height (piece bottom), mm.
         rects: Piece-relative material rectangles of the moving piece.
+        height: Total height of the moving piece, mm.
+        block_height: Stud plane height of the moving piece, mm.
+        flipped: Flip state of the moving piece (stacks rim-to-rim).
         supports: Footprints of the other pieces.
         step: Grid step in mm (> 0).
-        snap_to_grid: Round the base target so the footprint corner hits
-            grid-step multiples.
+        snap_to_grid: Round the base target to grid-step multiples.
         snap_to_parts: Enable the stacking / side-flush candidates.
 
     Returns:
@@ -409,6 +455,8 @@ def assemble_snap_target(
     hx, hy = _bbox_halves(rects)
     base_x = _grid_round(cursor_x - hx, step) + hx if snap_to_grid else cursor_x
     base_y = _grid_round(cursor_y - hy, step) + hy if snap_to_grid else cursor_y
+    base_z = _grid_round(cursor_z, step) if snap_to_grid else cursor_z
+    stack_offset = height if flipped else block_height
 
     best: tuple[float, float, float] | None = None
     best_score: tuple[float, int] | None = None
@@ -416,22 +464,38 @@ def assemble_snap_target(
     def consider(x: float, y: float, z: float, stacked: bool) -> None:
         '''Keep the candidate nearest to the cursor (stacking wins ties).'''
         nonlocal best, best_score
-        score = ((cursor_x - x) ** 2 + (cursor_y - y) ** 2, 0 if stacked else 1)
+        score = (
+            (cursor_x - x) ** 2 + (cursor_y - y) ** 2 + (cursor_z - z) ** 2,
+            0 if stacked else 1,
+        )
         if best_score is None or score < best_score:
             best_score = score
             best = (x, y, z)
 
+    def valid_pose(x: float, y: float, z: float) -> bool:
+        '''False when the pose at (x, y, z) would intersect a piece.'''
+        return not assemble_pose_collides(
+            supports, offset_rects(rects, x, y), z, height, stack_offset
+        )
+
     if snap_to_parts:
-        # The plain floor candidate competes too: a side candidate far away
-        # must never beat simply dropping at the cursor point.
-        consider(base_x, base_y, 0.0, stacked=False)
-        top = support_top_z(supports, offset_rects(rects, base_x, base_y))
-        if top is not None:
-            consider(base_x, base_y, top, stacked=True)
+        base_rects_w = offset_rects(rects, base_x, base_y)
+        # The free working-plane candidate competes too — but only when
+        # it does not intersect a piece: a blocked base position must
+        # never hide a legal stacking/flush magnet nearby.
+        if valid_pose(base_x, base_y, base_z):
+            consider(base_x, base_y, base_z, stacked=False)
         for support in supports:
+            if _rects_overlap(support.rects, base_rects_w):
+                # Stacking on this piece at its contact plane (legal at
+                # ANY height: towers, floating pieces, slot bottoms).
+                top = support.stack_top
+                if valid_pose(base_x, base_y, top):
+                    consider(base_x, base_y, top, stacked=True)
             # Flush against every material rectangle of the support and
-            # the moved piece; huge rect sets fall back to the bounding
-            # boxes to keep the candidate count bounded.
+            # the moved piece, at the support's bottom AND top planes;
+            # huge rect sets fall back to the bounding boxes to keep the
+            # candidate count bounded.
             support_rects: Sequence[Rect] = support.rects
             query_rects: Sequence[Rect] = rects
             if len(support_rects) * len(query_rects) > _MAX_SIDE_PAIRS:
@@ -442,33 +506,19 @@ def assemble_snap_target(
                     qx, qy = query_rect.cx, query_rect.cy
                     sx = support_rect.hx + query_rect.hx
                     sy = support_rect.hy + query_rect.hy
-                    consider(
-                        support_rect.cx + sx - qx,
-                        support_rect.cy - qy,
-                        support.z,
-                        stacked=False,
-                    )
-                    consider(
-                        support_rect.cx - sx - qx,
-                        support_rect.cy - qy,
-                        support.z,
-                        stacked=False,
-                    )
-                    consider(
-                        support_rect.cx - qx,
-                        support_rect.cy + sy - qy,
-                        support.z,
-                        stacked=False,
-                    )
-                    consider(
-                        support_rect.cx - qx,
-                        support_rect.cy - sy - qy,
-                        support.z,
-                        stacked=False,
-                    )
+                    for plane in (support.z, support.stack_top):
+                        for cx, cy in (
+                            (support_rect.cx + sx, support_rect.cy),
+                            (support_rect.cx - sx, support_rect.cy),
+                            (support_rect.cx, support_rect.cy + sy),
+                            (support_rect.cx, support_rect.cy - sy),
+                        ):
+                            x, y = cx - qx, cy - qy
+                            if valid_pose(x, y, plane):
+                                consider(x, y, plane, stacked=False)
 
     if best is None:
-        return (base_x, base_y, 0.0)
+        return (base_x, base_y, base_z)
     return best  # type: ignore[return-value]
 
 

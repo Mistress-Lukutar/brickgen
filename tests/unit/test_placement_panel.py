@@ -3,7 +3,7 @@ File:   test_placement_panel.py
 Brief:  Offscreen PlacementPanel tests: bed-range signals, tools state,
         tri-state flip checkbox and sizing.
 Author: Mistress-Lukutar
-Date:   2026-11-22
+Date:   2026-11-23
 Version: v0.21.0
 '''
 
