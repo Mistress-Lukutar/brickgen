@@ -30,6 +30,7 @@ from PySide6.QtWidgets import QRubberBand, QWidget
 from pyvistaqt import QtInteractor
 
 from brickgen.core.models import BlockSettings
+from brickgen.gui.keys import event_key
 from brickgen.gui.move_gizmo import GIZMO_LENGTH_STEPS, MoveGizmo
 
 logger = logging.getLogger(__name__)
@@ -2357,7 +2358,7 @@ class PreviewWidget(QtInteractor):
         move. X/Y/Z lock movement to a single axis (or Shift+X/Y/Z for plane
         constraint) during a move drag. Every other key falls through to the
         VTK interactor.'''
-        key = event.key()
+        key = event_key(event)
         if self._grabbing:
             lock_map: dict[int, str] = {
                 Qt.Key.Key_X: "x",

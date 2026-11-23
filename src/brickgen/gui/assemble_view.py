@@ -16,6 +16,7 @@ from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QWidget
 
+from brickgen.gui.keys import event_key
 from brickgen.gui.preview import (
     _FLOOR_RAY_MIN_SIN,
     AXIS_VECTORS,
@@ -911,7 +912,7 @@ class AssembleView(PreviewWidget):
         '''Placement keys (R/Space rotate, F flips, Esc cancels), X/Y/Z lock
         movement to axis/plane during placement, Space rotates the pieces of
         an active move drag, Del deletes.'''
-        key = event.key()
+        key = event_key(event)
         if self._placing:
             lock_map: dict[int, str] = {
                 Qt.Key.Key_X: "x",
