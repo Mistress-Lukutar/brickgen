@@ -645,6 +645,9 @@ class PreviewWidget(QtInteractor):
         self._grab_press_pos = QPoint()
         self._grab_orig: dict[int, tuple[float, float]] = {}
         self._grab_anchor: np.ndarray | None = None
+        # Free-path anchor/dz for view-plane drag movement (reset on drag start/end).
+        self._grab_free_anchor: np.ndarray | None = None
+        self._grab_free_dz: float = 0.0
         # Axis-lock state (X/Y/Z lock movement to a single axis or plane).
         # Move gizmo (View menu): draggable arrow cross at the selection center.
         self._gizmo_enabled = False
@@ -837,6 +840,10 @@ class PreviewWidget(QtInteractor):
     def grid_step(self) -> float:
         '''Current grid step in mm (unit size * cell scale).'''
         return self._grid_unit * self._grid_scale
+
+    def _z_snap_step(self) -> float:
+        '''Snap step along the Z axis; the XY grid step by default.'''
+        return max(self.grid_step(), 1e-9)
 
     # ------------------------------------------------------- axis-lock helpers
     def active_axes(self) -> frozenset[str]:
@@ -1845,6 +1852,8 @@ class PreviewWidget(QtInteractor):
             if 0 <= index < len(self._scene_meta)
         }
         self._grab_anchor = None
+        self._grab_free_anchor = None
+        self._grab_free_dz = 0.0
         # Reset axis-lock state for a fresh move.
         self._axis_lock = None
         self._axis_plane = False
@@ -1885,6 +1894,8 @@ class PreviewWidget(QtInteractor):
             if 0 <= index < len(self._scene_meta)
         }
         self._grab_anchor = None
+        self._grab_free_anchor = None
+        self._grab_free_dz = 0.0
         # Reset axis-lock state for a fresh move.
         self._axis_lock = None
         self._axis_plane = False
@@ -1962,6 +1973,7 @@ class PreviewWidget(QtInteractor):
 
         if self._grid_snap:
             step = max(self.grid_step(), 1e-9)
+            z_step = self._z_snap_step()
             meta = self._scene_meta[primary]
             hx = float(meta.get('half_x', 0.0))
             hy = float(meta.get('half_y', 0.0))
@@ -1970,7 +1982,7 @@ class PreviewWidget(QtInteractor):
             if "y" in allowed:
                 target_y = round((target_y - hy) / step) * step + hy
             if "z" in allowed:
-                dz = round(dz / step) * step
+                dz = round(dz / z_step) * z_step
 
         # Check if we actually moved compared to current meta position.
         dx = target_x - original_x
@@ -2127,6 +2139,47 @@ class PreviewWidget(QtInteractor):
         if length < 1e-9 or abs(direction[2]) < _FLOOR_RAY_MIN_SIN * length:
             return None
         t = (plane_z - origin[2]) / direction[2]
+        if t <= 0.0:
+            return None
+        return origin + direction * t
+
+    def _view_plane_normal(self) -> np.ndarray | None:
+        '''Unit normal of the camera view plane (the projection direction).'''
+        camera = self.renderer.GetActiveCamera()
+        normal = np.asarray(camera.GetDirectionOfProjection(), dtype=np.float64)
+        norm = float(np.linalg.norm(normal))
+        if norm < 1e-9:
+            return None
+        return normal / norm
+
+    def _cursor_on_view_plane(
+        self, pos: QPoint, point: np.ndarray
+    ) -> np.ndarray | None:
+        '''World point of the cursor ray on the camera-parallel plane through *point*.
+
+        This is the "free 3D move" plane — unlike the horizontal working plane
+        it can never be grazed by the ray (ray ≈ view direction), so pixel
+        deltas stay sane from any camera angle. Returns None when ray/plane are
+        degenerate or the plane is behind the camera.
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+            point: Anchor point defining the intersection plane.
+
+        Returns:
+            World (x, y, z) point on the view-plane through *point*, or None.
+        '''
+        ray = self._cursor_ray(pos)
+        if ray is None:
+            return None
+        normal = self._view_plane_normal()
+        if normal is None:
+            return None
+        origin, direction = ray
+        denom = float(np.dot(direction, normal))
+        if abs(denom) < 1e-9:
+            return None
+        t = float(np.dot(point - origin, normal) / denom)
         if t <= 0.0:
             return None
         return origin + direction * t
@@ -2508,6 +2561,26 @@ class PreviewWidget(QtInteractor):
             return None
         index = self._actor_map.get(self._picker.GetActor())
         return ("block", index) if index is not None else None
+
+    def _pick_scene_point(
+        self, pos: QPoint
+    ) -> tuple[tuple[str, int], np.ndarray] | None:
+        '''Depth-sorted block pick plus the world-space hit point.
+
+        Args:
+            pos: Cursor position in Qt widget coordinates.
+
+        Returns:
+            ``(("block", index), (x, y, z))`` for a block surface hit, else None.
+        '''
+        x, y = self._to_display(pos)
+        if not self._picker.Pick(x, y, 0, self.renderer):
+            return None
+        index = self._actor_map.get(self._picker.GetActor())
+        if index is None:
+            return None
+        wx, wy, wz = self._picker.GetPickPosition()
+        return ("block", index), np.array([wx, wy, wz], dtype=np.float64)
 
     def _finish_click(self, event: QMouseEvent) -> None:
         '''Apply the click semantics of an LMB press without a drag.

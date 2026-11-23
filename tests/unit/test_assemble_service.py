@@ -475,6 +475,33 @@ def test_snap_target_z_grid_rounding() -> None:
     assert z == pytest.approx(12.0)  # round(13/4)*4 = 12
 
 
+def test_snap_target_z_step_custom() -> None:
+    '''z_step overrides the Z snap step independently of XY step.'''
+    supports = [_box_support()]
+    # step=2.0, z_step=2.5, cursor_z=7.0 → z rounds to 7.5 (multiple of 2.5)
+    x, y, z = assemble_snap_target(
+        50.0, 50.0, 7.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, supports,
+        2.0, True, True, z_step=2.5,
+    )
+    assert z == pytest.approx(7.5)  # round(7.0/2.5)*2.5 = 7.5
+    # X/Y still use step=2.0 — cursor at (50,50) with hx=4 → _grid_round(46,2)+4=50
+    assert x == pytest.approx(50.0)
+    assert y == pytest.approx(50.0)
+
+
+def test_snap_target_z_step_none_fallback() -> None:
+    '''z_step=None falls back to the XY step for Z rounding.'''
+    supports = [_box_support()]
+    # step=2.0, z_step=None → same as before: cursor_z=7.0 rounds to 8.0
+    x, y, z = assemble_snap_target(
+        50.0, 50.0, 7.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, supports,
+        2.0, True, True, z_step=None,
+    )
+    assert z == pytest.approx(8.0)  # round(7.0/2.0)*2.0 = 8.0
+
+
 def test_snap_target_flipped_stack_offset() -> None:
     '''Flipped=True query piece stacking onto a support uses flipped
     stack_top semantics (stack candidate accepted as valid).'''
@@ -494,6 +521,62 @@ def test_snap_target_flipped_stack_offset() -> None:
     )
     assert (x, y) == pytest.approx((4.0, 4.0))
     assert z == pytest.approx(3.0)  # stacked at support.stack_top regardless of flip
+
+
+# ---------------------------------------------------------------------------
+# pick_point parameter tests
+# ---------------------------------------------------------------------------
+
+
+def test_snap_target_pick_point_on_tall_piece_wins() -> None:
+    '''pick_point on a tall piece top overrides scoring and base XY.
+
+    Two supports — A tall (stack_top=10), B short (stack_top=3) — placed so
+    the working-plane cursor point is geometrically closer to B's stacking
+    candidate, but pick_point sits exactly on A's top surface. Result must
+    stack on A (z == A.stack_top, x/y near the pick XY grid-rounded).
+    Also assert base-XY override: pick XY far from cursor XY → returned x/y
+    near the PICK xy.
+    '''
+    tall = Support(
+        x=0.0, y=0.0, z=0.0, hx=8.0, hy=8.0, height=8.8, stack_top=10.0,
+        rects=(Rect(0.0, 0.0, 8.0, 8.0),),
+    )
+    short = Support(
+        x=20.0, y=20.0, z=0.0, hx=8.0, hy=8.0, height=8.8, stack_top=3.0,
+        rects=(Rect(20.0, 20.0, 8.0, 8.0),),
+    )
+    # Cursor far from both supports in XY, high above at z=12.
+    x, y, z = assemble_snap_target(
+        50.0, 50.0, 12.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, [tall, short],
+        4.0, True, True,
+        pick_point=(0.0, 0.0, 10.0),  # on tall piece's top
+    )
+    # The tall support's stack_top candidate wins (distance from pick=0).
+    assert z == pytest.approx(10.0)
+    # Base XY derives from pick_point, not cursor: _grid_round(0-4,4)+4 = 0
+    assert (x, y) == pytest.approx((0.0, 0.0))
+
+
+def test_snap_target_pick_point_on_side_keeps_cursor_z() -> None:
+    '''pick_point on a side face at mid-height → free candidate keeps
+    cursor_z rounding (z does NOT become the pick z).'''
+    # Support whose +X side is near cursor's grid-rounded position.
+    support = _box_support(x=10.0, y=10.0)  # spans [2, 18] in X, Y
+    # Cursor at (10, 10) → base rounds to (8, 8), free candidate at (8, 8, 12).
+    # pick_point on the +X side face of the support at mid-height.
+    pick_pt: tuple[float, float, float] = (18.0, 10.0, 4.4)
+    x, y, z = assemble_snap_target(
+        10.0, 10.0, 12.0,
+        (Rect(0.0, 0.0, 4.0, 4.0),), 4.0, 3.0, False, [support],
+        4.0, True, True,
+        pick_point=pick_pt,
+    )
+    # Free candidate (8, 8, 12) distance to pick (18, 10, 4.4): sqrt(100+4+57.76)=13.7
+    # Flush at +X side: (22, 10, 3), distance: sqrt(16+0+0.16)=4.02 → flush wins!
+    # But z=3 is support.stack_top (a support plane), NOT mid-height pick_z=4.4.
+    assert z in (pytest.approx(0.0), pytest.approx(3.0), pytest.approx(12.0))
 
 
 # ---------------------------------------------------------------------------

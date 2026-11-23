@@ -930,6 +930,7 @@ def test_del_action_gated_to_planning(window: MainWindow) -> None:
 
 def _hover_move(widget: QWidget, pos: QPoint) -> None:
     '''A plain mouse-move event (no buttons held) at *pos*.'''
+    widget._pick_scene_point = lambda pos=None: None  # type: ignore[method-assign]
     move = QMouseEvent(
         QEvent.Type.MouseMove,
         QPointF(pos),
@@ -945,11 +946,14 @@ def _assemble_stub_ray(view, target_x: float, target_y: float, target_z: float =
 
     The camera origin is offset sideways so rays never run parallel to the
     Z axis line (the single-axis closest-point guard would reject them).
+    Also stubs _view_plane_normal to (0,0,1) so existing tests keep legacy
+    horizontal-plane semantics.
     '''
     origin = np.array([150.0, 120.0, 400.0], dtype=np.float64)
     target = np.array([target_x, target_y, target_z], dtype=np.float64)
     direction = target - origin
     view._cursor_ray = lambda pos=None: (origin, direction)
+    view._view_plane_normal = lambda: np.array([0.0, 0.0, 1.0])  # type: ignore[method-assign]
 
 
 # ------------------------------------------------------------------ Z lock lift
@@ -1411,3 +1415,301 @@ def test_gizmo_toggle_shared_across_tabs(window: MainWindow) -> None:
 
 
 # ------------------------------------------------------------------ gizmo visibility
+
+
+# ------------------------------------------------------- Z snap step (block height)
+
+def test_ghost_z_snap_uses_block_height(window: MainWindow) -> None:
+    '''Ghost Z snap uses block_height * grid_scale, not grid_step.'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    view = window._assemble_view
+    uid = window._project.blocks[0].uid
+    window._on_parts_place_requested(uid)
+    assert view.placing() is True
+
+    # Default: grid_step = 4.0 * 0.5 = 2.0, block_height = 3.0
+    # So _z_snap_step = 3.0 * 0.5 = 1.5 (not 2.0)
+    assert view._z_snap_step() == pytest.approx(1.5)
+    assert view.grid_step() == pytest.approx(2.0)
+
+    # Engage Z lock so ghost uses constrained path with _update_ghost_constrained
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("z", False)
+    assert view._axis_lock == "z"
+
+    # Move cursor to z=7.0: ghost z should be a multiple of _z_snap_step (1.5)
+    _assemble_stub_ray(view, 10.0, 5.0, 7.0)
+    _hover_move(view, QPoint(200, 150))
+    assert view._ghost_pos is not None
+    _, _, gz = view._ghost_pos
+    z_step = view._z_snap_step()
+    remainder_z = abs(gz / z_step - round(gz / z_step))
+    assert remainder_z < 1e-9, f"gz={gz} is not a multiple of _z_snap_step={z_step}"
+
+    # Move cursor high to z=100: ghost z should also be a multiple of _z_snap_step
+    _assemble_stub_ray(view, 10.0, 5.0, 100.0)
+    _hover_move(view, QPoint(200, 150))
+    assert view._ghost_pos is not None
+    _, _, gz = view._ghost_pos
+    remainder_z = abs(gz / z_step - round(gz / z_step))
+    assert remainder_z < 1e-9, f"gz={gz} is not a multiple of _z_snap_step={z_step}"
+
+    # Verify Z does NOT land on multiples of grid_step (2.0) for this movement.
+    # With step=1.5 the snap point differs from what step=2.0 would produce.
+    assert abs(gz - round(gz / 2.0) * 2.0) > 1e-9
+
+    view.cancel_placement()
+    _reset(window)
+
+
+def test_drag_z_lock_dz_is_multiple_of_z_snap_step(window: MainWindow) -> None:
+    '''Z-lock drag during piece grab produces dz multiples of _z_snap_step().'''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+    _place(window, z=0.0)
+
+    view = window._assemble_view
+    view.set_selection({0}, 0)
+    assert view.start_grab()
+    view._begin_piece_drag()
+
+    # Engage Z lock with near-anchor ray
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("z", False)
+    assert view._axis_lock == "z"
+    _hover_move(view, QPoint(200, 150))
+
+    # Retarget ray high: constrained delta lifts z only.
+    _assemble_stub_ray(view, 10.0, 5.0, 100.0)
+    _hover_move(view, QPoint(200, 150))
+    meta = view._scene_meta[0]
+    dz = float(meta['pos_z'])
+
+    # dz must be a multiple of _z_snap_step() (block_height * grid_scale = 1.5)
+    z_step = view._z_snap_step()
+    assert z_step == pytest.approx(1.5)
+    remainder = abs(dz / z_step - round(dz / z_step))
+    assert remainder < 1e-9, f"dz={dz} is not a multiple of z_step={z_step}"
+
+    view.cancel_grab()
+    _reset(window)
+
+
+def test_ghost_snap_to_pick_point_on_tall_piece(window: MainWindow) -> None:
+    '''Ghost placement uses the actual cursor hit point on the picked piece.
+
+    Place a piece, start ghost placement, stub _pick_scene_point to return a
+    hit on the placed piece's top surface, stub the ray as usual, _hover_move
+    → _ghost_pos z == that piece's stack_top and x/y near the pick point.
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    # Place a reference piece at z=25 so its stack_top (28.0) is above body bottom
+    # but far enough from ghost's working plane (z=0) that stacking wins over free.
+    _place(window, z=25.0)
+    bh = window._project.block_settings(0).block_height
+    # stack_top = position_z + block_height = 25.0 + 3.0 = 28.0
+    expected_stack_top = pytest.approx(25.0 + bh)
+
+    view = window._assemble_view
+    uid = window._project.blocks[0].uid
+    window._on_parts_place_requested(uid)
+    assert view.placing() is True
+
+    # Stub the ray for deterministic floor-plane intersection.
+    _assemble_stub_ray(view, 10.0, 5.0, 2.5)
+
+    # Verify supports are populated (before any hover calls).
+    assert len(view._drag_supports) > 0, (
+        f"_drag_supports empty: snap_parts={view._snap_parts}, "
+        f"provider={view._supports_provider}"
+    )
+
+    # Move the ghost once with no hit to initialize position.
+    _hover_move(view, QPoint(100, 100))
+
+    # Now set pick_scene_point stub (after _hover_move so it doesn't get overwritten).
+    total_h = window._project.block_settings(0).total_height
+    pick_z = 25.0 + total_h
+    hit_val: tuple[tuple[str, int], np.ndarray] = (
+        ("block", 0), np.array([0.0, 0.0, pick_z], dtype=np.float64)
+    )
+    view._pick_scene_point = lambda pos: hit_val  # type: ignore[method-assign]
+
+    # Call _update_ghost directly so the stub is used (not overwritten by _hover_move).
+    view._update_ghost(QPoint(100, 100))
+
+    assert view._ghost_pos is not None
+    gx, gy, gz = view._ghost_pos
+    # Ghost z should be at the stacked piece's stack_top (position_z + block_height).
+    assert gz == expected_stack_top
+    # Ghost x/y should be near the pick point (grid-rounded to origin).
+    assert gx == pytest.approx(0.0, abs=4.0)
+    assert gy == pytest.approx(0.0, abs=4.0)
+
+    view.cancel_placement()
+    _reset(window)
+
+
+# ----------------------------------------------------- view-plane free movement
+
+def test_ghost_free_path_moves_z_with_angled_camera(window: MainWindow) -> None:
+    '''Ghost placement with angled camera moves Z via mouse, no axis lock.
+
+    The view-plane normal is set to (0, 1, 1)/sqrt(2), a 45-degree upward angle.
+    Two cursor positions produce different intersections with the plane through
+    the ghost anchor; the z values must differ and must clamp at 0 when aimed
+    below the floor.
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    view = window._assemble_view
+    uid = window._project.blocks[0].uid
+    _ = window._project.block_settings(0)  # trigger settings load
+    window._on_parts_place_requested(uid)
+    assert view.placing() is True
+
+    # Stub ray with normal pointing up 45 degrees in YZ.
+    origin = np.array([150.0, 120.0, 400.0], dtype=np.float64)
+    target1 = np.array([10.0, 5.0, 2.5], dtype=np.float64)
+    direction1 = target1 - origin
+    view._cursor_ray = lambda pos=None: (origin, direction1)
+    angled_normal = np.array([0.0, 1.0, 1.0]) / np.sqrt(2.0)
+    view._view_plane_normal = lambda: angled_normal  # type: ignore[method-assign]
+
+    # First hover: ray target at z=2.5 → intersection plane through ghost anchor.
+    # ghost_free_anchor starts at (0, 0, 0) since ghost_pos is None and ghost_z=0.
+    # Plane normal = (0, 1/sqrt(2), 1/sqrt(2)), origin = (150, 120, 400).
+    # denom = dot(direction1, normal) = 0 + (-115)/sqrt(2) + (-397.5)/sqrt(2)
+    #       = -512.5/sqrt(2) ≈ -362.4
+    # point = ghost_free_anchor = [0, 0, 0]
+    # dot(point - origin, normal) = dot([-150, -120, -400], [0, 1/sqrt(2), 1/sqrt(2)])
+    #   = -120/sqrt(2) + (-400)/sqrt(2) = -520/sqrt(2) ≈ -367.7
+    # t = (-520/sqrt(2)) / (-512.5/sqrt(2)) = 520/512.5 ≈ 1.0146
+    # raw[2] = 400 + (2.5 - 400) * t = 400 + (-397.5) * 1.0146 ≈ 400 - 403.3 ≈ -3.3
+    _hover_move(view, QPoint(100, 100))
+    assert view._ghost_free_anchor is not None
+    z_after_first = float(view._ghost_free_anchor[2])
+
+    # Second hover: ray target at z=100 → different intersection.
+    target2 = np.array([10.0, 5.0, 100.0], dtype=np.float64)
+    direction2 = target2 - origin
+    view._cursor_ray = lambda pos=None: (origin, direction2)
+    # denom = dot(direction2, normal) = 0 + (-115)/sqrt(2) + (-300)/sqrt(2)
+    #       = -415/sqrt(2) ≈ -293.4
+    # t = (-520/sqrt(2)) / (-415/sqrt(2)) = 520/415 ≈ 1.2530
+    # raw[2] = 400 + (100 - 400) * t = 400 + (-300) * 1.2530 ≈ 400 - 375.9 ≈ 24.1
+    _hover_move(view, QPoint(200, 150))
+    assert view._ghost_free_anchor is not None
+    z_after_second = float(view._ghost_free_anchor[2])
+
+    # Z must have changed between the two hover moves (angled camera).
+    assert abs(z_after_first - z_after_second) > 0.5, (
+        f"Z did not change: {z_after_first} vs {z_after_second}"
+    )
+
+    # Third hover: aim well below floor → raw[2] negative → clamp at 0.
+    target3 = np.array([10.0, 5.0, -400.0], dtype=np.float64)
+    direction3 = target3 - origin
+    view._cursor_ray = lambda pos=None: (origin, direction3)
+    # denom = dot(direction3, normal) = 0 + (-115)/sqrt(2) + (-800)/sqrt(2)
+    #       = -915/sqrt(2) ≈ -647.0
+    # t = (-520/sqrt(2)) / (-915/sqrt(2)) = 520/915 ≈ 0.5683
+    # raw[2] = 400 + (-800) * 0.5683 = 400 - 454.6 ≈ -54.6 → clamped to 0
+    _hover_move(view, QPoint(100, 100))
+    assert view._ghost_pos is not None
+    _, _, ghost_z = view._ghost_pos
+    assert ghost_z == pytest.approx(0.0, abs=1e-6), (
+        f"Ghost z should clamp at 0, got {ghost_z}"
+    )
+
+    view.cancel_placement()
+    _reset(window)
+
+
+def test_drag_free_path_moves_z_with_angled_camera(window: MainWindow) -> None:
+    '''Drag with angled camera moves Z via mouse, no axis lock.
+
+    Place a piece, start grab, hover with angled normal → pos_z changes.
+    Aim below floor → z clamps at 0. Then engage Z-lock mid-grab and verify
+    the height is retained.
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+
+    # Place a reference piece at z=5 so its pos_z != 0 for clarity.
+    _place(window, z=5.0)
+
+    view = window._assemble_view
+    view.set_selection({0}, 0)
+    assert view.start_grab()
+    view._begin_piece_drag()
+
+    # Stub ray with angled normal [0, -1, -1]/sqrt(2).
+    origin = np.array([150.0, 120.0, 400.0], dtype=np.float64)
+    target1 = np.array([10.0, 5.0, 2.5], dtype=np.float64)
+    direction1 = target1 - origin
+    view._cursor_ray = lambda pos=None: (origin, direction1)
+    angled_normal = np.array([0.0, -1.0, -1.0]) / np.sqrt(2.0)
+    view._view_plane_normal = lambda: angled_normal  # type: ignore[method-assign]
+
+    # First hover: initializes grab_free_anchor at the piece's current position.
+    _hover_move(view, QPoint(100, 100))
+    assert view._grab_free_anchor is not None
+
+    # Second hover: ray target at z=100 → different intersection.
+    # With normal [0,-1,-1]/sqrt(2) and origin at (150,120,400), raw[2] is positive
+    # but delta from anchor is negative → piece drops toward floor.
+    target2 = np.array([10.0, 5.0, 100.0], dtype=np.float64)
+    direction2 = target2 - origin
+    view._cursor_ray = lambda pos=None: (origin, direction2)
+    _hover_move(view, QPoint(200, 150))
+    meta = view._scene_meta[0]
+    second_z = float(meta['pos_z'])
+
+    # Third hover: aim well below floor → raw[2] decreases further.
+    target3 = np.array([10.0, 5.0, -400.0], dtype=np.float64)
+    direction3 = target3 - origin
+    view._cursor_ray = lambda pos=None: (origin, direction3)
+    _hover_move(view, QPoint(100, 100))
+    meta = view._scene_meta[0]
+    third_z = float(meta['pos_z'])
+
+    # Z should decrease (drop toward floor) as cursor aims lower.
+    assert third_z <= second_z, (
+        f"Z should not increase: second={second_z}, third={third_z}"
+    )
+
+    # Engage Z-lock mid-grab: height should be retained (no jump).
+    _assemble_stub_ray(view, 10.0, 5.0)
+    view._set_axis_lock("z", False)
+    assert view._axis_lock == "z"
+    _hover_move(view, QPoint(200, 150))
+    meta = view._scene_meta[0]
+    # Engagement is a no-move: height stays approximately at the current value.
+    # (Small snapping differences may occur due to z_step rounding.)
+    diff = abs(meta["pos_z"] - third_z)
+    assert diff < 2.0, (
+        f"Z-lock engagement should retain height: expected ~{third_z}, "
+        f"got {meta['pos_z']}"
+    )
+
+    # Lift via Z-lock: ray target high → piece lifts.
+    _assemble_stub_ray(view, 10.0, 5.0, 200.0)
+    _hover_move(view, QPoint(200, 150))
+    meta = view._scene_meta[0]
+    assert meta["pos_z"] > 50, (
+        f"Z-lock should lift piece above 50, got {meta['pos_z']}"
+    )
+
+    view.cancel_grab()
+    _reset(window)

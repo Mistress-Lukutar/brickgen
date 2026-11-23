@@ -101,6 +101,8 @@ class AssembleView(PreviewWidget):
         self._ghost_flip = False
         self._ghost_color = "#ffffff"
         self._ghost_pos: tuple[float, float, float] | None = None
+        # Free-path anchor for view-plane ghost movement (reset on pose changes).
+        self._ghost_free_anchor: np.ndarray | None = None
         # --- Drag state ---
         self._grab_orig_z: dict[int, float] = {}
         self._drag_dz = 0.0
@@ -113,6 +115,23 @@ class AssembleView(PreviewWidget):
     def active_axes(self) -> frozenset[str]:
         '''Assemble tab allows Z movement (3D placement).'''
         return frozenset({"x", "y", "z"})
+
+    def _z_snap_step(self) -> float:
+        '''Z snap step: block height scaled by the grid scale factor.'''
+        if self._placing:
+            height = self._ghost_block_height
+        elif self._grab_orig:
+            primary = (
+                self._primary
+                if self._primary in self._grab_orig
+                else min(self._grab_orig)
+            )
+            height = float(self._scene_meta[primary].get('block_h', 0.0))
+        else:
+            height = 0.0
+        if height <= 1e-9:
+            return super()._z_snap_step()
+        return max(height * self._grid_scale, 1e-9)
 
     def _clamp_move_dz(self, dz: float) -> float:
         '''Clamp Z delta so the lowest grabbed piece never goes below z=0.'''
@@ -193,6 +212,7 @@ class AssembleView(PreviewWidget):
         self._constraint_origin = None
         self._constraint_zero = None
         self._last_grab_pos = None
+        self._ghost_free_anchor = None
         self._placing = True
         self._ghost_base = mesh
         self._ghost_block = block_index
@@ -247,6 +267,7 @@ class AssembleView(PreviewWidget):
         self._constraint_origin = None
         self._constraint_zero = None
         self._last_grab_pos = None
+        self._ghost_free_anchor = None
         self._update_gizmo()
         self.render()
 
@@ -303,8 +324,8 @@ class AssembleView(PreviewWidget):
         '''Move the ghost to the snapped drop position under the cursor.
 
         When an axis lock is active (X/Y/Z key), delegates to the constrained
-        path; otherwise uses the original free-plane floor intersection with
-        magnet snapping.
+        path; otherwise uses camera view-plane movement through the ghost anchor
+        with magnet snapping.
         '''
         if not self._placing or self._ghost_actor is None:
             return
@@ -312,15 +333,47 @@ class AssembleView(PreviewWidget):
         if self._axis_lock is not None:
             self._update_ghost_constrained(pos)
             return
-        world = self._cursor_on_plane(pos, self._ghost_z)
-        if world is None:
-            return
+        if self._guide_actors:
+            # A just-disabled lock leaves stale guide lines behind.
+            self._clear_guides()
+        hit = self._pick_scene_point(pos)
+        pick_x, pick_y = 0.0, 0.0
+        pick_point: np.ndarray | None = None
+        cursor_z = self._ghost_z
+        if hit is not None:
+            pick_x, pick_y = float(hit[1][0]), float(hit[1][1])
+            pick_point = hit[1]
+        else:
+            # Free path: camera view-plane through the ghost anchor.
+            if self._ghost_free_anchor is None:
+                gx, gy, gz = (
+                    self._ghost_pos if self._ghost_pos is not None
+                    else (0.0, 0.0, self._ghost_z)
+                )
+                self._ghost_free_anchor = np.array(
+                    [gx, gy, gz], dtype=np.float64
+                )
+            raw = self._cursor_on_view_plane(pos, self._ghost_free_anchor)
+            if raw is None:
+                return
+            self._ghost_free_anchor = raw.copy()
+            pick_x = float(raw[0])
+            pick_y = float(raw[1])
+            cursor_z = float(raw[2])
         x, y, z = assemble_snap_target(
-            float(world[0]), float(world[1]), self._ghost_z,
+            pick_x, pick_y, cursor_z,
             self._ghost_rects, self._ghost_height, self._ghost_block_height,
             self._ghost_flip, self._drag_supports, self.grid_step(),
             self._grid_snap, self._snap_parts,
+            z_step=self._z_snap_step(),
+            pick_point=pick_point,
         )
+        z = max(z, 0.0)
+        if pick_point is not None:
+            # Handoff: re-anchor the free path at the magnet result, so
+            # leaving the hovered piece continues from the snapped pose
+            # instead of jumping back to a stale cursor anchor.
+            self._ghost_free_anchor = np.array([x, y, z], dtype=np.float64)
         self._ghost_pos = (x, y, z)
         self._ghost_actor.SetPosition(x, y, z)
         self._tint_ghost(not self._ghost_valid_at(x, y, z))
@@ -336,6 +389,8 @@ class AssembleView(PreviewWidget):
         Args:
             pos: Cursor position in Qt widget coordinates.
         '''
+        # Clear stale free-path anchor when entering constrained mode.
+        self._ghost_free_anchor = None
         # Lazily engage: when constraint_anchor is None, set it from ghost pos.
         if self._constraint_anchor is None:
             gx, gy, gz = (
@@ -400,6 +455,7 @@ class AssembleView(PreviewWidget):
         # minimum corner rounds to the grid step like the free path does.
         if self._grid_snap:
             step = max(self.grid_step(), 1e-9)
+            z_step = self._z_snap_step()
             hx = hy = 0.0
             if self._ghost_rects:
                 cx_vals = [r.cx + r.hx for r in self._ghost_rects]
@@ -413,7 +469,7 @@ class AssembleView(PreviewWidget):
             if "y" in allowed:
                 ty = round((ty - hy) / step) * step + hy
             if "z" in allowed:
-                tz = round(tz / step) * step
+                tz = round(tz / z_step) * z_step
 
         # Clamp z >= 0.
         tz = max(tz, 0.0)
@@ -492,44 +548,64 @@ class AssembleView(PreviewWidget):
     # --------------------------------------------------------- input routing
 
     def _update_grab(self, pos: QPoint) -> None:
-        '''Move the selection with the cursor on the plane at its height.
+        '''Move the selection with the cursor via camera view-plane movement.
 
         When an axis lock is active (X/Y/Z key), delegates to the constrained
-        path; otherwise uses the original free-plane intersection at the
-        primary piece's current bottom height.
+        path; otherwise uses camera view-plane delta tracking anchored at the
+        primary piece's current position.
         '''
         if not self._grabbing or not self._grab_orig:
             return
         self._last_grab_pos = QPoint(pos)
+        # Clear stale free-path anchor when entering constrained mode.
         if self._axis_lock is not None:
+            self._grab_free_anchor = None
             self._update_grab_constrained(pos)
             self._sync_drag_dz_from_primary()
             return
         primary = (
             self._primary if self._primary in self._grab_orig else min(self._grab_orig)
         )
-        plane_z = float(self._scene_meta[primary].get('pos_z', 0.0))
-        world = self._cursor_on_plane(pos, plane_z)
-        if world is None:
-            return
-        if self._grab_anchor is None:
-            self._grab_anchor = world[:2].copy()
+        if self._grab_free_anchor is None:
+            meta = self._scene_meta[primary]
+            plane_point = np.array(
+                [float(meta['pos_x']), float(meta['pos_y']),
+                 float(meta.get('pos_z', 0.0))], dtype=np.float64
+            )
+            raw = self._cursor_on_view_plane(pos, plane_point)
+            if raw is None:
+                return
+            self._grab_free_anchor = raw.copy()
+            self._grab_anchor = raw[:2].copy()
+            self._grab_free_dz = float(self._drag_dz)
             if self._drag_dz != self._applied_dz:
                 self._apply_move(self._grab_orig, 0.0, 0.0, dz=self._drag_dz)
                 self._applied_dz = self._drag_dz
             return
+        raw = self._cursor_on_view_plane(pos, self._grab_free_anchor)
+        if raw is None:
+            return
+        delta = raw - self._grab_free_anchor
+        self._grab_free_anchor = raw.copy()
         original_x, original_y = self._grab_orig[primary]
-        target_x = original_x + float(world[0] - self._grab_anchor[0])
-        target_y = original_y + float(world[1] - self._grab_anchor[1])
+        target_x = original_x + float(delta[0])
+        target_y = original_y + float(delta[1])
+        dz = self._grab_free_dz + float(delta[2])
+        dz = self._clamp_move_dz(dz)
         if self._grid_snap:
             meta = self._scene_meta[primary]
             target_x, target_y = self._snap_move_target(
                 target_x, target_y,
                 float(meta.get('half_x', 0.0)), float(meta.get('half_y', 0.0)),
             )
+            orig_z = float(self._grab_orig_z.get(primary, 0.0))
+            z_step = self._z_snap_step()
+            dz = round((orig_z + dz) / z_step) * z_step - orig_z
+        self._grab_free_dz = dz
         dx, dy = target_x - original_x, target_y - original_y
-        self._apply_move(self._grab_orig, dx, dy, dz=self._drag_dz)
-        self._applied_dz = self._drag_dz
+        self._apply_move(self._grab_orig, dx, dy, dz=dz)
+        self._sync_drag_dz_from_primary()
+        self._update_guides(self._selection_center())
 
     def _sync_drag_dz_from_primary(self) -> None:
         '''Sync _drag_dz / _applied_dz from the primary piece's current Z.'''
@@ -812,6 +888,8 @@ class AssembleView(PreviewWidget):
         }
         self._grab_orig.clear()
         self._grab_anchor = None
+        self._grab_free_anchor = None
+        self._grab_free_dz = 0.0
         self.blocks_moved.emit(positions)
 
     def _finish_move_drag(self, event: QMouseEvent) -> None:
@@ -836,6 +914,8 @@ class AssembleView(PreviewWidget):
             }
             self._grab_orig.clear()
             self._grab_anchor = None
+            self._grab_free_anchor = None
+            self._grab_free_dz = 0.0
             self.blocks_moved.emit(positions)
             return
         if moved:
@@ -844,6 +924,8 @@ class AssembleView(PreviewWidget):
         self._end_grab()
         self._grab_orig.clear()
         self._grab_anchor = None
+        self._grab_free_anchor = None
+        self._grab_free_dz = 0.0
         if not from_axis:
             self._finish_click(event)
 
@@ -856,6 +938,8 @@ class AssembleView(PreviewWidget):
         self._end_grab()
         self._grab_orig.clear()
         self._grab_anchor = None
+        self._grab_free_anchor = None
+        self._grab_free_dz = 0.0
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
         '''Ghost mode: LMB drops, RMB cancels, MMB keeps the camera moves.'''
@@ -929,6 +1013,7 @@ class AssembleView(PreviewWidget):
                 self._ghost_rot = (self._ghost_rot + 1) % 4
                 self._refresh_ghost_rects()
                 self._build_ghost_actor()
+                self._ghost_free_anchor = None
                 self.render()
                 event.accept()
                 return
@@ -936,6 +1021,7 @@ class AssembleView(PreviewWidget):
                 self._ghost_flip = not self._ghost_flip
                 self._refresh_ghost_rects()
                 self._build_ghost_actor()
+                self._ghost_free_anchor = None
                 self.render()
                 event.accept()
                 return

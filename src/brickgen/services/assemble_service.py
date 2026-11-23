@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    import numpy as np
 
 from brickgen.core.exceptions import SettingsValidationError
 from brickgen.core.models import BlockSettings
@@ -414,18 +417,20 @@ def assemble_snap_target(
     step: float,
     snap_to_grid: bool,
     snap_to_parts: bool,
+    z_step: float | None = None,
+    pick_point: Sequence[float] | np.ndarray | None = None,
 ) -> tuple[float, float, float]:
     '''Resolve the free-3D drop position of a piece from the cursor point.
 
     The base target is the cursor point on the caller's working plane
     (``cursor_z`` is the piece bottom height): X/Y are rounded so the
     footprint minimum corner — not the center — lands on a grid-step
-    multiple when ``snap_to_grid``, Z is rounded to the step. With
-    ``snap_to_parts`` magnet candidates compete by their 3D distance to
-    the raw cursor: the free base position itself, stacking ON TOP of
-    any piece whose material overlaps the footprint (at its
-    ``stack_top`` — any height, so towers and floating pieces stack
-    alike), and aligning FLUSH to the sides of a nearby material
+    multiple when ``snap_to_grid``, Z is rounded to *z_step* (defaults
+    to *step*). With ``snap_to_parts`` magnet candidates compete by
+    their 3D distance to the raw cursor: the free base position itself,
+    stacking ON TOP of any piece whose material overlaps the footprint
+    (at its ``stack_top`` — any height, so towers and floating pieces
+    stack alike), and aligning FLUSH to the sides of a nearby material
     rectangle at that piece's bottom or top plane. Candidates that would
     intersect another piece are discarded; ties prefer stacking.
 
@@ -446,6 +451,11 @@ def assemble_snap_target(
         step: Grid step in mm (> 0).
         snap_to_grid: Round the base target to grid-step multiples.
         snap_to_parts: Enable the stacking / side-flush candidates.
+        z_step: Optional Z-axis snap step; defaults to *step*.
+        pick_point: World point on the piece surface under the cursor;
+            when given, it drives the candidate scoring reference AND the
+            base XY (for correct projection). ``base_z`` still rounds from
+            ``cursor_z`` so side faces do not float the ghost.
 
     Returns:
         The ``(x, y, z)`` drop position of the footprint center; *z* is
@@ -453,19 +463,30 @@ def assemble_snap_target(
     '''
     step = max(step, 1e-9)
     hx, hy = _bbox_halves(rects)
-    base_x = _grid_round(cursor_x - hx, step) + hx if snap_to_grid else cursor_x
-    base_y = _grid_round(cursor_y - hy, step) + hy if snap_to_grid else cursor_y
-    base_z = _grid_round(cursor_z, step) if snap_to_grid else cursor_z
+
+    # Scoring reference point and base XY source.
+    if pick_point is not None:
+        px, py = float(pick_point[0]), float(pick_point[1])
+        ref_x, ref_y, ref_z = px, py, float(pick_point[2])
+        base_x = _grid_round(px - hx, step) + hx if snap_to_grid else px
+        base_y = _grid_round(py - hy, step) + hy if snap_to_grid else py
+    else:
+        ref_x, ref_y, ref_z = cursor_x, cursor_y, cursor_z
+        base_x = _grid_round(cursor_x - hx, step) + hx if snap_to_grid else cursor_x
+        base_y = _grid_round(cursor_y - hy, step) + hy if snap_to_grid else cursor_y
+
+    z_round = max(step if z_step is None else z_step, 1e-9)
+    base_z = _grid_round(cursor_z, z_round) if snap_to_grid else cursor_z
     stack_offset = height if flipped else block_height
 
     best: tuple[float, float, float] | None = None
     best_score: tuple[float, int] | None = None
 
     def consider(x: float, y: float, z: float, stacked: bool) -> None:
-        '''Keep the candidate nearest to the cursor (stacking wins ties).'''
+        '''Keep the candidate nearest to the reference point (stacking wins ties).'''
         nonlocal best, best_score
         score = (
-            (cursor_x - x) ** 2 + (cursor_y - y) ** 2 + (cursor_z - z) ** 2,
+            (ref_x - x) ** 2 + (ref_y - y) ** 2 + (ref_z - z) ** 2,
             0 if stacked else 1,
         )
         if best_score is None or score < best_score:
