@@ -2,6 +2,19 @@
 setlocal
 cd /d "%~dp0"
 
+rem --- Optional skip flag: start.bat /skipupdate ---
+set "SKIP_UPDATE=0"
+if /i "%~1"=="/skipupdate" set "SKIP_UPDATE=1"
+
+rem --- Update from git (skipped with /skipupdate) ---
+if not "%SKIP_UPDATE%"=="1" (
+  echo Updating repository...
+  git pull --ff-only 2>nul
+  if errorlevel 1 (
+    echo Note: git pull failed or repository is not a git repo — continuing anyway.
+  )
+)
+
 rem --- Dependency check: venv present and all imports work ---
 set "DEPS_OK=0"
 if exist .venv\Scripts\python.exe (
