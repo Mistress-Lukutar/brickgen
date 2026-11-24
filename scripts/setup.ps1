@@ -25,10 +25,20 @@ if (-not (Test-Path "$root\.venv\Scripts\python.exe")) {
   if ($LASTEXITCODE -ne 0) { Write-Error "venv creation failed" }
 }
 
-Write-Host "Installing Python dependencies (cadquery, pydantic, numpy, matplotlib, typer)..."
-& "$root\.venv\Scripts\python.exe" -m pip install --upgrade pip -q
-& "$root\.venv\Scripts\python.exe" -m pip install -e "$root[dev]" -q
+Write-Host ""
+Write-Host "Installing Python dependencies (cadquery, pydantic, numpy, matplotlib, typer)..." -ForegroundColor Cyan
+
+Write-Host "  [1/2] Upgrading pip..."
+& "$root\.venv\Scripts\python.exe" -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) { Write-Error "pip upgrade failed" }
+
+Write-Host "  [2/2] Installing project dependencies (this may take several minutes)..."
+Write-Host ""
+& "$root\.venv\Scripts\python.exe" -m pip install -e "$root[dev]"
 if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed" }
+
+Write-Host ""
+Write-Host "  Dependencies installed successfully." -ForegroundColor Green
 
 Write-Host ""
 Write-Host "Setup complete. Start with start.bat." -ForegroundColor Green
