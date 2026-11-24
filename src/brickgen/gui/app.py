@@ -890,6 +890,9 @@ class MainWindow(QMainWindow):
         self._assemble_view.selection_changed.connect(self._on_assemble_selection)
         self._assemble_view.blocks_moved.connect(self._on_assemble_pieces_moved)
         self._assemble_view.piece_placed.connect(self._on_assemble_piece_placed)
+        self._assemble_view.pieces_placed.connect(
+            self._on_assemble_pieces_placed
+        )
         self._assemble_view.delete_requested.connect(self._on_assemble_delete)
         self._assemble_panel.snap_grid_changed.connect(self._on_assemble_snap_grid)
         self._assemble_panel.snap_parts_changed.connect(self._on_assemble_snap_parts)
@@ -1512,28 +1515,27 @@ class MainWindow(QMainWindow):
     def _paste_assembled(self) -> None:
         '''Paste the copied assembled copies as a cursor ghost.
 
-        The first copied piece attaches to the viewport ghost with its
-        orientation and height (exactly like a parts-panel placement): every
-        left click drops one copy, Esc/right click cancels — the ghost stays
-        until explicitly cancelled. Pieces land through the normal placement
-        handler, so linked block quantities follow on every drop.
+        The first (anchor) copied piece attaches to the viewport ghost with
+        its orientation and height; remaining pieces follow at their stored
+        offsets from the anchor. One click drops the WHOLE group atomically.
+        The ghost stays until Esc / RMB.
         '''
         if not self._clip_assembled:
             self._set_status("Clipboard is empty: copy pieces first (Ctrl+C).")
             return
         blocks_by_uid = {block.uid: block for block in self._project.blocks}
-        values = next(
-            (
-                entry
-                for entry in self._clip_assembled
-                if str(entry.get("block_uid", "")) in blocks_by_uid
-            ),
-            None,
-        )
-        if values is None:
+        # Filter to entries whose block still exists, keeping order.
+        filtered = [
+            entry
+            for entry in self._clip_assembled
+            if str(entry.get("block_uid", "")) in blocks_by_uid
+        ]
+        if not filtered:
             self._set_status("Nothing to paste: copied blocks no longer exist.")
             return
-        block_uid = str(values.get("block_uid", ""))
+
+        anchor = filtered[0]
+        block_uid = str(anchor.get("block_uid", ""))
         index = next(
             i for i, block in enumerate(self._project.blocks) if block.uid == block_uid
         )
@@ -1544,6 +1546,11 @@ class MainWindow(QMainWindow):
                 error=True,
             )
             return
+
+        anchor_rot = int(anchor.get("rot_z", 0)) % 4
+        anchor_flip = bool(anchor.get("flipped", False))
+        anchor_z = float(anchor.get("position_z", 0.0))
+
         settings = self._project.block_settings(index)
         self._assemble_view.start_placement(
             mesh,
@@ -1552,17 +1559,47 @@ class MainWindow(QMainWindow):
             settings.total_height,
             self._project.blocks[index].color,
             settings.block_height,
-            rot_z=int(values.get("rot_z", 0)) % 4,
-            flipped=bool(values.get("flipped", False)),
-            z=float(values.get("position_z", 0.0)),
+            rot_z=anchor_rot,
+            flipped=anchor_flip,
+            z=anchor_z,
         )
-        extra = len(self._clip_assembled) - 1
-        message = (
-            "Placing pasted copy: click drops it, R/Space rotates, F flips, "
-            "wheel changes height, Esc/RMB finishes."
-        )
-        if extra:
-            message += f" {extra} more copied piece(s) stay on the clipboard."
+
+        if len(filtered) > 1:
+            # Build group entries for all remaining pieces.
+            anchor_pos_x = float(anchor.get("position_x", 0.0))
+            anchor_pos_y = float(anchor.get("position_y", 0.0))
+            anchor_pos_z = float(anchor.get("position_z", 0.0))
+            group_entries: list[dict] = []
+            for entry in filtered:
+                e_block_uid = str(entry.get("block_uid", ""))
+                e_index = next(
+                    i
+                    for i, block in enumerate(self._project.blocks)
+                    if block.uid == e_block_uid
+                )
+                e_settings = self._project.block_settings(e_index)
+                group_entries.append({
+                    'block': e_index,
+                    'base_rects': base_footprint_rects(e_settings),
+                    'height': e_settings.total_height,
+                    'block_height': e_settings.block_height,
+                    'rot_z': int(entry.get("rot_z", 0)) % 4,
+                    'flipped': bool(entry.get("flipped", False)),
+                    'dx': float(entry.get("position_x", 0.0)) - anchor_pos_x,
+                    'dy': float(entry.get("position_y", 0.0)) - anchor_pos_y,
+                    'dz': float(entry.get("position_z", 0.0)) - anchor_pos_z,
+                })
+            self._assemble_view.set_ghost_group(group_entries)
+            message = (
+                f"Placing pasted group of {len(filtered)} piece(s): "
+                "click drops them all together, R/Space rotates, F flips, "
+                "wheel changes height, Esc/RMB finishes."
+            )
+        else:
+            message = (
+                "Placing pasted copy: click drops it, R/Space rotates, F flips, "
+                "wheel changes height, Esc/RMB finishes."
+            )
         self._set_status(message)
 
     # ------------------------------------------------------------ select all
@@ -3382,6 +3419,37 @@ class MainWindow(QMainWindow):
         # A linked block's quantity follows the new count (the placement
         # scene resyncs inside _apply_linked_quantities).
         self._apply_linked_quantities([block_index])
+        self._set_status(assemble_summary(self._project))
+
+    def _on_assemble_pieces_placed(self, infos: list) -> None:
+        '''Drop a multi-piece ghost group onto the assembly.
+
+        Args:
+            infos: List of per-piece dicts from ``pieces_placed`` signal,
+                each with keys ``block``, ``x``, ``y``, ``z``, ``rot_z``,
+                ``flipped``.
+        '''
+        block_indices: list[int] = []
+        self._begin_edit("assemble-place")
+        for info in infos:
+            block_index = int(info.get('block', -1))
+            if not 0 <= block_index < len(self._project.blocks):
+                continue
+            self._project.assemble.pieces.append(
+                AssembledPiece(
+                    block_uid=self._project.blocks[block_index].uid,
+                    position_x=float(info['x']),
+                    position_y=float(info['y']),
+                    position_z=float(info['z']),
+                    rot_z=int(info.get('rot_z', 0)),
+                    flipped=bool(info.get('flipped', False)),
+                )
+            )
+            block_indices.append(block_index)
+        self._mark_dirty()
+        self._sync_assemble()
+        if block_indices:
+            self._apply_linked_quantities(sorted(set(block_indices)))
         self._set_status(assemble_summary(self._project))
 
     def _linked_block_indices(self, uids: set[str]) -> list[int]:

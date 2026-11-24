@@ -18,7 +18,6 @@ from PySide6.QtWidgets import QWidget
 
 from brickgen.gui.keys import event_key
 from brickgen.gui.preview import (
-    _FLOOR_RAY_MIN_SIN,
     AXIS_VECTORS,
     RUBBER_BAND_THRESHOLD_PX,
     SELECTION_COLOR,
@@ -28,6 +27,7 @@ from brickgen.gui.preview import (
 from brickgen.services.assemble_service import (
     Rect,
     Support,
+    _bbox_halves,
     assemble_pose_collides,
     assemble_snap_target,
     offset_rects,
@@ -72,6 +72,10 @@ class AssembleView(PreviewWidget):
     # ``x``, ``y``, ``z`` (drop position of the footprint center / bottom),
     # ``rot_z`` (quarter turns) and ``flipped``.
     piece_placed = Signal(object)
+    # Emitted when a multi-piece ghost group is dropped atomically: list of
+    # per-piece dicts with keys ``block``, ``x``, ``y``, ``z``, ``rot_z``,
+    # ``flipped`` in group order. Single-entry groups still use piece_placed.
+    pieces_placed = Signal(list)
     # Emitted when the user deletes pieces (Del hotkey).
     delete_requested = Signal()
 
@@ -103,6 +107,10 @@ class AssembleView(PreviewWidget):
         self._ghost_pos: tuple[float, float, float] | None = None
         # Free-path anchor for view-plane ghost movement (reset on pose changes).
         self._ghost_free_anchor: np.ndarray | None = None
+        # Multi-piece ghost group (set by _paste_assembled). Each entry is a
+        # dict with keys: block, base_rects, height, block_height, rot_z,
+        # flipped, dx, dy, dz. Anchor entry has (0.0, 0.0, 0.0).
+        self._ghost_group: list[dict] | None = None
         # --- Drag state ---
         self._grab_orig_z: dict[int, float] = {}
         self._drag_dz = 0.0
@@ -110,7 +118,7 @@ class AssembleView(PreviewWidget):
         self._drag_valid_pose: dict[int, tuple[float, float, float, int]] = {}
         self._grab_start_pose: dict[int, tuple[float, float, float, int]] = {}
         self._rot_total = 0  # quarter turns applied during the active drag
-        self._rot_undo = 0   # quarter turns applied after the last valid snapshot
+        self._rot_undo = 0  # quarter turns applied after the last valid snapshot
 
     def active_axes(self) -> frozenset[str]:
         '''Assemble tab allows Z movement (3D placement).'''
@@ -213,6 +221,7 @@ class AssembleView(PreviewWidget):
         self._constraint_zero = None
         self._last_grab_pos = None
         self._ghost_free_anchor = None
+        self._ghost_group = None
         self._placing = True
         self._ghost_base = mesh
         self._ghost_block = block_index
@@ -259,6 +268,7 @@ class AssembleView(PreviewWidget):
         self._ghost_rects = ()
         self._drag_supports = []
         self._ghost_pos = None
+        self._ghost_group = None
         self.unsetCursor()
         self._clear_guides()
         self._axis_lock = None
@@ -270,6 +280,20 @@ class AssembleView(PreviewWidget):
         self._ghost_free_anchor = None
         self._update_gizmo()
         self.render()
+
+    def set_ghost_group(self, entries: list[dict]) -> None:
+        '''Store a copy of the multi-piece ghost group.
+
+        Each entry is a dict with keys: ``block``, ``base_rects``,
+        ``height``, ``block_height``, ``rot_z``, ``flipped``, ``dx``,
+        ``dy``, ``dz``. The anchor entry (first) has ``(0.0, 0.0, 0.0)``
+        offset; its ``rot_z`` / ``flipped`` mirror what
+        :meth:`start_placement` received.
+
+        Args:
+            entries: List of per-piece metadata for the group drop.
+        '''
+        self._ghost_group = [dict(e) for e in entries]
 
     def placing(self) -> bool:
         '''True while a ghost piece follows the cursor.'''
@@ -347,12 +371,11 @@ class AssembleView(PreviewWidget):
             # Free path: camera view-plane through the ghost anchor.
             if self._ghost_free_anchor is None:
                 gx, gy, gz = (
-                    self._ghost_pos if self._ghost_pos is not None
+                    self._ghost_pos
+                    if self._ghost_pos is not None
                     else (0.0, 0.0, self._ghost_z)
                 )
-                self._ghost_free_anchor = np.array(
-                    [gx, gy, gz], dtype=np.float64
-                )
+                self._ghost_free_anchor = np.array([gx, gy, gz], dtype=np.float64)
             raw = self._cursor_on_view_plane(pos, self._ghost_free_anchor)
             if raw is None:
                 return
@@ -361,10 +384,17 @@ class AssembleView(PreviewWidget):
             pick_y = float(raw[1])
             cursor_z = float(raw[2])
         x, y, z = assemble_snap_target(
-            pick_x, pick_y, cursor_z,
-            self._ghost_rects, self._ghost_height, self._ghost_block_height,
-            self._ghost_flip, self._drag_supports, self.grid_step(),
-            self._grid_snap, self._snap_parts,
+            pick_x,
+            pick_y,
+            cursor_z,
+            self._ghost_rects,
+            self._ghost_height,
+            self._ghost_block_height,
+            self._ghost_flip,
+            self._drag_supports,
+            self.grid_step(),
+            self._grid_snap,
+            self._snap_parts,
             z_step=self._z_snap_step(),
             pick_point=pick_point,
         )
@@ -394,7 +424,8 @@ class AssembleView(PreviewWidget):
         # Lazily engage: when constraint_anchor is None, set it from ghost pos.
         if self._constraint_anchor is None:
             gx, gy, gz = (
-                self._ghost_pos if self._ghost_pos is not None
+                self._ghost_pos
+                if self._ghost_pos is not None
                 else (0.0, 0.0, self._ghost_z)
             )
             self._constraint_anchor = np.array([gx, gy, gz], dtype=np.float64)
@@ -418,18 +449,11 @@ class AssembleView(PreviewWidget):
                 self._constraint_origin = self._constraint_anchor.copy()
                 ray = self._cursor_ray(pos)
                 if ray is not None:
-                    o, d = ray
-                    n = AXIS_VECTORS[lock]  # unit normal
-                    d_hat = d / max(float(np.linalg.norm(d)), 1e-12)
-                    denom = float(np.dot(d_hat, n))
-                    if abs(denom) >= _FLOOR_RAY_MIN_SIN:
-                        anchor_tmp = self._constraint_anchor
-                        assert anchor_tmp is not None
-                        t = float(
-                            np.dot(anchor_tmp - o, n) / denom
-                        )
-                        if t > 0.0:
-                            self._constraint_origin = o + d * t
+                    point = self._ray_plane_point(
+                        ray, self._constraint_anchor, AXIS_VECTORS[lock]
+                    )
+                    if point is not None:
+                        self._constraint_origin = point
 
         # Compute total delta from constrained math.
         raw = self._constrained_raw_delta(pos)
@@ -496,7 +520,12 @@ class AssembleView(PreviewWidget):
             super()._reengage_constraint()
 
     def _drop_ghost(self) -> None:
-        '''Drop one copy at the current ghost pose (ghost stays active).'''
+        '''Drop one copy at the current ghost pose (ghost stays active).
+
+        When a multi-piece ghost group is active, all pieces are dropped
+        atomically via ``pieces_placed``; single-entry groups fall back to
+        the existing ``piece_placed`` path.
+        '''
         if not self._placing or self._ghost_actor is None:
             return
         if self._ghost_pos is not None:
@@ -504,6 +533,16 @@ class AssembleView(PreviewWidget):
         else:
             position = self._ghost_actor.GetPosition()
             x, y, z = float(position[0]), float(position[1]), float(position[2])
+
+        # Multi-piece group drop.
+        if (
+            self._ghost_group is not None
+            and len(self._ghost_group) >= 2
+        ):
+            self._drop_ghost_group(x, y, z)
+            return
+
+        # Single-piece path (unchanged).
         if not self._ghost_valid_at(x, y, z):
             # Blocked drop: make the refusal visible even when the ghost
             # has not followed the cursor into this pose yet.
@@ -521,6 +560,88 @@ class AssembleView(PreviewWidget):
         )
         # The window committed the new piece (direct Qt connection): refresh
         # the support set so the next drop stacks on it.
+        self._drag_supports = self._query_supports(set())
+
+    def _drop_ghost_group(
+        self, x: float, y: float, z: float
+    ) -> None:
+        '''Drop a multi-piece ghost group atomically.
+
+        All entries are validated against existing supports (and each other
+        in group order). On success emits ``pieces_placed`` once; on failure
+        tints the ghost red and returns without emission.
+
+        Args:
+            x, y, z: Current ghost pose (anchor piece position).
+        '''
+        assert self._ghost_group is not None  # only called when group exists
+        anchor = self._ghost_group[0]
+        anchor_rot = anchor['rot_z']
+        anchor_flip = anchor['flipped']
+
+        # Compute the delta between current ghost pose and what start_placement
+        # originally received (from the anchor entry's stored values).
+        d_rot = (self._ghost_rot - anchor_rot) % 4
+        d_flip = self._ghost_flip != anchor_flip
+
+        # Build all poses and validate atomically.
+        supports_snapshot: list[Support] = list(self._drag_supports)
+        infos: list[dict] = []
+
+        for entry in self._ghost_group:
+            rot = (entry['rot_z'] + d_rot) % 4
+            flip = entry['flipped'] != d_flip
+
+            # Rotate the offset by d_rot quarter turns CCW.
+            dx_r, dy_r = float(entry['dx']), float(entry['dy'])
+            for _ in range(d_rot):
+                dx_r, dy_r = -dy_r, dx_r
+
+            px = x + dx_r
+            py = y + dy_r
+            pz = max(z + entry['dz'], 0.0)
+
+            rects_i = transform_footprint_rects(
+                entry['base_rects'], rot, flip
+            )
+            stack_offset = (
+                entry['height'] if flip else entry['block_height']
+            )
+            if not assemble_pose_collides(
+                supports_snapshot,
+                offset_rects(rects_i, px, py),
+                pz,
+                entry['height'],
+                stack_offset,
+            ):
+                # Append this piece's support for subsequent pieces to check.
+                hx, hy = _bbox_halves(rects_i)
+                supports_snapshot.append(
+                    Support(
+                        x=px, y=py, z=pz,
+                        hx=hx, hy=hy,
+                        height=entry['height'],
+                        stack_top=pz + stack_offset,
+                        rects=offset_rects(rects_i, px, py),
+                    )
+                )
+                infos.append({
+                    'block': entry['block'],
+                    'x': px,
+                    'y': py,
+                    'z': pz,
+                    'rot_z': rot,
+                    'flipped': flip,
+                })
+            else:
+                # Any collision → refuse the whole group.
+                self._tint_ghost(True)
+                return
+
+        # All pieces valid — emit once.
+        self.pieces_placed.emit(infos)
+        # The window committed all pieces (direct Qt connection): refresh
+        # the support set so the next drop stacks on them.
         self._drag_supports = self._query_supports(set())
 
     # ------------------------------------------------------- ghost pose helpers
@@ -569,8 +690,12 @@ class AssembleView(PreviewWidget):
         if self._grab_free_anchor is None:
             meta = self._scene_meta[primary]
             plane_point = np.array(
-                [float(meta['pos_x']), float(meta['pos_y']),
-                 float(meta.get('pos_z', 0.0))], dtype=np.float64
+                [
+                    float(meta['pos_x']),
+                    float(meta['pos_y']),
+                    float(meta.get('pos_z', 0.0)),
+                ],
+                dtype=np.float64,
             )
             raw = self._cursor_on_view_plane(pos, plane_point)
             if raw is None:
@@ -585,8 +710,11 @@ class AssembleView(PreviewWidget):
         raw = self._cursor_on_view_plane(pos, self._grab_free_anchor)
         if raw is None:
             return
+        # The anchor stays FIXED after engagement: the plane through it is
+        # camera-parallel, so delta is the TOTAL view-plane displacement
+        # since the free path started (re-anchoring every frame would turn
+        # it into a per-frame increment and the piece would jitter in place).
         delta = raw - self._grab_free_anchor
-        self._grab_free_anchor = raw.copy()
         original_x, original_y = self._grab_orig[primary]
         target_x = original_x + float(delta[0])
         target_y = original_y + float(delta[1])
@@ -595,13 +723,14 @@ class AssembleView(PreviewWidget):
         if self._grid_snap:
             meta = self._scene_meta[primary]
             target_x, target_y = self._snap_move_target(
-                target_x, target_y,
-                float(meta.get('half_x', 0.0)), float(meta.get('half_y', 0.0)),
+                target_x,
+                target_y,
+                float(meta.get('half_x', 0.0)),
+                float(meta.get('half_y', 0.0)),
             )
             orig_z = float(self._grab_orig_z.get(primary, 0.0))
             z_step = self._z_snap_step()
             dz = round((orig_z + dz) / z_step) * z_step - orig_z
-        self._grab_free_dz = dz
         dx, dy = target_x - original_x, target_y - original_y
         self._apply_move(self._grab_orig, dx, dy, dz=dz)
         self._sync_drag_dz_from_primary()
@@ -612,8 +741,7 @@ class AssembleView(PreviewWidget):
         if not self._grab_orig:
             return
         primary = (
-            self._primary if self._primary in self._grab_orig
-            else min(self._grab_orig)
+            self._primary if self._primary in self._grab_orig else min(self._grab_orig)
         )
         dz = float(self._scene_meta[primary].get('pos_z', 0.0)) - float(
             self._grab_orig_z.get(primary, 0.0)
@@ -735,7 +863,8 @@ class AssembleView(PreviewWidget):
             if assemble_pose_collides(
                 self._drag_supports,
                 offset_rects(rects, float(meta['pos_x']), float(meta['pos_y'])),
-                z, height,
+                z,
+                height,
                 height if flipped else block_h,
             ):
                 return True
@@ -752,11 +881,50 @@ class AssembleView(PreviewWidget):
     def _rotate_moved_pieces(self) -> None:
         '''Rotate every piece of the active move drag 90 degrees about Z.
 
-        Space mid-drag: each moved piece turns around its own center, the
-        footprint halves swap, the actors gain an accumulated 90-degree
-        Z rotation (the committed rot_z in the meta keeps the canonical
-        orientation for the next rebuild). Height stays as-is.
+        Single-selection: pivot equals the piece's own center, so its
+        position stays unchanged (rigid rotation about self-centre).
+        Multi-selection: the group pivots rigidly about the XY centre of
+        the selection bounding box; each piece follows a +90° CCW affine
+        transform around that common pivot.
+
+        Space mid-drag: each moved piece's ``rot_z`` increments (mod 4),
+        the footprint halves swap, the actors gain an accumulated
+        90-degree Z rotation (the committed ``rot_z`` in the meta keeps
+        the canonical orientation for the next rebuild). Height stays as-is.
         '''
+        # Compute group pivot: AABB centre of the selection (same as
+        # _selection_center() used by MoveGizmo and axis-lock anchor).
+        first = True
+        for index in self._grab_orig:
+            if not 0 <= index < len(self._scene_meta):
+                continue
+            meta = self._scene_meta[index]
+            x0 = float(meta['pos_x']) - float(meta['half_x'])
+            y0 = float(meta['pos_y']) - float(meta['half_y'])
+            x1 = float(meta['pos_x']) + float(meta['half_x'])
+            y1 = float(meta['pos_y']) + float(meta['half_y'])
+            if first:
+                min_x0, max_x1 = x0, x1
+                min_y0, max_y1 = y0, y1
+                first = False
+            else:
+                if x0 < min_x0:
+                    min_x0 = x0
+                if x1 > max_x1:
+                    max_x1 = x1
+                if y0 < min_y0:
+                    min_y0 = y0
+                if y1 > max_y1:
+                    max_y1 = y1
+
+        # If no valid pieces, nothing to do — return early without touching
+        # the rotation counters so a double-Space on empty grab is idempotent.
+        if first:
+            return
+
+        px = (min_x0 + max_x1) / 2.0
+        py = (min_y0 + max_y1) / 2.0
+
         for index in self._grab_orig:
             if not 0 <= index < len(self._scene_meta):
                 continue
@@ -770,7 +938,15 @@ class AssembleView(PreviewWidget):
                     int(meta['rot_z']),
                     bool(meta.get('flipped', False)),
                 )
+            # Piece centre BEFORE rotation.
             x, y = float(meta['pos_x']), float(meta['pos_y'])
+            dx = x - px
+            dy = y - py
+            # Rigid +90° CCW about pivot (px, py): (cx,cy) -> (px-dy, py+dx).
+            new_x = px - dy
+            new_y = py + dx
+            meta['pos_x'] = new_x
+            meta['pos_y'] = new_y
             if index < len(self._block_actors):
                 for actor in self._block_actors[index]:
                     actor.RotateZ(90.0)
@@ -778,8 +954,8 @@ class AssembleView(PreviewWidget):
             if outline is not None:
                 outline.RotateZ(90.0)
                 z = float(meta.get('pos_z', 0.0))
-                outline.SetPosition(x, y, z)
-            self._position_actor(index, x, y)
+                outline.SetPosition(new_x, new_y, z)
+            self._position_actor(index, new_x, new_y)
         self._rot_total += 1
         self._rot_undo += 1
         self._capture_drag_pose()

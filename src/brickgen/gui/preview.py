@@ -923,15 +923,12 @@ class PreviewWidget(QtInteractor):
         step = max(self.grid_step(), 1e-9)
         length = GIZMO_LENGTH_STEPS * step
         if self._gizmo is None:
-            self._gizmo = MoveGizmo(
-                self.active_axes(), AXIS_COLORS, AXIS_VECTORS
-            )
+            self._gizmo = MoveGizmo(self.active_axes(), AXIS_COLORS, AXIS_VECTORS)
             self._gizmo.build(length)
             self._gizmo_step = self.grid_step()
             self._gizmo.add_actors(self)
         elif (
-            self._gizmo_step is None
-            or abs(self.grid_step() - self._gizmo_step) > 1e-9
+            self._gizmo_step is None or abs(self.grid_step() - self._gizmo_step) > 1e-9
         ):
             # Grid scale changed: rebuild the arm geometry through the view.
             self._gizmo.remove_actors(self)
@@ -1130,17 +1127,21 @@ class PreviewWidget(QtInteractor):
             self._constraint_anchor = center.copy()
             # Compute _constraint_zero from primary piece's current offset.
             primary = (
-                self._primary if self._primary in self._grab_orig
+                self._primary
+                if self._primary in self._grab_orig
                 else min(self._grab_orig)
             )
             orig = self._grab_orig[primary]
             orig_z = float(getattr(self, '_grab_orig_z', {}).get(primary, 0.0))
             meta = self._scene_meta[primary]
-            current_offset = np.array([
-                meta['pos_x'] - orig[0],
-                meta['pos_y'] - orig[1],
-                float(meta.get('pos_z', 0.0)) - orig_z,
-            ], dtype=np.float64)
+            current_offset = np.array(
+                [
+                    meta['pos_x'] - orig[0],
+                    meta['pos_y'] - orig[1],
+                    float(meta.get('pos_z', 0.0)) - orig_z,
+                ],
+                dtype=np.float64,
+            )
             self._constraint_zero = current_offset
 
             # Compute _constraint_origin based on lock mode.
@@ -1162,19 +1163,50 @@ class PreviewWidget(QtInteractor):
                 self._constraint_origin = center.copy()
                 ray = self._cursor_ray(pos)
                 if ray is not None:
-                    o, d = ray
-                    n = AXIS_VECTORS[lock]  # unit normal
-                    d_hat = d / max(float(np.linalg.norm(d)), 1e-12)
-                    denom = float(np.dot(d_hat, n))
-                    if abs(denom) >= _FLOOR_RAY_MIN_SIN:
-                        t = float(np.dot(self._constraint_anchor - o, n) / denom)
-                        if t > 0.0:
-                            self._constraint_origin = o + d * t
+                    point = self._ray_plane_point(
+                        ray, self._constraint_anchor, AXIS_VECTORS[lock]
+                    )
+                    if point is not None:
+                        self._constraint_origin = point
 
         raw = self._constrained_raw_delta(pos)
         if raw is None:
             return None
         return self._constraint_zero + raw
+
+    def _ray_plane_point(
+        self,
+        ray: tuple[np.ndarray, np.ndarray],
+        anchor: np.ndarray,
+        normal: np.ndarray,
+    ) -> np.ndarray | None:
+        '''Intersect a cursor ray with the plane through *anchor*.
+
+        The ray direction may be unnormalized; it is normalized internally.
+
+        Args:
+            ray: ``(origin, direction)`` from :meth:`_cursor_ray`; direction
+                may be unnormalized.
+            anchor: World point on the plane.
+            normal: Unit plane normal.
+
+        Returns:
+            The world intersection point, or ``None`` when the ray direction
+            is degenerate, too parallel to the plane (|dot| < _FLOOR_RAY_MIN_SIN)
+            or points away from it (t <= 0).
+        '''
+        o, d = ray
+        length = float(np.linalg.norm(d))
+        if length < 1e-12:
+            return None
+        d_hat = d / length
+        denom = float(np.dot(d_hat, normal))
+        if abs(denom) < _FLOOR_RAY_MIN_SIN:
+            return None
+        t = float(np.dot(anchor - o, normal) / denom)
+        if t <= 0.0:
+            return None
+        return o + d_hat * t
 
     def _constrained_raw_delta(self, pos: QPoint) -> np.ndarray | None:
         '''Pure cursor math for constrained delta (no state mutation).
@@ -1235,15 +1267,9 @@ class PreviewWidget(QtInteractor):
             return raw
         else:
             # Plane mode: intersect cursor ray with plane through anchor.
-            n = AXIS_VECTORS[lock]  # unit normal
-            d_hat = d / max(float(np.linalg.norm(d)), 1e-12)
-            denom = float(np.dot(d_hat, n))
-            if abs(denom) < _FLOOR_RAY_MIN_SIN:
+            point = self._ray_plane_point((o, d), anchor, AXIS_VECTORS[lock])
+            if point is None:
                 return None
-            t = float(np.dot(anchor - o, n) / denom)
-            if t <= 0.0:
-                return None
-            point = o + d * t
             raw = point - origin
             return raw
 

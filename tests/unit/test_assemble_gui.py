@@ -140,9 +140,14 @@ def _wheel(view, dy: int) -> QWheelEvent:
         The constructed ``QWheelEvent``.
     '''
     event = QWheelEvent(
-        QPointF(10.0, 10.0), QPointF(10.0, 10.0), QPoint(0, 0), QPoint(0, dy),
-        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
-        Qt.ScrollPhase.NoScrollPhase, False,
+        QPointF(10.0, 10.0),
+        QPointF(10.0, 10.0),
+        QPoint(0, 0),
+        QPoint(0, dy),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
     )
     view.wheelEvent(event)
     return event
@@ -570,38 +575,134 @@ def test_paste_assembled_updates_linked_quantity(window: MainWindow) -> None:
     _reset(window)
 
 
-def test_paste_multi_copies_ghosts_first(window: MainWindow) -> None:
-    '''Multi-piece copy: ghost attaches to the FIRST copied piece's block.'''
+def test_paste_multi_drops_whole_group(window: MainWindow) -> None:
+    '''Multi-piece copy: one drop appends ALL copied pieces atomically.
+
+    Two pieces of the same block at different positions are copied, pasted
+    (ghost starts), then ONE drop → exactly 2 new pieces appended with
+    correct relative offsets and orientations preserved. One undo step
+    removes both. Status no longer mentions "stay on the clipboard".
+    '''
     _reset(window)
-    # Add a second block (mirror test_prune_stale_pieces_on_block_removal).
-    window._project.blocks.append(
-        BlockInstance(uid="blk2", cells_x=2, cells_y=2, quantity=1)
-    )
-    # Place pieces of both blocks.
-    _place(window, block_index=0)
-    _place(window, block_index=1)
+    unit = window._project.settings.unit_size  # 4.0 mm default
+
+    # Place two pieces of block 0 at different positions (~40mm apart).
+    _place(window, x=0.0, y=0.0)
+    _place(window, x=10.0 * unit, y=5.0 * unit)
     assert len(window._project.assemble.pieces) == 2
 
-    # Select {0, 1} (piece indices), primary = 0.
+    # Select both pieces and copy them.
     window._aselection = {0, 1}
     window._aprimary = 0
     window._on_copy()
-    window._on_paste()
+    window._reset_edit_history()
+    window._dirty = False
+    n_before = len(window._project.assemble.pieces)
 
+    # Paste → ghost active.
+    window._on_paste()
     view = window._assemble_view
+    assert view.placing() is True
     # Ghost attaches to the FIRST copied piece's block (index 0).
     assert view._ghost_block == 0
-    assert view.placing() is True
-    # Status message mentions remaining copies on clipboard.
+    # Status message no longer mentions clipboard.
     status = window._assemble_panel._status_label.text()
-    assert "stay on the clipboard" in status
+    assert "stay on the clipboard" not in status
+    assert f"group of {n_before} piece(s)" in status
 
-    # Cancel and prune the second block (mirror the prune test).
+    # One drop: set ghost position directly and call _drop_ghost.
+    # Piece 0 is at (0,0), piece 1 at (40,20). Ghost starts at origin.
+    # Drop at offset (20, 10) → piece 0 lands at (20,10), piece 1 at
+    # (60,30) — non-overlapping with originals or each other.
+    view._ghost_pos = (20.0, 10.0, 0.0)
+    view._drop_ghost()
+
+    assert len(window._project.assemble.pieces) == n_before + 2
+    new_pieces = window._project.assemble.pieces[n_before:]
+    assert len(new_pieces) == 2
+
+    # Both pieces reference the same block uid.
+    for p in new_pieces:
+        assert p.block_uid == window._project.blocks[0].uid
+
+    # Positions: anchor at ghost pos, second at offset from anchor.
+    # Piece n_before (anchor): x=20, y=10 (ghost pose).
+    assert new_pieces[0].position_x == pytest.approx(20.0)
+    assert new_pieces[0].position_y == pytest.approx(10.0)
+    # Piece n_before+1 (offset): x = 20 + (40-0) = 60, y = 10 + (20-0) = 30
+    assert new_pieces[1].position_x == pytest.approx(60.0)
+    assert new_pieces[1].position_y == pytest.approx(30.0)
+
+    # Orientations preserved (both were placed with default rot_z=0, flipped=False).
+    assert new_pieces[0].rot_z == 0
+    assert new_pieces[0].flipped is False
+    assert new_pieces[1].rot_z == 0
+    assert new_pieces[1].flipped is False
+
+    # Ghost PERSISTS after one drop.
+    assert view.placing() is True
+    assert window._dirty is True
+
+    # Cancel → ghost gone.
     view.cancel_placement()
-    window._selection = {1}
-    window._primary = 1
-    window._on_remove_blocks()
-    window._sync_assemble()
+    assert view.placing() is False
+
+    # One undo step removes BOTH pieces.
+    window._on_undo()
+    pieces = window._project.assemble.pieces
+    assert len(pieces) == n_before
+    _wait_meshes(window)
+    window._reset_edit_history()
+    _reset(window)
+
+
+def test_paste_group_refused_on_collision(window: MainWindow) -> None:
+    '''Multi-piece paste group collides with existing piece → drop refused.
+
+    Arrange an existing piece so the pasted group would overlap it. One
+    drop is refused, piece count unchanged, and the ghost survives (placing
+    still True) for a retry.
+    '''
+    _reset(window)
+    unit = window._project.settings.unit_size  # 4.0 mm
+
+    # Place two pieces of block 0 at different positions.
+    _place(window, x=0.0, y=0.0)
+    _place(window, x=10.0 * unit, y=5.0 * unit)
+    assert len(window._project.assemble.pieces) == 2
+
+    # Select both and copy.
+    window._aselection = {0, 1}
+    window._aprimary = 0
+    window._on_copy()
+    window._reset_edit_history()
+    window._dirty = False
+    n_before = len(window._project.assemble.pieces)
+
+    # Paste → ghost active.
+    window._on_paste()
+    view = window._assemble_view
+    assert view.placing() is True
+
+    # Drop at origin (overlaps piece 0). Both pieces in the group overlap.
+    view._ghost_pos = (0.0, 0.0, 0.0)
+    view._drop_ghost()
+
+    # Refused: no new pieces appended.
+    assert len(window._project.assemble.pieces) == n_before
+    # Ghost still active for retry.
+    assert view.placing() is True
+    # Ghost tinted red (collision).
+    assert view._ghost_actor is not None
+    color_hex = _actor_color_hex(view._ghost_actor)
+    assert color_hex[:7] == "#d02020"
+
+    # Move to a legal position and drop again.
+    view._ghost_pos = (30.0, 15.0, 0.0)
+    view._drop_ghost()
+    assert len(window._project.assemble.pieces) == n_before + 2
+
+    view.cancel_placement()
     _reset(window)
 
 
@@ -731,6 +832,7 @@ def test_move_keeps_height_and_rotation_keeps_height(window: MainWindow) -> None
 
     # Space rotate → height must still be 7.0 (old code re-resolved it).
     from PySide6.QtGui import QKeyEvent
+
     event = QKeyEvent(
         QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier
     )
@@ -819,6 +921,137 @@ def test_space_rotates_moved_pieces(window: MainWindow) -> None:
 
     window._on_undo()
     assert window._project.assemble.pieces[0].rot_z == 0
+    _wait_meshes(window)
+    window._reset_edit_history()
+    _reset(window)
+
+
+def test_space_rotates_group_about_common_center(window: MainWindow) -> None:
+    '''Multi-selection Space rotates the group rigidly about the bbox centre.
+
+    Two pieces with DIFFERENT footprints are placed so that mean-of-centers
+    pivot differs from AABB-center pivot — this exercises the fix for the
+    round-1 bug where the pivot was computed as mean of centres instead of
+    the selection bounding-box centre (which is what MoveGizmo draws at).
+
+    Block 0: default 1x1 → piece 0 at pos=(0,0), half_x=2.
+    Block 1: 3x1 cells  → piece 1 at pos=(12,0), half_x=6.
+
+    AABB center in X = ((-2)+18)/2 = 8 (not mean-of-centers which would be
+    (0+12)/2 = 6).  This makes the test fail if the old mean-pivot code runs.
+    '''
+    _reset(window)
+    _wait_meshes(window)
+
+    unit = window._project.settings.unit_size  # 4.0 mm
+
+    # Ensure block 0 is the default 1x1 (some earlier tests modify cells).
+    block0 = window._project.blocks[0]
+    block0.cells_x = 1
+    block0.cells_y = 1
+
+    # Add a second block with different footprint (3x1 cells) so the two
+    # pieces have different half-extents, making AABB-centre pivot differ from
+    # mean-of-centers pivot.
+    from brickgen.core.project import BlockInstance as BI
+
+    window._project.blocks.append(BI(uid="blk2", cells_x=3, cells_y=1, quantity=1))
+
+    # Trigger regeneration so both blocks have fresh meshes and correct dims.
+    window._mark_scene_dirty()
+    window._applied_context = None  # clear stale context from initial gen
+    window._on_generate()
+    _wait_applied(window)
+
+    view = window._assemble_view
+
+    # Place piece 0 at origin using block 0 (1x1, half_x=2).
+    _place(window, x=0.0)
+    # Place piece 1 at x=12 using block 1 (3x1, half_x=6).
+    _place(window, block_index=1, x=3 * unit)
+
+    # Now sync the assemble scene — this rebuilds actors from the project
+    # pieces using the freshly regenerated meshes.
+    window._sync_assemble()
+    window._reset_edit_history()
+    window._dirty = False
+
+    assert len(view._scene_meta) == 2
+    for i, m in enumerate(view._scene_meta):
+        assert abs(m['pos_x']) < 1e-6 or abs(m['pos_x'] - 3 * unit) < 1e-6
+
+    # Select both pieces and start a drag.
+    view.set_selection({0, 1}, 0)
+    view._grabbing = True
+    view._grab_keyboard = False
+    view._grab_orig = {
+        0: (0.0, 0.0),
+        1: (3 * unit, 0.0),
+    }
+    view._begin_piece_drag()
+
+    # Press Space mid-drag.
+    event = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier
+    )
+    view.keyPressEvent(event)
+    assert event.isAccepted()
+
+    # --- Verify _scene_meta during drag ---
+    for idx in (0, 1):
+        meta = view._scene_meta[idx]
+        assert meta['rot_z'] == 1
+        # Halves must have been swapped. Piece 0 is square so halves stay equal;
+        # piece 1 was rectangular (6×2) and should now be (2×6).
+
+    # Compute expected pivot: AABB centre of pre-rotation bounds.
+    # Piece 0 (1x1, pos=0): x in [-2, 2], y in [-2, 2]
+    # Piece 1 (3x1, pos=12): x in [6, 18], y in [-2, 2]
+    # AABB centre = ((-2)+18)/2, (-2+2)/2 = (8, 0).
+    # Piece 0: dx=0-8=-8, dy=0 → new=(8-0, 0+(-8)) = (8, -8)
+    # Piece 1: dx=12-8=4,  dy=0 → new=(8-0, 0+4)     = (8, 4)
+    expected = {
+        0: (8.0, -8.0),
+        1: (8.0, 4.0),
+    }
+    for idx in (0, 1):
+        meta = view._scene_meta[idx]
+        ex, ey = expected[idx]
+        dx_val = abs(meta['pos_x'] - ex)
+        dy_val = abs(meta['pos_y'] - ey)
+        assert dx_val < 1e-6, f"Piece {idx} pos_x: {meta['pos_x']} != {ex}"
+        assert dy_val < 1e-6, f"Piece {idx} pos_y: {meta['pos_y']} != {ey}"
+
+    # Verify group bbox extents swap.
+    xs = [view._scene_meta[i]['pos_x'] - view._scene_meta[i]['half_x'] for i in (0, 1)]
+    ys = [view._scene_meta[i]['pos_y'] - view._scene_meta[i]['half_y'] for i in (0, 1)]
+    xe = [view._scene_meta[i]['pos_x'] + view._scene_meta[i]['half_x'] for i in (0, 1)]
+    ye = [view._scene_meta[i]['pos_y'] + view._scene_meta[i]['half_y'] for i in (0, 1)]
+    width = max(xe) - min(xs)
+    height = max(ye) - min(ys)
+    # Pre-rotation: x-range [-2,18] → w=20; y-range [-2,2] → h=4.
+    # Post-rot: should swap to w=4, h=20.
+    assert abs(width - 4.0) < 1e-6, f"Post-rot width: {width} != 4.0"
+    assert abs(height - 20.0) < 1e-6, f"Post-rot height: {height} != 20.0"
+
+    # Commit the drag: pieces_moved must carry the rotated positions.
+    view.confirm_grab()
+    for idx in (0, 1):
+        piece = window._project.assemble.pieces[idx]
+        assert piece.rot_z == 1
+        ex, ey = expected[idx]
+        assert abs(piece.position_x - ex) < 1e-6
+        assert abs(piece.position_y - ey) < 1e-6
+    assert window._dirty is True
+
+    # Undo restores pre-drag positions and rot_z=0.
+    window._on_undo()
+    _wait_meshes(window)
+    for idx in (0, 1):
+        piece = window._project.assemble.pieces[idx]
+        assert piece.rot_z == 0
+    assert abs(window._project.assemble.pieces[0].position_x - 0.0) < 1e-6
+    assert abs(window._project.assemble.pieces[1].position_x - 3 * unit) < 1e-6
     _wait_meshes(window)
     window._reset_edit_history()
     _reset(window)
@@ -928,6 +1161,7 @@ def test_del_action_gated_to_planning(window: MainWindow) -> None:
 
 # ---------------------------------------------------------------- axis-lock
 
+
 def _hover_move(widget: QWidget, pos: QPoint) -> None:
     '''A plain mouse-move event (no buttons held) at *pos*.'''
     widget._pick_scene_point = lambda pos=None: None  # type: ignore[method-assign]
@@ -957,6 +1191,7 @@ def _assemble_stub_ray(view, target_x: float, target_y: float, target_z: float =
 
 
 # ------------------------------------------------------------------ Z lock lift
+
 
 def test_drag_z_lock_lifts_piece(window: MainWindow) -> None:
     '''Z-axis lock during a grab lifts the piece along world-Z.'''
@@ -991,6 +1226,7 @@ def test_drag_z_lock_lifts_piece(window: MainWindow) -> None:
 
 # ------------------------------------------------------------- Z clamp floor
 
+
 def test_drag_z_lock_clamps_at_floor(window: MainWindow) -> None:
     '''Z-lock drag below z=0 clamps the piece at the floor.'''
     _reset(window)
@@ -1023,6 +1259,7 @@ def test_drag_z_lock_clamps_at_floor(window: MainWindow) -> None:
 
 
 # -------------------------------------------------------- plane lock XY
+
 
 def test_shift_z_lock_moves_xy_not_z(window: MainWindow) -> None:
     '''Shift+Z (plane mode) excludes Z; only X/Y change.'''
@@ -1058,6 +1295,7 @@ def test_shift_z_lock_moves_xy_not_z(window: MainWindow) -> None:
 
 
 # ------------------------------------------------------- ghost Z lock snap
+
 
 def test_ghost_z_lock_constrains_and_snaps_corner(window: MainWindow) -> None:
     '''During placement, Z-lock constrains ghost to Z with plain corner snapping.'''
@@ -1099,6 +1337,7 @@ def test_ghost_z_lock_constrains_and_snaps_corner(window: MainWindow) -> None:
 
 # ----------------------------------------------------- plane lock YZ
 
+
 def test_ghost_plane_lock_x_moves_yz(window: MainWindow) -> None:
     '''During placement, Shift+X (plane mode) locks X; ghost moves in Y/Z.'''
     _reset(window)
@@ -1131,7 +1370,67 @@ def test_ghost_plane_lock_x_moves_yz(window: MainWindow) -> None:
     _reset(window)
 
 
+# ---------------------------------- unnormalized ray plane lock regression
+
+
+def test_shift_plane_lock_unnormalized_ray_no_flyoff(window: MainWindow) -> None:
+    '''Shift+Z plane lock with an unnormalized cursor ray must not fly off.
+
+    Regression: ``_cursor_ray`` returns a direction whose length equals the
+    camera-to-focal-point distance (hundreds of mm).  The old code computed
+    the intersection parameter *t* against the normalised direction but then
+    applied *t* to the unnormalised vector, overshooting by factor |d|.
+
+    This test verifies that a ~30 mm in-plane cursor travel produces roughly
+    30 mm of piece displacement, not hundreds.
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+    _place(window, z=5.0)
+
+    view = window._assemble_view
+    view.set_selection({0}, 0)
+    assert view.start_grab()
+    view._begin_piece_drag()
+
+    # Stub _cursor_ray with a camera origin far away so direction length ~400.
+    cam_origin = np.array([0.0, -60.0, 400.0], dtype=np.float64)
+
+    def stub_ray(target_x: float, target_y: float, target_z: float = 2.5):
+        target = np.array([target_x, target_y, target_z], dtype=np.float64)
+        direction = target - cam_origin
+        view._cursor_ray = lambda pos=None: (cam_origin, direction)  # type: ignore[method-assign]
+        view._view_plane_normal = lambda: np.array([0.0, 0.0, 1.0])  # type: ignore[method-assign]
+
+    # Engage plane lock at target A (on the engagement plane z=2.5).
+    stub_ray(10.0, 5.0)
+    view._set_axis_lock("z", True)
+    assert view._axis_lock == "z"
+    assert view._axis_plane is True
+    _hover_move(view, QPoint(200, 150))
+
+    # Retarget to target B: ~30 mm displaced in X, same Y/Z.
+    stub_ray(40.0, 5.0)
+    _hover_move(view, QPoint(200, 150))
+
+    meta = view._scene_meta[0]
+    expected_dx = 30.0  # target_b.x - target_a.x
+    assert abs(meta['pos_x'] - expected_dx) < 5.0, (
+        f"Expected pos_x near {expected_dx}, got {meta['pos_x']} — "
+        "unnormalized ray caused fly-off"
+    )
+    # Y should barely move (targets share same Y).
+    assert abs(meta['pos_y']) < 5.0
+    # Z unchanged (plane lock excludes Z).
+    assert meta['pos_z'] == pytest.approx(5.0, abs=1e-6)
+
+    view.cancel_grab()
+    _reset(window)
+
+
 # ------------------------------------------------------- gizmo has Z axis
+
 
 def test_assemble_gizmo_has_z_axis(window: MainWindow) -> None:
     '''Assemble gizmo exposes X, Y and Z axes (planning is XY only).'''
@@ -1157,6 +1456,7 @@ def test_assemble_gizmo_has_z_axis(window: MainWindow) -> None:
 
 
 # ----------------------------------------------------- planning gizmo XY only
+
 
 def test_planning_preview_gizmo_xy_only(window: MainWindow) -> None:
     '''Planning tab PreviewWidget gizmo has only X and Y axes (no Z).'''
@@ -1419,6 +1719,7 @@ def test_gizmo_toggle_shared_across_tabs(window: MainWindow) -> None:
 
 # ------------------------------------------------------- Z snap step (block height)
 
+
 def test_ghost_z_snap_uses_block_height(window: MainWindow) -> None:
     '''Ghost Z snap uses block_height * grid_scale, not grid_step.'''
     _reset(window)
@@ -1538,7 +1839,8 @@ def test_ghost_snap_to_pick_point_on_tall_piece(window: MainWindow) -> None:
     total_h = window._project.block_settings(0).total_height
     pick_z = 25.0 + total_h
     hit_val: tuple[tuple[str, int], np.ndarray] = (
-        ("block", 0), np.array([0.0, 0.0, pick_z], dtype=np.float64)
+        ("block", 0),
+        np.array([0.0, 0.0, pick_z], dtype=np.float64),
     )
     view._pick_scene_point = lambda pos: hit_val  # type: ignore[method-assign]
 
@@ -1558,6 +1860,7 @@ def test_ghost_snap_to_pick_point_on_tall_piece(window: MainWindow) -> None:
 
 
 # ----------------------------------------------------- view-plane free movement
+
 
 def test_ghost_free_path_moves_z_with_angled_camera(window: MainWindow) -> None:
     '''Ghost placement with angled camera moves Z via mouse, no axis lock.
@@ -1707,9 +2010,58 @@ def test_drag_free_path_moves_z_with_angled_camera(window: MainWindow) -> None:
     _assemble_stub_ray(view, 10.0, 5.0, 200.0)
     _hover_move(view, QPoint(200, 150))
     meta = view._scene_meta[0]
-    assert meta["pos_z"] > 50, (
-        f"Z-lock should lift piece above 50, got {meta['pos_z']}"
+    assert meta["pos_z"] > 50, f"Z-lock should lift piece above 50, got {meta['pos_z']}"
+
+    view.cancel_grab()
+    _reset(window)
+
+
+def test_drag_free_path_accumulates_xy_moves(window: MainWindow) -> None:
+    '''Guard the fixed free-path anchor: per-frame cursor increments accumulate.
+
+    Regression test for the bug where ``_grab_free_anchor`` was re-anchored to
+    the cursor every mouse-move frame and the per-frame increment was applied as
+    a total offset from drag-start, causing XY pieces to jitter in place.
+
+    With stubbed ray targets advancing steadily in +X, the accumulated position
+    trace must be strictly non-decreasing and the final ``pos_x`` far past the
+    first-increment offset (~20 mm).
+    '''
+    _reset(window)
+    window._tabs.setCurrentIndex(1)
+    _wait_meshes(window)
+    _place(window, x=0.0, y=0.0, z=0.0)
+
+    view = window._assemble_view
+    view.set_selection({0}, 0)
+    assert view.start_grab()
+    view._begin_piece_drag()
+
+    # Initialize the free anchor (no move yet — first hover locks anchor).
+    _assemble_stub_ray(view, 10.0, 5.0)
+    _hover_move(view, QPoint(100, 100))
+    assert view._grab_free_anchor is not None
+
+    # Five successive hover moves with ray target advancing +20 mm in X each step.
+    pos_trace: list[float] = []
+    for k in range(1, 6):
+        _assemble_stub_ray(view, 30.0 + 20.0 * k, 5.0)
+        _hover_move(view, QPoint(100 + 10 * k, 100))
+        pos_trace.append(float(view._scene_meta[0]['pos_x']))
+
+    # The cursor travelled +100 mm total (5 steps x +20 px each).
+    # Even with grid snap the accumulated position must exceed 40.0.
+    assert pos_trace[-1] > 40.0, (
+        f"Final pos_x={pos_trace[-1]} should exceed 40.0; "
+        "free-path anchor may not be accumulating displacement"
     )
+
+    # Strictly non-decreasing trace — a regression that replaces total offset
+    # with per-frame increments would park the piece near ~20 and stay flat.
+    for i in range(1, len(pos_trace)):
+        assert pos_trace[i] >= pos_trace[i - 1], (
+            f"Trace not non-decreasing at step {i}: {pos_trace[i - 1]} → {pos_trace[i]}"
+        )
 
     view.cancel_grab()
     _reset(window)
